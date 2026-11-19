@@ -1,6 +1,7 @@
 // No console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod history;
 mod os_media;
 mod ui_state;
 
@@ -16,7 +17,7 @@ use tonearm_core::covers::CoverCache;
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
 use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
-use ui_state::{CoverTarget, Effect};
+use ui_state::{CoverTarget, Effect, UiState};
 
 slint::include_modules!();
 
@@ -394,6 +395,16 @@ impl Senders {
                     }
                 }
                 Effect::Cover { url, size, target } => self.load_cover(url, size, target),
+                Effect::Library(cmd) => {
+                    if self.library.try_send(cmd).is_err() {
+                        tracing::warn!("library busy");
+                    }
+                }
+                Effect::Save(store) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt.spawn_blocking(move || store.save());
+                    }
+                }
             }
         }
     }
@@ -401,6 +412,16 @@ impl Senders {
     fn load_cover(&self, url: String, size: u32, target: CoverTarget) {
         let covers = Arc::clone(&self.covers);
         let weak = self.window.clone();
+        #[cfg(debug_assertions)]
+        if let Some(seed) = url.strip_prefix("preview:") {
+            let cover = preview_cover(seed, size.min(400));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = weak.upgrade() {
+                    ui_state::with(|st| st.on_cover(&w, &target, &cover));
+                }
+            });
+            return;
+        }
         self.rt.spawn(async move {
             match covers.get(&url, size).await {
                 Ok(cover) => {
@@ -410,7 +431,7 @@ impl Senders {
                         }
                     });
                 }
-                Err(e) => tracing::debug!(%e, "cover not loaded"),
+                Err(e) => tracing::info!(%e, "cover not loaded"),
             }
         });
     }
@@ -467,9 +488,11 @@ fn apply_auth(w: &AppWindow, s: &Senders, event: Event) {
                     }
                 }
                 AuthState::LoggedIn { username } => {
-                    w.set_username(username.to_uppercase().into());
+                    w.set_username(username.into());
                     w.set_notice("".into());
                     w.set_offline(false);
+                    let fx = ui_state::with(|st| st.show_resume(w));
+                    s.run(fx);
                     AuthView::LoggedIn
                 }
             };
@@ -502,6 +525,7 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             os_media::on_state(state, position_ms);
             w.set_play_view(ui_state::play_view(state));
             w.set_position_ms(i32::try_from(position_ms).unwrap_or(i32::MAX));
+            ui_state::with(|st| st.position_changed(w));
         }
         PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
         PlayerEvent::Track(track) => {
@@ -563,7 +587,7 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
             }
             // Follow the playback if someone moved it to yet another device.
             s.set_remote(Some(state.device.id.clone()));
-            w.set_remote_name(state.device.name.to_uppercase().into());
+            w.set_remote_name(state.device.name.clone().into());
             s.remote_playing.store(state.is_playing, Ordering::Relaxed);
             w.set_play_view(if state.is_playing {
                 PlayView::Playing
@@ -627,47 +651,48 @@ fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
     s.run(fx);
 }
 
+/// "Доброе утро" … by the local hour.
+fn greeting() -> String {
+    use chrono::Timelike;
+    match chrono::Local::now().hour() {
+        5..=11 => "Доброе утро",
+        12..=17 => "Добрый день",
+        18..=23 => "Добрый вечер",
+        _ => "Доброй ночи",
+    }
+    .to_owned()
+}
+
+/// "Четверг, 19 ноября" in local time.
 fn date_label() -> String {
-    // Only a decorative header; UTC date is good enough and avoids a time-zone dependency.
-    let days = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
-    // Civil-from-days (Howard Hinnant), proleptic Gregorian.
-    let z = i64::try_from(days).unwrap_or(0) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    use chrono::Datelike;
     const MONTHS: [&str; 12] = [
-        "ЯНВАРЯ",
-        "ФЕВРАЛЯ",
-        "МАРТА",
-        "АПРЕЛЯ",
-        "МАЯ",
-        "ИЮНЯ",
-        "ИЮЛЯ",
-        "АВГУСТА",
-        "СЕНТЯБРЯ",
-        "ОКТЯБРЯ",
-        "НОЯБРЯ",
-        "ДЕКАБРЯ",
+        "января",
+        "февраля",
+        "марта",
+        "апреля",
+        "мая",
+        "июня",
+        "июля",
+        "августа",
+        "сентября",
+        "октября",
+        "ноября",
+        "декабря",
     ];
     const WEEKDAYS: [&str; 7] = [
-        "ЧЕТВЕРГ",
-        "ПЯТНИЦА",
-        "СУББОТА",
-        "ВОСКРЕСЕНЬЕ",
-        "ПОНЕДЕЛЬНИК",
-        "ВТОРНИК",
-        "СРЕДА",
+        "Понедельник",
+        "Вторник",
+        "Среда",
+        "Четверг",
+        "Пятница",
+        "Суббота",
+        "Воскресенье",
     ];
-    let month = MONTHS[usize::try_from(m - 1).unwrap_or(0)];
-    let weekday = WEEKDAYS[usize::try_from(days % 7).unwrap_or(0)];
-    format!("{weekday}, {d} {month}")
+    let now = chrono::Local::now();
+    let month = MONTHS[usize::try_from(now.month0()).unwrap_or(0)];
+    let weekday = WEEKDAYS[usize::try_from(now.weekday().num_days_from_monday()).unwrap_or(0)];
+    format!("{weekday}, {} {month}", now.day())
 }
 
 fn mb_to_bytes(mb: u32) -> u64 {
@@ -758,7 +783,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (ev_tx, ev_rx) = mpsc::channel::<Event>(32);
     let (pcmd_tx, pcmd_rx) = mpsc::channel::<PlayerCommand>(64);
     let (pev_tx, pev_rx) = mpsc::channel::<PlayerEvent>(64);
-    let (lcmd_tx, lcmd_rx) = mpsc::channel::<LibraryCommand>(16);
+    let (lcmd_tx, lcmd_rx) = mpsc::channel::<LibraryCommand>(64);
     let (lev_tx, lev_rx) = mpsc::channel::<LibraryEvent>(64);
     let (ccmd_tx, ccmd_rx) = mpsc::channel::<ConnectCommand>(16);
     let (cev_tx, cev_rx) = mpsc::channel::<ConnectEvent>(16);
@@ -775,6 +800,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     show_settings(&window, &settings);
     window.set_version(env!("CARGO_PKG_VERSION").into());
     window.set_date_label(date_label().into());
+    window.set_greeting(greeting().into());
 
     let senders = Senders {
         auth: cmd_tx.clone(),
@@ -941,9 +967,79 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     let s = senders.clone();
     window.on_play_row(move |i| {
-        let fx = ui_state::with(|st| st.play_row(usize::try_from(i).unwrap_or(usize::MAX)));
+        if let Some(w) = s.window.upgrade() {
+            let i = usize::try_from(i).unwrap_or(usize::MAX);
+            let fx = ui_state::with(|st| st.play_row(&w, i));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_play_collection(move |kind, uri| {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.play_collection(&w, kind, uri.to_string()));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_radio_current(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.radio_current(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_lyrics_opened(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.lyrics_opened(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_palette_opened(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.palette_edited(&w, ""));
+        }
+    });
+    let s = senders.clone();
+    window.on_palette_edited(move |text| {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.palette_edited(&w, &text));
+        }
+    });
+    let s = senders.clone();
+    window.on_palette_activate(move |i| {
+        if let Some(w) = s.window.upgrade() {
+            let i = usize::try_from(i).unwrap_or(usize::MAX);
+            let fx = ui_state::with(|st| st.palette_activate(&w, i));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_page_filter_edited(move |text| {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.page_filter(&w, &text));
+        }
+    });
+    let s = senders.clone();
+    window.on_page_sort_changed(move |sort| {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.page_sort(&w, sort));
+        }
+    });
+    let s = senders.clone();
+    window.on_stats_opened(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.stats_opened(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_history_play(move |i| {
+        let fx = ui_state::with(|st| st.history_play(i));
         s.run(fx);
     });
+    let s = senders.clone();
+    window.on_queue_move(move |from, to| s.run(ui_state::UiState::queue_move(from, to)));
     let s = senders.clone();
     window.on_play_page(move || {
         let fx = ui_state::with(|st| st.play_page(false));
@@ -1014,7 +1110,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
         let name = ui_state::with(|st| st.device_name(&id));
-        w.set_remote_name(name.to_uppercase().into());
+        w.set_remote_name(name.into());
     });
     let s = senders.clone();
     window.on_queue_jump(move |i| {
@@ -1031,7 +1127,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let s = senders.clone();
-    window.on_toggle_play(move || s.player(PlayerCommand::TogglePlay));
+    window.on_toggle_play(move || match ui_state::with(UiState::take_resume) {
+        Some(fx) => s.run(fx),
+        None => s.player(PlayerCommand::TogglePlay),
+    });
     let weak = window.as_weak();
     let s = senders.clone();
     window.on_seek(move |ratio| {
@@ -1047,7 +1146,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.player(PlayerCommand::SetVolume(percent));
     });
 
-    // Once-a-second UI clock: login wait time and offline countdown.
+    // Once-a-second UI clock: login wait time, offline countdown, history and lyrics.
+    let tick_senders = senders.clone();
     let tick = slint::Timer::default();
     let weak = window.as_weak();
     tick.start(
@@ -1062,10 +1162,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     w.set_retry_in_secs(w.get_retry_in_secs() - 1);
                 }
                 // A remote device is polled every few seconds; move the dial in between.
-                if !w.get_remote_name().is_empty() && w.get_play_view() == PlayView::Playing {
+                let playing = w.get_play_view() == PlayView::Playing;
+                if !w.get_remote_name().is_empty() && playing {
                     let next = (w.get_position_ms() + 1000).min(w.get_duration_ms());
                     w.set_position_ms(next);
                 }
+                let fx = ui_state::with(|st| st.tick(&w, playing));
+                tick_senders.run(fx);
             }
         },
     );
@@ -1111,7 +1214,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // to check the UI without a Spotify account.
     #[cfg(debug_assertions)]
     if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
-        preview(&window);
+        preview(&window, &senders);
     }
 
     // Media keys / MPRIS / SMTC, once the event loop runs and the window has a native handle.
@@ -1164,6 +1267,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window.run()?;
 
+    // Continue where we left off next time: write the history and position now.
+    if std::env::var_os("TONEARM_UI_PREVIEW").is_none()
+        && let Some(store) = ui_state::with(|st| st.save_now(&window))
+    {
+        store.save();
+    }
+
     let _ = cmd_tx.blocking_send(Command::Shutdown);
     // Dropping the window and the senders closes the player and library channels.
     drop(window);
@@ -1181,7 +1291,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(debug_assertions)]
-fn preview(w: &AppWindow) {
+fn preview(w: &AppWindow, senders: &Senders) {
     use tonearm_core::library::{CollectionKind, PageHeader, PlaylistSummary, Tile, TrackItem};
     let screen = std::env::var("TONEARM_UI_PREVIEW").unwrap_or_default();
     w.set_auth_view(match screen.as_str() {
@@ -1208,7 +1318,7 @@ fn preview(w: &AppWindow) {
         name: (*n).into(),
         owner: "Егор".into(),
         track_count: 40 + u32::try_from(i).unwrap_or(0) * 17,
-        image_url: None,
+        image_url: Some(format!("preview:p{i}")),
     })
     .collect();
     let fx = ui_state::with(|st| {
@@ -1228,7 +1338,7 @@ fn preview(w: &AppWindow) {
             kind: CollectionKind::Album,
             title: (*t).into(),
             subtitle: "Исполнитель".into(),
-            image_url: None,
+            image_url: Some(format!("preview:{t}")),
         })
         .collect();
         fx.extend(st.on_library(w, LibraryEvent::Home(tiles)));
@@ -1246,7 +1356,7 @@ fn preview(w: &AppWindow) {
                         byline_uri: None,
                         year: None,
                         total_tracks: Some(7),
-                        image_url: None,
+                        image_url: Some("preview:p0".into()),
                     },
                 },
             ));
@@ -1286,9 +1396,12 @@ fn preview(w: &AppWindow) {
             artists: "Северный Ветер".into(),
             album: "Ночные маршруты".into(),
             duration_ms: 221_000,
-            cover_url: None,
+            cover_url: Some("preview:deck".into()),
         };
         fx.extend(st.on_track(w, &track));
+        if screen == "stats" || screen == "home" {
+            fx.extend(st.preview_history(w));
+        }
         // Feed the OS media controls too, once they are registered (after the event loop starts).
         slint::Timer::single_shot(Duration::from_millis(300), move || {
             os_media::on_track(&track, true, false);
@@ -1296,7 +1409,7 @@ fn preview(w: &AppWindow) {
         });
         fx
     });
-    drop(fx);
+    senders.run(fx);
     if screen == "library" {
         w.set_page(Page::Library);
     }
@@ -1370,21 +1483,119 @@ fn preview(w: &AppWindow) {
         });
     }
     if screen.starts_with("search") {
-        preview_search(w, &screen);
+        preview_search(w, senders, &screen);
+    }
+    if screen == "stats" {
+        w.set_page(Page::Stats);
+    }
+    if screen == "lyrics" {
+        use tonearm_core::library::extras::{LyricLine, Lyrics};
+        let lines = [
+            "Город спит, и только мы",
+            "Едем вдоль реки",
+            "Огни над рекой",
+            "Горят для нас одних",
+            "",
+            "Тихо шепчет радио",
+            "Старые слова",
+            "Огни над рекой",
+            "Нас ведут до утра",
+        ];
+        let lyrics = Lyrics {
+            lines: lines
+                .iter()
+                .enumerate()
+                .map(|(i, t)| LyricLine {
+                    start_ms: Some(u32::try_from(i).unwrap_or(0) * 12_000 + 30_000),
+                    text: (*t).into(),
+                })
+                .collect(),
+            synced: true,
+            provider: "LRCLIB".into(),
+        };
+        w.set_lyrics_open(true);
+        let fx = ui_state::with(|st| {
+            st.on_library(
+                w,
+                LibraryEvent::Lyrics {
+                    uri: "spotify:track:0".into(),
+                    lyrics: Some(lyrics),
+                },
+            )
+        });
+        senders.run(fx);
+    }
+    if screen == "palette" {
+        let weak = w.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(400), move || {
+            if let Some(w) = weak.upgrade() {
+                w.invoke_open_palette();
+                w.set_palette_query("но".into());
+                ui_state::with(|st| st.palette_edited(&w, "но"));
+            }
+        });
     }
     w.set_position_ms(84_000);
     w.set_play_view(PlayView::Playing);
 }
 
+/// Sample cover for the preview: a two-colour gradient with a disc, coloured by the seed.
 #[cfg(debug_assertions)]
-fn preview_search(w: &AppWindow, screen: &str) {
+fn preview_cover(seed: &str, size: u32) -> tonearm_core::covers::Cover {
+    let h = seed.bytes().fold(2_166_136_261_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    });
+    let pal: [[u8; 3]; 8] = [
+        [0xF2, 0x6B, 0x3A],
+        [0x3A, 0x86, 0xF2],
+        [0x8E, 0x4D, 0xE8],
+        [0x2B, 0xB6, 0x8F],
+        [0xE8, 0x3F, 0x6F],
+        [0xF2, 0xC1, 0x3A],
+        [0x1F, 0x4E, 0x79],
+        [0xC9, 0x5A, 0xD6],
+    ];
+    let a = pal[(h % 8) as usize];
+    let b = pal[((h >> 8) % 8) as usize];
+    let n = size.max(8);
+    let mut px = Vec::with_capacity((n * n * 4) as usize);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    for y in 0..n {
+        for x in 0..n {
+            let t = (x + y) as f32 / (2 * n) as f32;
+            let (cx, cy) = (x as f32 - n as f32 * 0.62, y as f32 - n as f32 * 0.42);
+            let r = (cx * cx + cy * cy).sqrt() / n as f32;
+            let ring = if r < 0.28 { 0.75 } else { 1.0 };
+            for c in 0..3 {
+                let v = f32::from(a[c]) * (1.0 - t) + f32::from(b[c]) * t;
+                px.push((v * ring) as u8);
+            }
+            px.push(255);
+        }
+    }
+    let accent = tonearm_core::covers::accent(&px);
+    tonearm_core::covers::Cover {
+        url: seed.into(),
+        width: n,
+        height: n,
+        color: px,
+        accent,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn preview_search(w: &AppWindow, senders: &Senders, screen: &str) {
     use tonearm_core::library::{CollectionKind, SearchResults, Tile, TrackItem};
     let tile = |kind, title: &str, sub: &str| Tile {
         uri: format!("spotify:x:{title}"),
         kind,
         title: title.into(),
         subtitle: sub.into(),
-        image_url: None,
+        image_url: Some(format!("preview:{title}")),
     };
     let tracks = [
         ("Ночной поезд", "Северный Ветер", 192),
@@ -1407,6 +1618,7 @@ fn preview_search(w: &AppWindow, screen: &str) {
         artists: (*a).into(),
         duration_ms: d * 1000,
         playable: true,
+        image_url: Some(format!("preview:{a}")),
         ..TrackItem::default()
     })
     .collect();
@@ -1438,9 +1650,9 @@ fn preview_search(w: &AppWindow, screen: &str) {
     if screen == "search-tracks" {
         w.set_search_tab(1);
     }
-    ui_state::with(|st| {
+    let fx = ui_state::with(|st| {
         drop(st.search_edited(w, "Ночн"));
-        drop(st.on_library(
+        st.on_library(
             w,
             LibraryEvent::Search {
                 query: "Ночн".into(),
@@ -1448,6 +1660,7 @@ fn preview_search(w: &AppWindow, screen: &str) {
                 offset: 0,
                 results,
             },
-        ));
+        )
     });
+    senders.run(fx);
 }
