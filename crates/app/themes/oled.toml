@@ -1,0 +1,12 @@
+name = "OLED"
+base = "dark"
+accent_from_cover = true
+
+[colors]
+bg = "#000000"
+sidebar = "#000000"
+surface = "#0C0C0C"
+surface-2 = "#161616"
+line = "#FFFFFF10"
+accent = "#FFFFFF"
+on-accent = "#000000"

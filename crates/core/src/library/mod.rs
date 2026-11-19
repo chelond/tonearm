@@ -43,8 +43,8 @@ pub enum LibraryCommand {
         uri: String,
         saved: bool,
     },
-    /// Cover of a track the player reported without one.
-    TrackCover(String),
+    /// Full details (artists, length, cover) of a track the player reported only partly.
+    TrackMeta(String),
     /// Similar tracks for "Радио по треку"; `title` names the queue.
     Radio {
         uri: String,
@@ -104,10 +104,7 @@ pub enum LibraryEvent {
         uri: String,
         saved: bool,
     },
-    TrackCover {
-        uri: String,
-        url: String,
-    },
+    TrackMeta(TrackItem),
     Radio {
         title: String,
         tracks: Vec<TrackItem>,
@@ -331,9 +328,8 @@ impl Service {
         };
         let task = async move {
             let ev = match cmd {
-                LibraryCommand::TrackCover(uri) => {
-                    let url = extras::track_cover(&session, &uri).await?;
-                    LibraryEvent::TrackCover { uri, url }
+                LibraryCommand::TrackMeta(uri) => {
+                    LibraryEvent::TrackMeta(extras::track_meta(&session, &uri).await?)
                 }
                 LibraryCommand::Radio { uri, title } => match extras::radio(&session, &uri).await {
                     Ok(tracks) => LibraryEvent::Radio { title, tracks },
@@ -544,19 +540,35 @@ async fn refresh_internal(session: Session, events: mpsc::Sender<LibraryEvent>) 
                 .filter(|&i| lists[i].image_url.is_none())
                 .take(MOSAIC_LIMIT)
                 .collect();
-            if !missing.is_empty() {
-                let found: Vec<(usize, Option<String>)> = futures_util::stream::iter(missing)
-                    .map(|i| {
-                        let session = session.clone();
-                        let uri = lists[i].uri.clone();
-                        async move { (i, internal::fallback_cover(&session, &uri).await) }
-                    })
-                    .buffer_unordered(4)
-                    .collect()
-                    .await;
-                for (i, url) in found {
-                    lists[i].image_url = url;
+            let jobs: Vec<(usize, String)> = missing
+                .into_iter()
+                .map(|i| (i, lists[i].uri.clone()))
+                .collect();
+            let mut found = futures_util::stream::iter(jobs)
+                .map(|(i, uri)| {
+                    let session = session.clone();
+                    async move { (i, internal::fallback_cover(&session, &uri).await) }
+                })
+                .buffer_unordered(6);
+            // The sidebar fills in as mosaics arrive: every few of them, and once at the end.
+            let mut fresh = 0;
+            while let Some((i, url)) = found.next().await {
+                if url.is_none() {
+                    tracing::info!(uri = %lists[i].uri, "no mosaic for playlist");
+                    continue;
                 }
+                lists[i].image_url = url;
+                fresh += 1;
+                if fresh == 6 {
+                    fresh = 0;
+                    let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+                    let _ = events
+                        .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                        .await;
+                }
+            }
+            drop(found);
+            if fresh > 0 {
                 let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
                 let _ = events
                     .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))

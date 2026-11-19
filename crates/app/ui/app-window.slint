@@ -18,6 +18,7 @@ export struct QueueRow { code: string, title: string, artist: string, manual: bo
 export struct LyricRow { text: string }
 // kind: 0 page, 1 playlist, 2 album, 3 artist, 4 search action, 5 liked, 6 command
 export struct PaletteRow { kind: int, icon: string, title: string, subtitle: string, uri: string }
+export struct ThemeCard { id: string, name: string, bg: color, surface: color, text: color, muted: color, accent: color, custom: bool }
 export struct StatRow { title: string, subtitle: string, value: string, share: float, uri: string, image: image, has-image: bool }
 
 export global Fmt {
@@ -77,8 +78,19 @@ component NavItem inherits Rectangle {
     border-radius: 8px;
     background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.fast; }
+    // accent mark that grows on the open page
+    Rectangle {
+        x: 0;
+        width: 3px;
+        height: root.active ? 18px : 0px;
+        y: (root.height - self.height) / 2;
+        border-radius: 2px;
+        background: Theme.accent;
+        animate height { duration: 260ms; easing: cubic-bezier(0.3, 1.4, 0.5, 1); }
+    }
     HorizontalLayout {
-        padding-left: 12px;
+        padding-left: touch.has-hover && !root.active ? 16px : 12px;
+        animate padding-left { duration: Theme.normal; easing: ease-out; }
         padding-right: 12px;
         spacing: 14px;
         VerticalLayout {
@@ -157,13 +169,21 @@ component SidebarRow inherits Rectangle {
 component TileView inherits Rectangle {
     in property <TileData> tile;
     in property <bool> round: tile.kind == 3;
+    // Position in its grid: tiles fade up one after another.
+    in property <int> index;
     callback clicked();
     callback play();
+    property <bool> appeared: false;
+    init => { self.appeared = true; }
+    opacity: self.appeared ? 1 : 0;
+    animate opacity { duration: 380ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
     border-radius: Layout.radius;
     background: touch.has-hover ? Theme.surface-2 : Theme.surface;
     animate background { duration: Theme.normal; }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
     VerticalLayout {
+        y: root.appeared ? 0px : 18px;
+        animate y { duration: 460ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
         padding: 12px;
         spacing: 10px;
         Rectangle {
@@ -217,6 +237,7 @@ component TileGrid inherits Rectangle {
         y: Math.floor(i / root.cols) * (root.cell-h + 16px);
         width: root.cell;
         height: root.cell-h;
+        index: i;
         tile: t;
         clicked => { root.open(t.kind, t.uri); }
         play => { root.play(t.kind, t.uri); }
@@ -228,8 +249,13 @@ component QuickCard inherits Rectangle {
     in property <PlaylistEntry> entry;
     in property <bool> liked;
     in property <bool> active;
+    in property <int> index;
     callback clicked();
     callback play();
+    property <bool> appeared: false;
+    init => { self.appeared = true; }
+    opacity: self.appeared ? 1 : 0;
+    animate opacity { duration: 320ms; delay: min(root.index, 8) * 45ms; easing: ease-out; }
     height: 60px;
     border-radius: 8px;
     clip: true;
@@ -435,6 +461,75 @@ component DeviceItem inherits Rectangle {
             spacing: 2px;
             Text { text: root.name; font-size: 14px; font-weight: 600; color: root.active ? Theme.accent : Theme.text-1; overflow: elide; }
             Text { text: root.kind; font-size: 12px; color: Theme.text-3; }
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// A theme in the settings: a tiny window drawn in its colours.
+component ThemeSwatch inherits Rectangle {
+    in property <ThemeCard> card;
+    in property <bool> current;
+    callback clicked();
+    width: 148px;
+    height: 112px;
+    property <bool> hot: touch.has-hover;
+    Rectangle {
+        y: root.hot ? -3px : 0px;
+        height: 80px;
+        border-radius: Layout.radius;
+        background: root.card.bg;
+        border-width: root.current ? 2px : 1px;
+        border-color: root.current ? Theme.accent : root.hot ? Theme.line-2 : Theme.line;
+        clip: true;
+        animate y { duration: Theme.normal; easing: ease-out; }
+        animate border-color { duration: Theme.fast; }
+        // sidebar strip, a card and a player bar
+        Rectangle { x: 0; y: 0; width: 34px; height: parent.height; background: root.card.surface; opacity: 0.6; }
+        Rectangle { x: 6px; y: 10px; width: 20px; height: 4px; border-radius: 2px; background: root.card.text; }
+        Rectangle { x: 6px; y: 20px; width: 16px; height: 3px; border-radius: 2px; background: root.card.muted; }
+        Rectangle { x: 6px; y: 28px; width: 18px; height: 3px; border-radius: 2px; background: root.card.muted; }
+        Rectangle { x: 44px; y: 10px; width: 40px; height: 34px; border-radius: 5px; background: root.card.surface; }
+        Rectangle { x: 90px; y: 10px; width: 40px; height: 34px; border-radius: 5px; background: root.card.surface; }
+        Rectangle { x: 44px; y: 52px; width: 50px; height: 4px; border-radius: 2px; background: root.card.text; }
+        Rectangle { x: 44px; y: 61px; width: 34px; height: 3px; border-radius: 2px; background: root.card.muted; }
+        Rectangle {
+            x: parent.width - self.width - 10px;
+            y: parent.height - self.height - 10px;
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            background: root.card.accent;
+        }
+        if root.current: Rectangle {
+            x: parent.width - self.width - 8px;
+            y: 8px;
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            background: Theme.accent;
+            Icon { name: "check"; size: 12px; ink: Theme.on-accent; }
+        }
+    }
+    HorizontalLayout {
+        y: 86px;
+        height: 22px;
+        spacing: 6px;
+        Text {
+            text: root.card.name;
+            font-size: 13px;
+            font-weight: root.current ? 600 : 400;
+            color: root.current ? Theme.text-1 : Theme.text-2;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        if root.card.custom: Rectangle {
+            width: 36px;
+            height: 18px;
+            y: 2px;
+            border-radius: 9px;
+            background: Theme.surface-2;
+            Text { text: "своя"; font-size: 10px; color: Theme.text-3; }
         }
     }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
@@ -746,6 +841,14 @@ export component AppWindow inherits Window {
     in-out property <int> set-normalisation;
     in-out property <int> set-gapless: 1;
     in-out property <int> set-notifications: 1;
+    // Themes: built-in and from the themes folder.
+    in property <[ThemeCard]> themes;
+    in property <string> theme-id;
+    in property <string> theme-errors;
+    callback theme-picked(string);
+    callback theme-open-folder();
+    callback theme-new();
+    callback theme-reload();
     in-out property <string> set-device;
     in-out property <int> set-cache: 2;               // 128 | 256 | 512 | 1024 MB
     in-out property <int> set-engine;                 // 0 built-in librespot, 1 Spotify Soloist
@@ -780,6 +883,8 @@ export component AppWindow inherits Window {
     callback play-page();
     callback toggle-play();
     callback seek(float);
+    // Time under the pointer while the progress bar is dragged.
+    property <int> scrub-ms: -1;
     callback volume-changed(int);
     callback back();
     callback search-edited(string);
@@ -1130,6 +1235,7 @@ export component AppWindow inherits Window {
                                     }
                                     for p[i] in root.playlists: QuickCard {
                                         visible: i + 1 < parent.count;
+                                        index: i + 1;
                                         x: Math.mod(i + 1, parent.cols) * (parent.cw + 12px);
                                         y: Math.floor((i + 1) / parent.cols) * 72px;
                                         width: parent.cw;
@@ -1577,6 +1683,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.page-error != "": Text {
                                     text: root.page-error;
+                                    min-width: min(self.preferred-width, 280px);
                                     font-size: 13px;
                                     color: Theme.danger;
                                     vertical-alignment: center;
@@ -1900,6 +2007,29 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     SettingsGroup {
+                                        title: "Оформление";
+                                        Rectangle {
+                                            property <int> cols: max(1, floor((self.width - 40px + 12px) / 160px));
+                                            height: ceil(root.themes.length / self.cols) * 124px + 24px;
+                                            for t[i] in root.themes: ThemeSwatch {
+                                                x: 20px + mod(i, parent.cols) * 160px;
+                                                y: 16px + floor(i / parent.cols) * 124px;
+                                                card: t;
+                                                current: t.id == root.theme-id;
+                                                clicked => { root.theme-picked(t.id); }
+                                            }
+                                        }
+                                        SettingRow {
+                                            title: "Свои темы";
+                                            hint: root.theme-errors != "" ? "Не загрузились: " + root.theme-errors
+                                                : "Файлы .toml в папке тем. Изменения в файле видны сразу";
+                                            last: true;
+                                            Button { text: "Создать из текущей"; icon: "plus"; clicked => { root.theme-new(); } }
+                                            Button { text: "Папка тем"; kind: ButtonKind.ghost; clicked => { root.theme-open-folder(); } }
+                                            IconButton { icon: "repeat"; clicked => { root.theme-reload(); } }
+                                        }
+                                    }
+                                    SettingsGroup {
                                         title: "Плеер";
                                         SettingRow {
                                             title: "Чем играть";
@@ -2100,9 +2230,9 @@ export component AppWindow inherits Window {
                         width: min(parent.width - 48px, toast-row.preferred-width + 32px);
                         height: 48px;
                         border-radius: 24px;
-                        background: root.offline || root.notice-is-error ? #3A1A1C : Theme.surface-2;
+                        background: root.offline || root.notice-is-error ? Theme.danger.with-alpha(0.2) : Theme.surface-2;
                         border-width: 1px;
-                        border-color: root.offline || root.notice-is-error ? #FF5A5F55 : Theme.line-2;
+                        border-color: root.offline || root.notice-is-error ? Theme.danger.with-alpha(0.35) : Theme.line-2;
                         drop-shadow-blur: 20px;
                         drop-shadow-color: #00000088;
                         toast-row := HorizontalLayout {
@@ -2208,35 +2338,64 @@ export component AppWindow inherits Window {
                     padding-left: 16px;
                     padding-right: 20px;
                     spacing: 16px;
-                    // now playing
-                    HorizontalLayout {
+                    // now playing: a new track slides in (cover grows back, title rises)
+                    now := HorizontalLayout {
                         width: 300px;
                         spacing: 14px;
-                        Cover {
-                            width: 56px;
-                            height: 56px;
-                            y: (parent.height - self.height) / 2;
-                            source: root.track-image;
-                            loaded: root.track-has-image;
-                            placeholder-icon: "play";
-                            TouchArea { mouse-cursor: pointer; clicked => { root.toggle-lyrics(); } }
+                        property <bool> swap: false;
+                        property <duration> settle: self.swap ? 0ms : 460ms;
+                        property <string> title: root.track-title;
+                        changed title => {
+                            self.swap = true;
+                            swap-timer.running = true;
                         }
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            Text {
-                                text: root.track-title != "" ? root.track-title : "Ничего не играет";
-                                font-size: 14px;
-                                font-weight: 600;
-                                color: root.track-title != "" ? Theme.text-1 : Theme.text-3;
-                                overflow: elide;
+                        swap-timer := Timer {
+                            interval: 40ms;
+                            running: false;
+                            triggered => {
+                                self.running = false;
+                                now.swap = false;
                             }
-                            Text { text: root.track-artists; font-size: 12px; color: Theme.text-2; overflow: elide; }
-                            if root.remote-name != "": HorizontalLayout {
-                                spacing: 6px;
-                                Icon { name: "devices"; size: 12px; ink: Theme.accent; }
-                                Text { text: "Играет на «" + root.remote-name + "»"; font-size: 11px; color: Theme.accent; overflow: elide; }
+                        }
+                        Rectangle {
+                            width: 56px;
+                            Cover {
+                                width: now.swap ? 40px : 56px;
+                                height: self.width;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                opacity: now.swap ? 0 : 1;
+                                animate width { duration: now.settle; easing: cubic-bezier(0.2, 0.9, 0.3, 1.3); }
+                                animate opacity { duration: now.settle; easing: ease-out; }
+                                source: root.track-image;
+                                loaded: root.track-has-image;
+                                placeholder-icon: "play";
+                                TouchArea { mouse-cursor: pointer; clicked => { root.toggle-lyrics(); } }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            opacity: now.swap ? 0 : 1;
+                            animate opacity { duration: now.settle; easing: ease-out; }
+                            VerticalLayout {
+                                y: now.swap ? 10px : 0px;
+                                animate y { duration: now.settle; easing: ease-out; }
+                                height: parent.height;
+                                alignment: center;
+                                spacing: 3px;
+                                Text {
+                                    text: root.track-title != "" ? root.track-title : "Ничего не играет";
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    color: root.track-title != "" ? Theme.text-1 : Theme.text-3;
+                                    overflow: elide;
+                                }
+                                Text { text: root.track-artists; font-size: 12px; color: Theme.text-2; overflow: elide; }
+                                if root.remote-name != "": HorizontalLayout {
+                                    spacing: 6px;
+                                    Icon { name: "devices"; size: 12px; ink: Theme.accent; }
+                                    Text { text: "Играет на «" + root.remote-name + "»"; font-size: 11px; color: Theme.accent; overflow: elide; }
+                                }
                             }
                         }
                         if root.track-title != "": IconButton { y: (parent.height - self.height) / 2; icon: "radio"; icon-size: 18px; clicked => { root.radio-current(); } }
@@ -2266,7 +2425,7 @@ export component AppWindow inherits Window {
                             max-width: 640px;
                             Text {
                                 width: 40px;
-                                text: Fmt.clock(root.position-ms);
+                                text: Fmt.clock(root.scrub-ms >= 0 ? root.scrub-ms : root.position-ms);
                                 font-family: Fonts.mono;
                                 font-size: 11px;
                                 color: Theme.text-3;
@@ -2277,7 +2436,11 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 smooth: root.play-view == PlayView.playing;
                                 value: root.duration-ms > 0 ? root.position-ms / root.duration-ms : 0;
-                                committed(v) => { root.seek(v); }
+                                moving(v) => { root.scrub-ms = v * root.duration-ms; }
+                                committed(v) => {
+                                    root.scrub-ms = -1;
+                                    root.seek(v);
+                                }
                             }
                             Text {
                                 width: 40px;

@@ -1,4 +1,4 @@
-//! Extras on top of the library: track radio, lyrics, the cover of a single track.
+//! Extras on top of the library: track radio, lyrics, the details of a single track.
 //!
 //! All of them go through the librespot session (no Client ID). Lyrics fall back to LRCLIB, a
 //! free public lyrics database, when Spotify has none or refuses the request.
@@ -9,7 +9,7 @@ use librespot_core::{Session, SpotifyId, SpotifyUri};
 use librespot_metadata::{Metadata, Track};
 
 use super::internal;
-use super::metadata::image_url_small;
+use super::metadata::track_item;
 use super::model::TrackItem;
 
 /// Tracks in a radio queue (the seed comes first).
@@ -30,11 +30,13 @@ pub struct Lyrics {
     pub provider: String,
 }
 
-/// Cover of one track (when the player did not report one).
-pub async fn track_cover(session: &Session, uri: &str) -> Option<String> {
+/// Full details of one track, for a player that reported only part of them.
+pub async fn track_meta(session: &Session, uri: &str) -> Option<TrackItem> {
     let id = SpotifyUri::from_uri(uri).ok()?;
     let t = Track::get(session, &id).await.ok()?;
-    image_url_small(&t.album.covers)
+    let mut item = track_item(&t);
+    item.uri = uri.to_owned();
+    Some(item)
 }
 
 /// "Радио по треку": the seed, then similar tracks. Uses Spotify's "inspired by" mix and falls
@@ -83,7 +85,8 @@ fn station_uris(json: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Lyrics of a track: Spotify first, then LRCLIB by title, artist and duration.
+/// Lyrics of a track: Spotify first, then LRCLIB by title, artist and duration. Lyrics that
+/// follow the song win over plain text from either source.
 pub async fn lyrics(
     session: &Session,
     uri: &str,
@@ -91,10 +94,14 @@ pub async fn lyrics(
     artist: &str,
     duration_ms: u32,
 ) -> Option<Lyrics> {
-    if let Some(l) = spotify_lyrics(session, uri).await {
-        return Some(l);
+    let spotify = spotify_lyrics(session, uri).await;
+    if spotify.as_ref().is_some_and(|l| l.synced) {
+        return spotify;
     }
-    lrclib(title, artist, duration_ms).await
+    match lrclib(title, artist, duration_ms).await {
+        Some(l) if l.synced || spotify.is_none() => Some(l),
+        _ => spotify,
+    }
 }
 
 async fn spotify_lyrics(session: &Session, uri: &str) -> Option<Lyrics> {
@@ -142,21 +149,61 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
         .build()
         .ok()?;
     let artist = artist.split(", ").next().unwrap_or(artist);
+    // The exact match needs the length; without it, or when it misses, search by name.
+    if duration_ms > 0 && !artist.is_empty() {
+        let exact = client
+            .get("https://lrclib.net/api/get")
+            .query(&[
+                ("track_name", title),
+                ("artist_name", artist),
+                ("duration", &(duration_ms / 1000).to_string()),
+            ])
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
+        if let Some(resp) = exact
+            && let Ok(json) = resp.json::<serde_json::Value>().await
+            && let Some(l) = parse_lrclib(&json).filter(|l| l.synced)
+        {
+            return Some(l);
+        }
+    }
+    let mut query = vec![("track_name", title)];
+    if !artist.is_empty() {
+        query.push(("artist_name", artist));
+    }
     let resp = client
-        .get("https://lrclib.net/api/get")
-        .query(&[
-            ("track_name", title),
-            ("artist_name", artist),
-            ("duration", &(duration_ms / 1000).to_string()),
-        ])
+        .get("https://lrclib.net/api/search")
+        .query(&query)
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
+        .ok()
+        .filter(|r| r.status().is_success())?;
     let json: serde_json::Value = resp.json().await.ok()?;
-    parse_lrclib(&json)
+    best_search_hit(&json, duration_ms).and_then(parse_lrclib)
+}
+
+/// The search hit to use: synced lyrics first, then the closest length.
+fn best_search_hit(json: &serde_json::Value, duration_ms: u32) -> Option<&serde_json::Value> {
+    let want = f64::from(duration_ms) / 1000.0;
+    json.as_array()?
+        .iter()
+        .filter(|h| {
+            // A hit far off in length is another version (or another song).
+            duration_ms == 0
+                || h["duration"]
+                    .as_f64()
+                    .is_none_or(|d| (d - want).abs() <= 8.0)
+        })
+        .min_by_key(|h| {
+            let synced = h["syncedLyrics"].as_str().is_some_and(|s| !s.is_empty());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let off = h["duration"]
+                .as_f64()
+                .map_or(999, |d| (d - want).abs() as u32);
+            (!synced, off)
+        })
 }
 
 fn parse_lrclib(json: &serde_json::Value) -> Option<Lyrics> {
@@ -269,6 +316,19 @@ mod tests {
         let l = parse_lrclib(&j).unwrap();
         assert!(!l.synced);
         assert_eq!(l.lines.len(), 2);
+    }
+
+    #[test]
+    fn search_prefers_synced_and_close_length() {
+        let j = serde_json::json!([
+            {"duration": 200.0, "syncedLyrics": null, "plainLyrics": "a"},
+            {"duration": 260.0, "syncedLyrics": "[00:01.00]far"},
+            {"duration": 203.0, "syncedLyrics": "[00:01.00]near"}
+        ]);
+        let hit = best_search_hit(&j, 201_000).unwrap();
+        assert_eq!(hit["duration"], 203.0);
+        let any = best_search_hit(&j, 0).unwrap();
+        assert!(any["syncedLyrics"].is_string());
     }
 
     #[test]
