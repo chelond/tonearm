@@ -73,6 +73,7 @@ fn report_fatal(message: &str) {
         };
         let (body, title) = (wide(&text), wide("Tonearm"));
         // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call.
+        #[allow(unsafe_code)]
         unsafe {
             MessageBoxW(
                 std::ptr::null_mut(),
