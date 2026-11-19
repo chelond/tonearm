@@ -24,8 +24,9 @@ const POSITION_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_VOLUME_PERCENT: u8 = 70;
 /// "Previous" restarts the track when it has played longer than this.
 const RESTART_THRESHOLD_MS: u32 = 3000;
-/// Unavailable tracks skipped in a row before giving up.
-const MAX_SKIPS: u32 = 10;
+/// Unavailable tracks skipped in a row before giving up. Several in a row almost always means
+/// Spotify refuses audio keys to this account (librespot issue #1649), not dead tracks.
+const MAX_SKIPS: u32 = 3;
 /// Entries sent to the queue panel.
 const QUEUE_SNAPSHOT: usize = 100;
 
@@ -452,6 +453,12 @@ impl Service {
                 if self.skips < MAX_SKIPS {
                     self.advance().await;
                 } else {
+                    self.emit(PlayerEvent::Error(
+                        "Spotify не выдаёт ключи воспроизведения этому аккаунту (известная проблема librespot \
+                         с новыми аккаунтами). Воспроизведение остановлено."
+                            .into(),
+                    ))
+                    .await;
                     self.set_state(PlaybackState::Stopped, 0).await;
                 }
             }

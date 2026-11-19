@@ -465,9 +465,25 @@ async fn load_page(
 async fn refresh_internal(session: Session, events: mpsc::Sender<LibraryEvent>) {
     match internal::playlists(&session).await {
         Ok(lists) => {
-            let tiles = internal::home_tiles(&lists, HOME_TILES);
+            let mut tiles = internal::home_tiles(&lists, HOME_TILES);
             let _ = events.send(LibraryEvent::Playlists(lists)).await;
-            let _ = events.send(LibraryEvent::Home(tiles)).await;
+            let _ = events.send(LibraryEvent::Home(tiles.clone())).await;
+            // Tiles without a picture get the first track's album cover, then a second update.
+            let missing: Vec<usize> = (0..tiles.len())
+                .filter(|&i| tiles[i].image_url.is_none())
+                .collect();
+            if !missing.is_empty() {
+                let covers = futures_util::future::join_all(
+                    missing
+                        .iter()
+                        .map(|&i| internal::first_track_cover(&session, &tiles[i].uri)),
+                )
+                .await;
+                for (i, cover) in missing.into_iter().zip(covers) {
+                    tiles[i].image_url = cover;
+                }
+                let _ = events.send(LibraryEvent::Home(tiles)).await;
+            }
         }
         Err(e) => {
             let _ = events

@@ -19,7 +19,7 @@ use super::metadata::{image_url, track_item};
 use super::model::{CollectionKind, PageHeader, PlaylistSummary, SearchResults, Tile, TrackItem};
 
 /// Parallel metadata requests (per-user limit; the official client does far more).
-const CONCURRENCY: usize = 16;
+const CONCURRENCY: usize = 32;
 /// Tracks per chunk sent to the UI while a long list loads.
 pub const CHUNK: usize = 50;
 const ROOTLIST_LEN: usize = 500;
@@ -43,6 +43,23 @@ fn picture_url(picture: &[u8]) -> Option<String> {
     }
     let hex: String = picture.iter().map(|b| format!("{b:02x}")).collect();
     Some(format!("https://i.scdn.co/image/{hex}"))
+}
+
+/// Cover of a playlist: the CDN url Spotify lists for its own playlists (daylist, mixes),
+/// else the uploaded picture id. Playlists with neither use a mosaic in the official client.
+fn list_cover(attrs: &librespot_protocol::playlist4_external::ListAttributes) -> Option<String> {
+    let rank = |name: &str| match name {
+        "large" | "xlarge" => 0,
+        "default" => 1,
+        _ => 2,
+    };
+    attrs
+        .picture_size
+        .iter()
+        .filter(|p| p.url().starts_with("https://"))
+        .min_by_key(|p| rank(p.target_name()))
+        .map(|p| p.url().to_owned())
+        .or_else(|| picture_url(attrs.picture()))
 }
 
 /// Sidebar playlists (rootlist). Folders and other non-playlist entries are skipped.
@@ -70,7 +87,7 @@ pub async fn playlists(session: &Session) -> Result<Vec<PlaylistSummary>, Intern
                     .map(|m| m.owner_username().to_owned())
                     .unwrap_or_default(),
                 track_count: meta.map_or(0, |m| u32::try_from(m.length()).unwrap_or(0)),
-                image_url: attrs.and_then(|a| picture_url(a.picture())),
+                image_url: attrs.and_then(list_cover),
             }
         })
         .collect())
@@ -124,7 +141,7 @@ pub async fn playlist(
         byline_uri: None,
         year: None,
         total_tracks: Some(u32::try_from(uris.len()).unwrap_or(0)),
-        image_url: picture_url(attrs.picture()),
+        image_url: list_cover(attrs),
     };
     Ok((header, uris))
 }
@@ -181,6 +198,14 @@ async fn context_track_uris(
     }
     uris.truncate(limit);
     Ok(uris)
+}
+
+/// Cover of the first track's album, for playlists without a picture of their own.
+pub async fn first_track_cover(session: &Session, playlist_uri: &str) -> Option<String> {
+    let (_, uris) = playlist(session, playlist_uri).await.ok()?;
+    let id = SpotifyUri::from_uri(uris.first()?).ok()?;
+    let t = Track::get(session, &id).await.ok()?;
+    image_url(&t.album.covers)
 }
 
 /// Uris of Liked Songs, newest first (the order the collection context returns).

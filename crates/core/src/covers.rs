@@ -45,6 +45,9 @@ fn allowed(url: &str) -> bool {
         || url.starts_with("https://mosaic.scdn.co/")
         || url.starts_with("https://image-cdn-")
         || url.starts_with("https://wrapped-images.spotifycdn.com/")
+        || url.starts_with("https://pickasso.spotifycdn.com/")
+        || url.starts_with("https://seeded-session-images.scdn.co/")
+        || url.starts_with("https://daylist.spotifycdn.com/")
 }
 
 fn file_name(url: &str) -> String {
