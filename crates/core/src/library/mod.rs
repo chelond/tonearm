@@ -5,6 +5,7 @@
 mod metadata;
 pub mod model;
 pub mod webapi;
+mod webtoken;
 
 use std::time::Duration;
 
@@ -14,11 +15,8 @@ use tokio::task::JoinHandle;
 
 pub use model::*;
 use webapi::{ApiError, Http, HttpResponse, Method, TrackPage, WebApi};
+pub use webtoken::{WEBAPI_REFRESH_KEY, forget_own_token, use_own_client_id};
 
-/// Scopes for the session's Web API token.
-const SCOPES: &str = "playlist-read-private,playlist-read-collaborative,user-library-read,\
-user-library-modify,user-read-recently-played,user-read-private,user-read-playback-state,\
-user-modify-playback-state";
 const HOME_TILES: usize = 6;
 /// Typing pause before a search request, so every keystroke does not hit the rate limit.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -108,21 +106,9 @@ impl SessionHttp {
 
 impl SessionHttp {
     async fn execute(&self, req: reqwest::RequestBuilder) -> Result<HttpResponse, ApiError> {
-        // login5 first: Spotify retired the Mercury keymaster endpoint (it answers
-        // "Service unavailable"). Keymaster stays as a fallback for older accounts/servers.
-        let token = match self.session.login5().auth_token().await {
-            Ok(t) => t,
-            Err(login5_err) => {
-                tracing::warn!(error = %login5_err, "login5 token failed, trying keymaster");
-                self.session
-                    .token_provider()
-                    .get_token(SCOPES)
-                    .await
-                    .map_err(|e| ApiError::Network(format!("токен: {login5_err}; {e}")))?
-            }
-        };
+        let token = webtoken::access_token(&self.session).await?;
         let resp = req
-            .bearer_auth(&token.access_token)
+            .bearer_auth(token.expose())
             .send()
             .await
             .map_err(|e| ApiError::Network(e.without_url().to_string()))?;

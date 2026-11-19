@@ -18,7 +18,8 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpotifySettings {
-    /// Own app from developer.spotify.com, reserved for a Web API fallback. Not a secret (PKCE).
+    /// Own app from developer.spotify.com for Web API tokens (avoids the shared client id's
+    /// rate limit). Empty = login5 token of the session. Not a secret (PKCE).
     pub client_id: String,
 }
 

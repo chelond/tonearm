@@ -60,6 +60,28 @@ librespot выдаёт многоразовые учётные данные, о�
 
 Хранится не пароль, а многоразовый токен этого устройства; отозвать его можно на сайте Spotify («Выйти везде»).
 
+### Свой Client ID для Web API (если «Spotify ограничил запросы»)
+
+Плейлисты, медиатека и поиск идут через Web API. По умолчанию токен для него берётся из сессии librespot,
+а она работает под общим Client ID официального клиента, которым пользуются все программы на librespot.
+Поэтому Spotify часто отвечает 429 («ограничил запросы»). Решение: зарегистрировать своё приложение.
+
+1. Откройте <https://developer.spotify.com/dashboard> → **Create app**.
+2. Redirect URI: `http://127.0.0.1:8898/login`, API: **Web API**. Сохраните и скопируйте **Client ID**
+   (Client Secret не нужен, вход по PKCE).
+3. В разделе **User Management** приложения добавьте email своего аккаунта Spotify (в Development Mode
+   приложение работает только для пользователей из этого списка).
+4. Впишите Client ID в `config.toml` (Windows: `%APPDATA%\tonearm\config\config.toml`,
+   Linux: `~/.config/tonearm/config.toml`):
+   ```toml
+   [spotify]
+   client_id = "ваш_client_id"
+   ```
+5. Перезапустите Tonearm. Один раз откроется браузер: разрешите доступ. Refresh-токен ляжет в keyring,
+   дальше без браузера. «Выйти» удаляет и его.
+
+Воспроизведение по-прежнему идёт через librespot, Client ID влияет только на Web API.
+
 ## Звук
 
 Вывод через ALSA (cpal/rodio из librespot). С PipeWire нужен `pipewire-alsa`, с PulseAudio — `pulseaudio-alsa`

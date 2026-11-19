@@ -23,7 +23,9 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 pub enum ApiError {
     #[error("нет связи со Spotify: {0}")]
     Network(String),
-    #[error("Spotify ограничил запросы, попробуйте позже")]
+    #[error(
+        "Spotify ограничил запросы, попробуйте позже (поможет свой Client ID в config.toml, см. README)"
+    )]
     RateLimited,
     #[error("нет доступа ({0})")]
     Forbidden(u16),
