@@ -13,6 +13,15 @@ pub struct Settings {
     pub audio: AudioSettings,
     pub cache: CacheSettings,
     pub ui: UiSettings,
+    pub player: PlayerSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerSettings {
+    /// Play through Spotify Soloist instead of the built-in librespot player. The Soloist key
+    /// itself lives in the keyring (`soloist-api-key`), never here.
+    pub soloist: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -15,7 +15,7 @@ use tonearm_core::connect::{ConnectCommand, ConnectEvent, RemoteAction};
 use tonearm_core::covers::CoverCache;
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
-use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent};
+use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
 use ui_state::{CoverTarget, Effect};
 
 slint::include_modules!();
@@ -97,6 +97,67 @@ fn install_panic_hook() {
     }));
 }
 
+/// Keyring entry of the user's own Soloist key (from developer.spotify.com).
+const SOLOIST_KEY: &str = "soloist-api-key";
+
+fn soloist_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let dirs = directories::ProjectDirs::from("", "", "tonearm")?;
+    Some((
+        dirs.data_local_dir().join("soloist"),
+        dirs.cache_dir().join("soloist"),
+    ))
+}
+
+fn soloist_config(api_key: String) -> Option<SoloistConfig> {
+    let (root, cache_dir) = soloist_dirs()?;
+    Some(SoloistConfig {
+        api_key,
+        root,
+        cache_dir,
+        device_name: tonearm_player::soloist::DEVICE_NAME.into(),
+    })
+}
+
+/// What Spotify's "Copy" button puts on the clipboard: one token of printable characters.
+/// The format is not documented, so stay loose but never take ordinary text or a link.
+fn looks_like_key(text: &str) -> bool {
+    let t = text.trim();
+    (20..=512).contains(&t.len())
+        && t.bytes().all(|b| b.is_ascii_graphic())
+        && t.bytes().any(|b| b.is_ascii_digit())
+        && t.bytes().any(|b| b.is_ascii_alphabetic())
+        && !t.contains("://")
+}
+
+/// Settings line for Soloist's state, and whether "ПОВТОРИТЬ" helps.
+fn soloist_text(status: &SoloistStatus) -> (String, String, bool) {
+    match status {
+        SoloistStatus::Off => ("ВЫКЛЮЧЕН".into(), String::new(), false),
+        SoloistStatus::Downloading(p) => (
+            format!("СКАЧИВАЮ С СЕРВЕРА SPOTIFY · {p}%"),
+            String::new(),
+            false,
+        ),
+        SoloistStatus::Starting => ("ЗАПУСКАЮ…".into(), String::new(), false),
+        SoloistStatus::Pairing => ("ВХОЖУ В ВАШ АККАУНТ…".into(), String::new(), false),
+        SoloistStatus::NeedsPairing { reason } => (
+            "НУЖНА ПРИВЯЗКА · ОДИН РАЗ".into(),
+            format!(
+                "Не получилось войти автоматически ({reason}). Откройте Spotify на телефоне в той же \
+                 Wi-Fi сети и выберите устройство «{}» в списке устройств. Больше это не понадобится.",
+                tonearm_player::soloist::DEVICE_NAME
+            ),
+            true,
+        ),
+        SoloistStatus::Ready { version, days_left } => (
+            format!("ГОТОВ · {version} · ОБНОВЛЯЕТСЯ САМ ({days_left} ДН.)"),
+            String::new(),
+            false,
+        ),
+        SoloistStatus::Failed(message) => ("ОШИБКА".into(), message.clone(), true),
+    }
+}
+
 /// Senders for everything the UI can ask for.
 #[derive(Clone)]
 struct Senders {
@@ -110,6 +171,8 @@ struct Senders {
     covers: Arc<CoverCache>,
     /// What `config.toml` holds; the settings page edits it.
     settings: Arc<Mutex<Settings>>,
+    /// A clipboard watch for the Soloist key is running.
+    key_watch: Arc<AtomicBool>,
     rt: Handle,
     window: slint::Weak<AppWindow>,
 }
@@ -134,6 +197,13 @@ impl Senders {
         if new.audio != current.audio {
             self.local(PlayerCommand::Configure(audio_options(&new)));
         }
+        if new.player != current.player {
+            if new.player.soloist {
+                self.start_soloist();
+            } else {
+                self.local(PlayerCommand::Soloist(None));
+            }
+        }
         if new.cache != current.cache {
             let covers = Arc::clone(&self.covers);
             let bytes = mb_to_bytes(new.cache.max_size_mb);
@@ -148,6 +218,79 @@ impl Senders {
         self.rt.spawn_blocking(move || {
             if let Err(e) = new.save() {
                 tracing::warn!(error = %e, "cannot save config.toml");
+            }
+        });
+    }
+
+    /// Starts Soloist with the saved key, or asks for one.
+    fn start_soloist(&self) {
+        let s = self.clone();
+        self.rt.spawn_blocking(move || {
+            let key = tonearm_core::system_store().get(SOLOIST_KEY).ok().flatten();
+            match key.and_then(|k| soloist_config(k.expose().to_owned())) {
+                Some(cfg) => {
+                    s.local(PlayerCommand::Soloist(Some(cfg)));
+                    let _ = s
+                        .window
+                        .upgrade_in_event_loop(|w| w.set_soloist_need_key(false));
+                }
+                None => {
+                    let _ = s.window.upgrade_in_event_loop(|w| {
+                        w.set_soloist_need_key(true);
+                        w.set_soloist_status("НУЖЕН КЛЮЧ · ОДИН РАЗ".into());
+                        w.set_soloist_detail(
+                            "Нажмите «Получить ключ»: откроется страница Spotify (нужен Premium). \
+                             Там нажмите «Copy», Tonearm сам заберёт ключ из буфера обмена."
+                                .into(),
+                        );
+                    });
+                }
+            }
+        });
+    }
+
+    /// Saves a key the user pasted or copied, then starts Soloist with it.
+    fn use_soloist_key(&self, key: String) {
+        let s = self.clone();
+        self.rt.spawn_blocking(move || {
+            let store = tonearm_core::system_store();
+            if let Err(e) = store.set(SOLOIST_KEY, &tonearm_core::Secret::new(key)) {
+                tracing::warn!(error = %e, "cannot save the soloist key");
+                let _ = s.window.upgrade_in_event_loop(|w| {
+                    w.set_soloist_status("КЛЮЧ НЕ СОХРАНИЛСЯ".into());
+                    w.set_soloist_detail("Хранилище паролей системы недоступно.".into());
+                });
+                return;
+            }
+            s.start_soloist();
+        });
+    }
+
+    /// After "ПОЛУЧИТЬ КЛЮЧ": watch the clipboard for ten minutes for the key the user copies.
+    fn watch_clipboard_for_key(&self) {
+        if self.key_watch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let s = self.clone();
+        std::thread::spawn(move || {
+            let found = (|| {
+                let mut clipboard = arboard::Clipboard::new().ok()?;
+                let before = clipboard.get_text().ok();
+                for _ in 0..600 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Ok(text) = clipboard.get_text() else {
+                        continue;
+                    };
+                    if Some(&text) != before.as_ref() && looks_like_key(&text) {
+                        return Some(text.trim().to_owned());
+                    }
+                }
+                None
+            })();
+            s.key_watch.store(false, Ordering::SeqCst);
+            if let Some(key) = found {
+                tracing::info!("soloist key taken from the clipboard");
+                s.use_soloist_key(key);
             }
         });
     }
@@ -374,6 +517,29 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             w.set_notice(text.into());
             w.set_notice_is_error(true);
         }
+        PlayerEvent::AudioKeyRefused => {
+            w.set_notice(
+                "Spotify не выдаёт этому аккаунту ключи для встроенного плеера (так бывает с новыми \
+                 аккаунтами). Включите Soloist: Настройки → Плеер."
+                    .into(),
+            );
+            w.set_notice_is_error(true);
+        }
+        PlayerEvent::Soloist(status) => {
+            let (line, detail, retry) = soloist_text(&status);
+            w.set_soloist_status(line.into());
+            w.set_soloist_detail(detail.into());
+            w.set_soloist_can_retry(retry);
+            if matches!(status, SoloistStatus::Ready { .. }) {
+                w.set_soloist_need_key(false);
+            }
+            // A refused key: ask for a new one.
+            if let SoloistStatus::Failed(m) = &status
+                && m.contains("ключ")
+            {
+                w.set_soloist_need_key(true);
+            }
+        }
     }
 }
 
@@ -539,6 +705,7 @@ fn show_settings(w: &AppWindow, s: &Settings) {
         .position(|&mb| mb >= s.cache.max_size_mb)
         .unwrap_or(CACHE_SIZES_MB.len() - 1);
     w.set_set_cache(i32::try_from(cache).unwrap_or(2));
+    w.set_set_engine(i32::from(s.player.soloist));
 }
 
 /// The settings page → Settings (keeps what the page does not show, like the Client ID).
@@ -550,6 +717,7 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.audio.device = w.get_set_device().to_string();
     s.ui.notifications = w.get_set_notifications() != 0;
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
+    s.player.soloist = w.get_set_engine() == 1;
     s
 }
 
@@ -617,11 +785,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         library: lcmd_tx,
         covers: Arc::new(CoverCache::new(mb_to_bytes(settings.cache.max_size_mb))),
         settings: Arc::new(Mutex::new(settings.clone())),
+        key_watch: Arc::new(AtomicBool::new(false)),
         rt: runtime.handle().clone(),
         window: window.as_weak(),
     };
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
+    if settings.player.soloist && std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+        senders.start_soloist();
+    }
+    let s = senders.clone();
+    window.on_soloist_get_key(move || {
+        if let Err(e) = open::that_detached(tonearm_player::soloist::KEY_PAGE) {
+            tracing::warn!(error = %e, "cannot open the browser");
+        }
+        if let Some(w) = s.window.upgrade() {
+            w.set_soloist_detail(
+                "Страница открыта в браузере. Нажмите там «Copy» у ключа: Tonearm заберёт его сам. \
+                 Можно и вставить ключ в поле."
+                    .into(),
+            );
+        }
+        s.watch_clipboard_for_key();
+    });
+    let s = senders.clone();
+    window.on_soloist_key_entered(move |text| {
+        let key = text.trim().to_owned();
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return;
+        }
+        s.use_soloist_key(key);
+    });
+    let s = senders.clone();
+    window.on_soloist_retry(move || s.local(PlayerCommand::SoloistRetry));
     let s = senders.clone();
     window.on_settings_changed(move || s.settings_changed());
     let s = senders.clone();
@@ -658,7 +854,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.auth(Command::CancelLogin);
     });
     let s = senders.clone();
-    window.on_logout(move || s.auth(Command::Logout));
+    window.on_logout(move || {
+        // Soloist's sign-in and key belong to this account: forget them too.
+        s.local(PlayerCommand::Soloist(None));
+        s.rt.spawn_blocking(|| {
+            let _ = tonearm_core::system_store().delete(SOLOIST_KEY);
+            if let Some((root, _)) = soloist_dirs() {
+                std::thread::sleep(Duration::from_secs(2)); // let the child exit first
+                let _ = std::fs::remove_dir_all(root.join("data"));
+            }
+        });
+        s.auth(Command::Logout);
+    });
     let s = senders.clone();
     window.on_retry_now(move || s.auth(Command::RetryNow));
     let weak = window.as_weak();

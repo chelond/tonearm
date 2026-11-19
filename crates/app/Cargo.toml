@@ -20,6 +20,9 @@ tracing-subscriber.workspace = true
 slint.workspace = true
 souvlaki.workspace = true
 directories.workspace = true
+# Already in the tree through Slint: reads the Soloist key the user copies on Spotify's page.
+arboard = { version = "3", default-features = false }
+open = "5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
