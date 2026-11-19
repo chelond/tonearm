@@ -1,8 +1,6 @@
-// Tonearm "Пульт" theme: monochrome hi-fi panel + one signal colour.
-// Drop into crates/app/ui/, bundle fonts (Inter, Inter Display, JetBrains Mono — all OFL) via
-// `import "fonts/....ttf";` and `import { Theme, Fonts, ... } from "theme.slint";`.
-// Rules: square corners, 1px grid lines, covers grayscale (converted in Rust on load) except the playing one,
-// signal red only for "live" things: playhead, playing row, active nav mark, active SHF/RPT, errors.
+// Tonearm theme: soft dark surfaces, rounded cards, full-colour covers and one accent colour that
+// follows the playing track (picked from its cover in Rust). Inter for text, Inter Display for
+// big titles, JetBrains Mono only for time codes.
 
 import "fonts/Inter-Regular.ttf";
 import "fonts/Inter-SemiBold.ttf";
@@ -10,98 +8,244 @@ import "fonts/InterDisplay-Bold.ttf";
 import "fonts/JetBrainsMono-Regular.ttf";
 
 export global Theme {
-    out property <color> bg: #0B0B0A;
-    out property <color> raise: #121211;      // player deck, menus
-    out property <color> hover: #171716;
-    out property <color> selected: #1F1F1D;
-    out property <color> line: #262624;
-    out property <color> line-2: #3A3A37;     // button borders, dotted leaders, empty LEDs
-    out property <color> text-1: #ECEAE4;     // warm paper white
-    out property <color> text-2: #8C8A84;
-    out property <color> text-3: #55534F;
-    out property <color> signal: #FF4A1C;
+    out property <color> bg: #0E0E11;
+    out property <color> sidebar: #0A0A0D;
+    out property <color> surface: #16161B;      // cards, player bar
+    out property <color> surface-2: #1E1E24;    // raised: menus, inputs
+    out property <color> hover: #FFFFFF0D;
+    out property <color> pressed: #FFFFFF17;
+    out property <color> selected: #FFFFFF14;
+    out property <color> line: #FFFFFF12;
+    out property <color> line-2: #FFFFFF26;
+    out property <color> text-1: #F4F4F6;
+    out property <color> text-2: #A6A6B0;
+    out property <color> text-3: #6E6E78;
+    out property <color> danger: #FF5A5F;
+    // Set from Rust: the playing cover's colour and the open page's cover colour.
+    in-out property <color> accent: #FF6A3D;
+    in-out property <color> page-accent: #4A4A58;
+    out property <color> on-accent: #0E0E11;
+    out property <duration> fast: 120ms;
+    out property <duration> normal: 220ms;
+    out property <duration> slow: 600ms;
 }
 
 export global Fonts {
-    out property <string> display: "Inter Display";   // huge titles, 700, tracking -3..-6px
+    out property <string> display: "Inter Display";
     out property <string> text: "Inter";
-    out property <string> mono: "JetBrains Mono";      // numbers, labels, buttons
+    out property <string> mono: "JetBrains Mono";
 }
 
 export global Layout {
-    out property <length> sidebar-width: 232px;
-    out property <length> deck-height: 96px;
-    out property <length> queue-width: 312px;
-    out property <length> header-height: 64px;
-    out property <length> row-height: 40px;
-    out property <length> page-x: 40px;
+    out property <length> sidebar-width: 248px;
+    out property <length> bar-height: 88px;
+    out property <length> queue-width: 340px;
+    out property <length> row-height: 52px;
+    out property <length> page-x: 32px;
+    out property <length> radius: 10px;
+    out property <length> radius-s: 6px;
 }
 
-// Mono uppercase label: "§ 01 — НЕДАВНО", "ГРОМКОСТЬ".
-export component Label inherits Text {
-    font-family: Fonts.mono;
-    font-size: 11px;
-    letter-spacing: 1.2px;
+// Small grey caption ("ПЛЕЙЛИСТЫ" style labels are gone: sentence case reads easier).
+export component Caption inherits Text {
+    font-size: 12px;
     color: Theme.text-3;
+    overflow: elide;
 }
 
-export enum KeyKind { solid, outline, ghost, danger }
+// Section heading on pages: "Недавно слушали".
+export component Heading inherits Text {
+    font-family: Fonts.display;
+    font-weight: 700;
+    font-size: 22px;
+    color: Theme.text-1;
+    overflow: elide;
+}
 
-// Rectangular mono button ("ПАУЗА", "ПЕРЕМЕШАТЬ", "ВЫЙТИ →").
-export component Key inherits Rectangle {
-    in property <string> text;
-    in property <KeyKind> kind: KeyKind.outline;
-    in property <bool> lit;           // small signal square in the corner (SHF/RPT on)
+// Stroke icons in a 24×24 box (shapes after the Lucide set, drawn as paths).
+export component Icon inherits Path {
+    in property <string> name;
+    in property <color> ink: Theme.text-2;
+    in property <length> size: 20px;
+    property <bool> filled: name == "play" || name == "pause" || name == "prev" || name == "next" || name == "heart-fill";
+    width: size;
+    height: size;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: filled ? ink : transparent;
+    stroke: filled ? transparent : ink;
+    stroke-width: filled ? 0px : 2px * size / 24px;
+    commands: name == "home" ? "M3 10.5 L12 3 L21 10.5 L21 20 L15 20 L15 14 L9 14 L9 20 L3 20 Z"
+        : name == "search" ? "M4 11 A7 7 0 1 0 18 11 A7 7 0 1 0 4 11 Z M16 16 L21 21"
+        : name == "library" ? "M5 4 L5 20 M10 4 L10 20 M14.5 4.5 L19 19.5"
+        : name == "stats" ? "M5 20 L5 12 M12 20 L12 4 M19 20 L19 9"
+        : name == "settings" ? "M4 7 L20 7 M4 17 L20 17 M17 7 A2.5 2.5 0 1 0 12 7 A2.5 2.5 0 1 0 17 7 Z M12 17 A2.5 2.5 0 1 0 7 17 A2.5 2.5 0 1 0 12 17 Z"
+        : name == "heart" || name == "heart-fill" ? "M12 20 C12 20 3 14.5 3 8.6 A4.6 4.6 0 0 1 12 6.4 A4.6 4.6 0 0 1 21 8.6 C21 14.5 12 20 12 20 Z"
+        : name == "play" ? "M7 4.5 L19.5 12 L7 19.5 Z"
+        : name == "pause" ? "M6.5 4.5 L10 4.5 L10 19.5 L6.5 19.5 Z M14 4.5 L17.5 4.5 L17.5 19.5 L14 19.5 Z"
+        : name == "prev" ? "M5.5 5 L8 5 L8 19 L5.5 19 Z M19 5 L9.5 12 L19 19 Z"
+        : name == "next" ? "M16 5 L18.5 5 L18.5 19 L16 19 Z M5 5 L14.5 12 L5 19 Z"
+        : name == "shuffle" ? "M3 7 L6 7 C10 7 14 17 18 17 L21 17 M18 14 L21 17 L18 20 M3 17 L6 17 C7.6 17 8.9 15.5 10 13.6 M14 10.4 C15.1 8.5 16.4 7 18 7 L21 7 M18 4 L21 7 L18 10"
+        : name == "repeat" ? "M17 3 L20 6 L17 9 M4 12 L4 10 A4 4 0 0 1 8 6 L20 6 M7 21 L4 18 L7 15 M20 12 L20 14 A4 4 0 0 1 16 18 L4 18"
+        : name == "queue" ? "M4 6 L20 6 M4 12 L14 12 M4 18 L11 18 M15 17 A2 2 0 1 0 19 17 A2 2 0 1 0 15 17 Z M19 17 L19 10 L22 9"
+        : name == "devices" ? "M3 5 L21 5 L21 15 L3 15 Z M8 19.5 L16 19.5 M12 15 L12 19.5"
+        : name == "volume" ? "M4 9 L8 9 L13 5 L13 19 L8 15 L4 15 Z M16.5 9 A4.2 4.2 0 0 1 16.5 15 M19 6 A8.5 8.5 0 0 1 19 18"
+        : name == "mute" ? "M4 9 L8 9 L13 5 L13 19 L8 15 L4 15 Z M17 9.5 L22 14.5 M22 9.5 L17 14.5"
+        : name == "lyrics" ? "M12 3 A3 3 0 0 1 15 6 L15 11 A3 3 0 0 1 9 11 L9 6 A3 3 0 0 1 12 3 Z M5.5 11 A6.5 6.5 0 0 0 18.5 11 M12 17.5 L12 21"
+        : name == "radio" ? "M5 19 A10 10 0 0 1 5 5 M19 5 A10 10 0 0 1 19 19 M8 16 A5.6 5.6 0 0 1 8 8 M16 8 A5.6 5.6 0 0 1 16 16 M14 12 A2 2 0 1 0 10 12 A2 2 0 1 0 14 12 Z"
+        : name == "back" ? "M15 18 L9 12 L15 6"
+        : name == "forward" ? "M9 18 L15 12 L9 6"
+        : name == "close" ? "M18 6 L6 18 M6 6 L18 18"
+        : name == "grip" ? "M8.5 6 L10.5 6 M13.5 6 L15.5 6 M8.5 12 L10.5 12 M13.5 12 L15.5 12 M8.5 18 L10.5 18 M13.5 18 L15.5 18"
+        : name == "sort" ? "M4 6 L20 6 M7 12 L17 12 M10 18 L14 18"
+        : name == "clock" ? "M3 12 A9 9 0 1 0 21 12 A9 9 0 1 0 3 12 Z M12 7 L12 12 L15.5 14"
+        : name == "plus" ? "M12 5 L12 19 M5 12 L19 12"
+        : name == "down" ? "M6 9 L12 15 L18 9"
+        : name == "dots" ? "M5 12 L5.5 12 M11.75 12 L12.25 12 M18.5 12 L19 12"
+        : name == "sparkle" ? "M12 3 L13.8 10.2 L21 12 L13.8 13.8 L12 21 L10.2 13.8 L3 12 L10.2 10.2 Z"
+        : name == "link" ? "M10 14 L14 10 M8.5 11.5 L6.5 13.5 A3.5 3.5 0 0 0 11.5 18.5 L13.5 16.5 M15.5 12.5 L17.5 10.5 A3.5 3.5 0 0 0 12.5 5.5 L10.5 7.5"
+        : name == "user" ? "M16 8 A4 4 0 1 0 8 8 A4 4 0 1 0 16 8 Z M4 21 A8 8 0 0 1 20 21"
+        : name == "logout" ? "M15 4 L19 4 L19 20 L15 20 M10 8 L6 12 L10 16 M6 12 L15 12"
+        : "";
+}
+
+// Round icon button with a hover circle.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <length> icon-size: 20px;
+    in property <bool> active;           // accent ink + dot (shuffle / repeat on)
+    in property <bool> enabled: true;
+    in property <string> badge;          // "1" on repeat-one
+    in property <string> tooltip;
     callback clicked();
-    height: 40px;
-    min-width: t.preferred-width + 36px;
-    border-width: kind == KeyKind.outline ? 1px : 0px;
-    border-color: touch.has-hover ? Theme.text-2 : Theme.line-2;
-    background: kind == KeyKind.solid ? (touch.pressed ? Theme.text-2 : Theme.text-1)
-        : touch.has-hover ? Theme.hover : transparent;
-    t := Text {
-        text: root.text;
-        font-family: Fonts.mono;
-        font-size: 12px;
-        letter-spacing: 1.4px;
-        color: root.kind == KeyKind.solid ? Theme.bg
-            : root.kind == KeyKind.danger ? Theme.signal
-            : root.kind == KeyKind.ghost ? Theme.text-2 : Theme.text-1;
+    width: 36px;
+    height: 36px;
+    border-radius: self.height / 2;
+    background: touch.pressed ? Theme.pressed : touch.has-hover && root.enabled ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+    Icon {
+        name: root.icon;
+        size: root.icon-size;
+        ink: !root.enabled ? Theme.text-3 : root.active ? Theme.accent : touch.has-hover ? Theme.text-1 : Theme.text-2;
+        animate ink { duration: Theme.fast; }
     }
-    if root.lit: Rectangle {
-        x: root.width - 8px;
-        y: 4px;
+    if root.active && root.badge == "": Rectangle {
+        y: root.height - 5px;
         width: 4px;
         height: 4px;
-        background: Theme.signal;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    if root.badge != "": Rectangle {
+        x: root.width - 14px;
+        y: 4px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: Theme.accent;
+        Text { text: root.badge; font-size: 8px; font-weight: 700; color: Theme.on-accent; }
     }
     touch := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
 }
 
-// Segmented switch: [96|160|320], [ВЫКЛ|ВКЛ]. Also used as on/off toggle.
-export component Switch inherits Rectangle {
+// Big round play button (accent, or white on the player bar).
+export component PlayButton inherits Rectangle {
+    in property <bool> playing;
+    in property <length> size: 52px;
+    in property <color> fill: Theme.accent;
+    in property <color> ink: Theme.on-accent;
+    callback clicked();
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: touch.pressed ? fill.darker(0.2) : touch.has-hover ? fill.brighter(0.12) : fill;
+    animate background { duration: Theme.fast; }
+    // A slightly smaller disc while pressed reads as a press without transforms.
+    Rectangle {
+        width: touch.pressed ? root.size * 0.92 : root.size;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: transparent;
+        animate width { duration: Theme.fast; easing: ease-out; }
+        Icon {
+            name: root.playing ? "pause" : "play";
+            size: root.size * 0.42;
+            ink: root.ink;
+            x: (parent.width - self.width) / 2 + (root.playing ? 0px : root.size * 0.02);
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export enum ButtonKind { primary, secondary, ghost, danger }
+
+// Pill button with text ("Войти", "Очистить", "Ещё").
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <ButtonKind> kind: ButtonKind.secondary;
+    callback clicked();
+    height: 38px;
+    min-width: row.preferred-width + 32px;
+    border-radius: self.height / 2;
+    border-width: kind == ButtonKind.secondary ? 1px : 0px;
+    border-color: touch.has-hover ? Theme.text-2 : Theme.line-2;
+    background: kind == ButtonKind.primary ? (touch.pressed ? Theme.accent.darker(0.2) : touch.has-hover ? Theme.accent.brighter(0.1) : Theme.accent)
+        : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    animate background, border-color { duration: Theme.fast; }
+    row := HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                name: root.icon;
+                size: 16px;
+                ink: root.kind == ButtonKind.primary ? Theme.on-accent : root.kind == ButtonKind.danger ? Theme.danger : Theme.text-1;
+            }
+        }
+        Text {
+            text: root.text;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+            color: root.kind == ButtonKind.primary ? Theme.on-accent
+                : root.kind == ButtonKind.danger ? Theme.danger
+                : root.kind == ButtonKind.ghost ? Theme.text-2 : Theme.text-1;
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Segmented control: [96|160|320], [Выкл|Вкл].
+export component Segmented inherits Rectangle {
     in property <[string]> items;
     in-out property <int> current;
     callback changed(int);
-    border-width: 1px;
-    border-color: Theme.line-2;
-    height: 30px;
-    width: row.preferred-width + 2px;
+    height: 34px;
+    width: row.preferred-width + 6px;
+    border-radius: self.height / 2;
+    background: Theme.surface-2;
     row := HorizontalLayout {
-        padding: 1px;
+        padding: 3px;
+        spacing: 2px;
         for item[i] in root.items: Rectangle {
-            width: tx.preferred-width + 20px;
-            background: i == root.current ? Theme.text-1 : transparent;
+            width: tx.preferred-width + 24px;
+            border-radius: self.height / 2;
+            background: i == root.current ? Theme.text-1 : t.has-hover ? Theme.hover : transparent;
+            animate background { duration: Theme.fast; }
             tx := Text {
                 text: item;
-                font-family: Fonts.mono;
-                font-size: 11px;
-                color: i == root.current ? Theme.bg : Theme.text-3;
+                font-size: 13px;
+                font-weight: i == root.current ? 600 : 400;
+                color: i == root.current ? Theme.bg : Theme.text-2;
             }
-            TouchArea {
+            t := TouchArea {
+                mouse-cursor: pointer;
                 clicked => {
                     root.current = i;
                     root.changed(i);
@@ -111,97 +255,170 @@ export component Switch inherits Rectangle {
     }
 }
 
-// Tuner-dial progress: 64 ticks, every 8th taller, played ticks light, signal playhead. Click/drag to seek.
-export component TickRuler inherits Rectangle {
-    in property <float> value;     // 0..1
-    callback seek(float);
-    property <int> ticks: 64;
-    property <float> drag: -1;
-    property <float> shown: drag >= 0 ? drag : max(0, min(1, value));
-    height: 18px;
-    HorizontalLayout {
-        spacing: 3px;
-        alignment: stretch;
-        for i in root.ticks: Rectangle {
-            Rectangle {
-                y: parent.height - self.height;
-                height: Math.mod(i, 8) == 0 ? 12px : 6px;
-                background: i / root.ticks < root.shown ? Theme.text-1 : Theme.text-3;
-            }
-        }
-    }
+// On/off switch.
+export component Toggle inherits Rectangle {
+    in-out property <int> on;
+    callback changed(int);
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    background: on == 1 ? Theme.accent : Theme.line-2;
+    animate background { duration: Theme.normal; }
     Rectangle {
-        x: root.width * root.shown - 1px;
-        y: -4px;
-        width: 2px;
-        height: root.height + 8px;
-        background: Theme.signal;
+        x: root.on == 1 ? root.width - self.width - 3px : 3px;
+        y: 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: #FFFFFF;
+        animate x { duration: Theme.normal; easing: ease-out; }
     }
     TouchArea {
-        pointer-event(e) => {
-            if e.kind == PointerEventKind.down {
-                root.drag = max(0, min(1, self.mouse-x / self.width));
-            } else if e.kind == PointerEventKind.up && root.drag >= 0 {
-                root.seek(root.drag);
-                root.drag = -1;
-            }
-        }
-        moved => {
-            if self.pressed { root.drag = max(0, min(1, self.mouse-x / self.width)); }
+        mouse-cursor: pointer;
+        clicked => {
+            root.on = root.on == 1 ? 0 : 1;
+            root.changed(root.on);
         }
     }
 }
 
-// Segment meter: volume (12) or cache usage (20). Click sets the level.
-export component LedMeter inherits Rectangle {
-    in property <int> segments: 12;
-    in-out property <int> level: 8;
-    in property <bool> interactive: true;
-    callback changed(int);
-    height: 10px;
-    HorizontalLayout {
-        spacing: 3px;
-        for i in root.segments: Rectangle {
-            background: i < root.level ? Theme.text-1 : Theme.line-2;
+// Slim slider (progress, volume). Thickens and shows a knob on hover; drag or click to set.
+export component Slider inherits Rectangle {
+    in property <float> value;           // 0..1
+    in property <bool> smooth;           // animate the fill between updates (playback progress)
+    in property <color> fill: Theme.text-1;
+    callback committed(float);
+    callback moving(float);
+    property <float> drag: -1;
+    property <bool> hot: touch.has-hover || self.drag >= 0;
+    property <float> shown: self.drag >= 0 ? self.drag : max(0, min(1, self.value));
+    height: 16px;
+    Rectangle {
+        y: (root.height - self.height) / 2;
+        height: root.hot ? 6px : 4px;
+        border-radius: self.height / 2;
+        background: Theme.line-2;
+        animate height { duration: Theme.fast; }
+        Rectangle {
+            x: 0;
+            width: parent.width * root.shown;
+            border-radius: parent.border-radius;
+            background: root.hot ? Theme.accent : root.fill;
+            animate width { duration: root.smooth && root.drag < 0 ? 1000ms : 0ms; easing: linear; }
         }
     }
-    TouchArea {
-        enabled: root.interactive;
-        clicked => {
-            root.level = Math.ceil(self.mouse-x / self.width * root.segments);
-            root.changed(root.level);
+    Rectangle {
+        x: root.width * root.shown - self.width / 2;
+        y: (root.height - self.height) / 2;
+        width: root.hot ? 14px : 0px;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: #FFFFFF;
+        animate width { duration: Theme.fast; }
+        animate x { duration: root.smooth && root.drag < 0 ? 1000ms : 0ms; easing: linear; }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                root.drag = max(0, min(1, self.mouse-x / self.width));
+                root.moving(root.drag);
+            } else if e.kind == PointerEventKind.up && root.drag >= 0 {
+                root.committed(root.drag);
+                root.drag = -1;
+            }
+        }
+        moved => {
+            if self.pressed && root.drag >= 0 {
+                root.drag = max(0, min(1, self.mouse-x / self.width));
+                root.moving(root.drag);
+            }
         }
         scroll-event(e) => {
-            root.level = max(0, min(root.segments, root.level + (e.delta-y > 0 ? 1 : -1)));
-            root.changed(root.level);
+            root.committed(max(0, min(1, root.shown + (e.delta-y > 0 ? 0.05 : -0.05))));
             accept
         }
     }
 }
 
+// Rounded cover with a placeholder until the picture arrives (fades in).
+export component Cover inherits Rectangle {
+    in property <image> source;
+    in property <bool> loaded;
+    in property <bool> round;
+    in property <string> placeholder-icon: "library";
+    in property <length> radius: Layout.radius-s;
+    border-radius: round ? min(self.width, self.height) / 2 : radius;
+    clip: true;
+    background: Theme.surface-2;
+    if !root.loaded: Icon {
+        name: root.placeholder-icon;
+        size: min(root.width, root.height) * 0.36;
+        ink: Theme.text-3;
+    }
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.source;
+        image-fit: cover;
+        opacity: root.loaded ? 1 : 0;
+        animate opacity { duration: 300ms; }
+    }
+}
+
+// Three bouncing bars on the playing row; still while paused.
+export component Equalizer inherits Rectangle {
+    in property <bool> running;
+    in property <color> ink: Theme.accent;
+    width: 14px;
+    height: 14px;
+    property <float> t: self.running ? animation-tick() / 1ms : 0;
+    for i in 3: Rectangle {
+        x: i * 5px;
+        width: 3px;
+        property <float> phase: root.running ? (Math.sin((root.t / 160 + i * 2.1) * 1rad) + 1) / 2 : 0.4 + i * 0.1;
+        height: root.height * (0.25 + 0.75 * self.phase);
+        y: root.height - self.height;
+        border-radius: 1px;
+        background: root.ink;
+    }
+}
+
 export enum RowState { normal, playing, unavailable }
 
-// Sleeve-style track row: code (001 / A1) · title · artist · dotted leader · m:ss. ListView delegate.
+// Track row: number / equalizer · cover? · title + artist · album · duration.
 export component TrackRow inherits Rectangle {
-    in property <string> code;          // "001", "A1", "B3"
+    in property <string> code;
     in property <string> title;
     in property <string> artist;
+    in property <string> album;
     in property <string> duration;
-    in property <bool> selected;
+    in property <image> image;
+    in property <bool> has-image;
+    in property <bool> show-image;
+    in property <bool> show-album: true;
+    in property <bool> playing-now;      // the player is running (equalizer moves)
     in property <RowState> state: RowState.normal;
-    // Navigation lists (library, discography) open on a single click; track lists play on double click.
+    // Navigation lists open on a single click; track lists play on double click.
     in property <bool> single-click;
+    in property <length> inset: 8px;     // side margin of the hover background
     callback play();
     callback context-menu(Point);
 
     height: Layout.row-height;
-    background: selected ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
-    opacity: state == RowState.unavailable ? 0.3 : 1.0;
+    property <bool> is-playing: state == RowState.playing;
+    opacity: state == RowState.unavailable ? 0.35 : 1.0;
 
-    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    Rectangle {
+        x: root.inset;
+        width: root.width - 2 * root.inset;
+        border-radius: Layout.radius-s;
+        background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
 
     touch := TouchArea {
-        mouse-cursor: root.single-click ? pointer : default;
+        mouse-cursor: pointer;
         clicked => { if root.single-click { root.play(); } }
         double-clicked => { if !root.single-click && root.state != RowState.unavailable { root.play(); } }
         pointer-event(e) => {
@@ -212,53 +429,66 @@ export component TrackRow inherits Rectangle {
     }
 
     HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        spacing: 16px;
-        Text {
-            width: 32px;
-            vertical-alignment: center;
-            text: touch.has-hover && root.state == RowState.normal && !root.single-click ? "▶" : root.code;
-            font-family: Fonts.mono;
-            font-size: 12px;
-            color: root.state == RowState.playing ? Theme.signal : Theme.text-3;
-        }
-        Text {
-            vertical-alignment: center;
-            text: root.title;
-            font-family: Fonts.text;
-            font-size: 15px;
-            color: root.state == RowState.playing ? Theme.signal : Theme.text-1;
-            overflow: elide;
-        }
-        Text {
-            vertical-alignment: center;
-            text: root.artist;
-            font-size: 13px;
-            color: Theme.text-2;
-            overflow: elide;
-        }
-        // dotted leader: a clipped run of dots fills the remaining width
+        padding-left: root.inset + 12px;
+        padding-right: root.inset + 16px;
+        spacing: 14px;
         Rectangle {
-            horizontal-stretch: 1;
-            min-width: 20px;
-            clip: true;
-            Text {
-                x: 0;
-                y: parent.height / 2 - 4px;
-                text: "······································································································································································································································································································";
-                font-family: Fonts.mono;
-                font-size: 10px;
-                color: Theme.line-2;
+            width: 28px;
+            if root.is-playing: Equalizer { running: root.playing-now; }
+            if !root.is-playing && touch.has-hover && !root.single-click: Icon {
+                name: "play";
+                size: 14px;
+                ink: Theme.text-1;
+            }
+            if !root.is-playing && !(touch.has-hover && !root.single-click): Text {
+                text: root.code;
+                font-size: 13px;
+                color: Theme.text-3;
+                horizontal-alignment: center;
             }
         }
-        Text {
-            vertical-alignment: center;
-            text: root.duration;
-            font-family: Fonts.mono;
-            font-size: 12px;
+        if root.show-image: Cover {
+            width: 38px;
+            height: 38px;
+            y: (parent.height - self.height) / 2;
+            radius: 4px;
+            source: root.image;
+            loaded: root.has-image;
+            placeholder-icon: "play";
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 3;
+            Text {
+                text: root.title;
+                font-size: 14px;
+                font-weight: 600;
+                color: root.is-playing ? Theme.accent : Theme.text-1;
+                overflow: elide;
+            }
+            if root.artist != "": Text {
+                text: root.artist;
+                font-size: 13px;
+                color: Theme.text-2;
+                overflow: elide;
+            }
+        }
+        if root.show-album: Text {
+            horizontal-stretch: 2;
+            text: root.album;
+            font-size: 13px;
             color: Theme.text-2;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            min-width: 48px;
+            text: root.duration;
+            font-size: 13px;
+            color: Theme.text-3;
+            vertical-alignment: center;
+            horizontal-alignment: right;
         }
     }
 }
-

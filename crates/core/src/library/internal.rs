@@ -200,12 +200,48 @@ async fn context_track_uris(
     Ok(uris)
 }
 
-/// Cover of the first track's album, for playlists without a picture of their own.
-pub async fn first_track_cover(session: &Session, playlist_uri: &str) -> Option<String> {
+/// Cover for a playlist without a picture of its own: a 2×2 mosaic of the first four different
+/// album covers, as the official client shows it, or the single album cover of a short list.
+pub async fn fallback_cover(session: &Session, playlist_uri: &str) -> Option<String> {
     let (_, uris) = playlist(session, playlist_uri).await.ok()?;
-    let id = SpotifyUri::from_uri(uris.first()?).ok()?;
-    let t = Track::get(session, &id).await.ok()?;
-    image_url(&t.album.covers)
+    mosaic_for(session, &uris).await
+}
+
+/// Mosaic (or single cover) from the albums of the first tracks in `uris`.
+pub async fn mosaic_for(session: &Session, uris: &[String]) -> Option<String> {
+    let ids: Vec<SpotifyUri> = uris
+        .iter()
+        .take(16)
+        .filter_map(|u| SpotifyUri::from_uri(u).ok())
+        .collect();
+    let tracks = futures_util::future::join_all(ids.iter().map(|id| Track::get(session, id))).await;
+    let mut covers: Vec<String> = Vec::new();
+    for t in tracks.into_iter().flatten() {
+        if let Some(url) = image_url(&t.album.covers)
+            && !covers.contains(&url)
+        {
+            covers.push(url);
+            if covers.len() == 4 {
+                break;
+            }
+        }
+    }
+    mosaic_url(&covers)
+}
+
+/// Four `i.scdn.co/image/<id>` urls → one mosaic url; fewer → the first cover.
+fn mosaic_url(covers: &[String]) -> Option<String> {
+    if covers.len() < 4 {
+        return covers.first().cloned();
+    }
+    let ids: Option<Vec<&str>> = covers
+        .iter()
+        .map(|u| u.strip_prefix("https://i.scdn.co/image/"))
+        .collect();
+    match ids {
+        Some(ids) => Some(format!("https://mosaic.scdn.co/640/{}", ids.concat())),
+        None => covers.first().cloned(),
+    }
 }
 
 /// Uris of Liked Songs, newest first (the order the collection context returns).
@@ -387,6 +423,17 @@ fn write_request(username: &str, uri: &str, added_at: u64, removed: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mosaic_needs_four_covers() {
+        let c = |id: &str| format!("https://i.scdn.co/image/{id}");
+        assert_eq!(mosaic_url(&[]), None);
+        assert_eq!(mosaic_url(&[c("a"), c("b")]), Some(c("a")));
+        assert_eq!(
+            mosaic_url(&[c("a"), c("b"), c("c"), c("d")]).as_deref(),
+            Some("https://mosaic.scdn.co/640/abcd")
+        );
+    }
 
     #[test]
     fn write_request_encodes_like_protoc() {

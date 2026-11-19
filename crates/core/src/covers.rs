@@ -1,7 +1,7 @@
-//! Cover art: download, disk cache with a size limit, decode, resize, grayscale.
+//! Cover art: download, disk cache with a size limit, decode, resize, accent colour.
 //!
-//! The "Пульт" design shows every cover in grayscale except the playing one, so each cover is
-//! decoded once into both variants here and the UI only picks one.
+//! Each cover is decoded once at the size it is shown; the accent colour (a vivid, readable
+//! colour picked from the picture) tints the UI around the playing track and the open page.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -15,7 +15,8 @@ pub struct Cover {
     pub width: u32,
     pub height: u32,
     pub color: Vec<u8>,
-    pub gray: Vec<u8>,
+    /// Vivid colour from the picture, lightened or darkened to read well on the dark theme.
+    pub accent: [u8; 3],
 }
 
 impl std::fmt::Debug for Cover {
@@ -39,15 +40,33 @@ pub struct CoverCache {
     http: reqwest::Client,
 }
 
-/// Only Spotify's image CDN is fetched.
+/// Only Spotify's image CDNs are fetched. Spotify serves its own playlists (blends, "This Is",
+/// mixes, daylist, Wrapped…) from many hosts under these two domains, so match the domain.
 fn allowed(url: &str) -> bool {
-    url.starts_with("https://i.scdn.co/")
-        || url.starts_with("https://mosaic.scdn.co/")
-        || url.starts_with("https://image-cdn-")
-        || url.starts_with("https://wrapped-images.spotifycdn.com/")
-        || url.starts_with("https://pickasso.spotifycdn.com/")
-        || url.starts_with("https://seeded-session-images.scdn.co/")
-        || url.starts_with("https://daylist.spotifycdn.com/")
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.contains(['@', ':']) {
+        return false;
+    }
+    [".scdn.co", ".spotifycdn.com", ".spotify.com"]
+        .iter()
+        .any(|d| host.ends_with(d))
+}
+
+/// `spotify:image:<hex>` / `spotify:mosaic:<id>:<id>…` (as some internal endpoints return them)
+/// → a CDN url; other urls pass through.
+#[must_use]
+pub fn normalize_url(url: &str) -> String {
+    if let Some(hex) = url.strip_prefix("spotify:image:") {
+        return format!("https://i.scdn.co/image/{hex}");
+    }
+    if let Some(ids) = url.strip_prefix("spotify:mosaic:") {
+        let ids: String = ids.split(':').collect();
+        return format!("https://mosaic.scdn.co/640/{ids}");
+    }
+    url.to_owned()
 }
 
 fn file_name(url: &str) -> String {
@@ -110,11 +129,19 @@ impl CoverCache {
 
     /// Returns the cover scaled to fit `size`×`size`.
     pub async fn get(&self, url: &str, size: u32) -> Result<Cover, CoverError> {
-        if !allowed(url) {
-            return Err(CoverError::Network("недопустимый адрес".into()));
+        let url = normalize_url(url);
+        if !allowed(&url) {
+            return Err(CoverError::Network(format!("недопустимый адрес {url}")));
         }
-        let bytes = self.bytes(url).await?;
-        let url = url.to_owned();
+        // One retry: covers load in bursts and a single timeout should not leave a hole.
+        let bytes = match self.bytes(&url).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(%e, "cover retry");
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                self.bytes(&url).await?
+            }
+        };
         tokio::task::spawn_blocking(move || decode(&url, &bytes, size))
             .await
             .map_err(|_| CoverError::Decode)?
@@ -214,23 +241,94 @@ fn decode(url: &str, bytes: &[u8], size: u32) -> Result<Cover, CoverError> {
     };
     let color = img.to_rgba8();
     let (width, height) = color.dimensions();
-    let mut gray = color.clone();
-    for px in gray.pixels_mut() {
-        let [r, g, b, a] = px.0;
-        let l = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-        // Slight contrast boost around mid-grey, as in the mockups.
-        let l = ((l - 128.0) * 1.1 + 128.0).clamp(0.0, 255.0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let l = l as u8;
-        px.0 = [l, l, l, a];
-    }
+    let accent = accent(color.as_raw());
     Ok(Cover {
         url: url.to_owned(),
         width,
         height,
         color: color.into_raw(),
-        gray: gray.into_raw(),
+        accent,
     })
+}
+
+/// Picks the accent colour: a saturation-weighted average of the pixels (so a vivid area wins
+/// over a large grey one), then brought into a lightness band that reads on a dark background.
+#[must_use]
+pub fn accent(rgba: &[u8]) -> [u8; 3] {
+    let (mut r, mut g, mut b, mut wsum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for px in rgba.chunks_exact(4).step_by(3) {
+        let (pr, pg, pb) = (f32::from(px[0]), f32::from(px[1]), f32::from(px[2]));
+        let max = pr.max(pg).max(pb);
+        let min = pr.min(pg).min(pb);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        // Skip near-black and near-white: they say nothing about the cover's colour.
+        let w = sat * sat + 0.02;
+        let w = if max < 30.0 || min > 235.0 {
+            w * 0.1
+        } else {
+            w
+        };
+        r += pr * w;
+        g += pg * w;
+        b += pb * w;
+        wsum += w;
+    }
+    if wsum <= 0.0 {
+        return [0xFF, 0x6A, 0x3D];
+    }
+    let (h, s, _) = rgb_to_hsl(r / wsum, g / wsum, b / wsum);
+    // Keep some colour even for washed-out covers; fixed lightness keeps text on it readable.
+    let s = (s * 1.25).clamp(0.25, 0.85);
+    hsl_to_rgb(h, s, 0.62)
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let (r, g, b) = (r / 255.0, g / 255.0, b / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = f32::midpoint(max, min);
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < f32::EPSILON {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h / 6.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let ch = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        let v = if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let v = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        v
+    };
+    [ch(h + 1.0 / 3.0), ch(h), ch(h - 1.0 / 3.0)]
 }
 
 #[cfg(test)]
@@ -245,13 +343,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_resizes_and_makes_gray() {
+    fn decode_resizes_and_picks_accent() {
         let c = decode("u", &png(640, 640), 64).unwrap();
         assert_eq!((c.width, c.height), (64, 64));
         assert_eq!(c.color.len(), 64 * 64 * 4);
-        let [r, g, b, _] = [c.gray[0], c.gray[1], c.gray[2], c.gray[3]];
-        assert!(r == g && g == b);
         assert_eq!(&c.color[..3], &[200, 40, 30]);
+        // A red cover gives a red accent.
+        let [r, g, b] = c.accent;
+        assert!(r > g && r > b, "{:?}", c.accent);
+    }
+
+    #[test]
+    fn accent_of_grey_is_not_black() {
+        let grey = vec![128u8; 16 * 16 * 4];
+        let [r, g, b] = accent(&grey);
+        assert!(u16::from(r) + u16::from(g) + u16::from(b) > 300);
+    }
+
+    #[test]
+    fn spotify_uris_become_urls() {
+        assert_eq!(
+            normalize_url("spotify:image:ab12"),
+            "https://i.scdn.co/image/ab12"
+        );
+        assert_eq!(
+            normalize_url("spotify:mosaic:a:b:c:d"),
+            "https://mosaic.scdn.co/640/abcd"
+        );
+        assert_eq!(normalize_url("https://x.scdn.co/y"), "https://x.scdn.co/y");
     }
 
     #[test]
@@ -281,7 +400,13 @@ mod tests {
     #[test]
     fn only_spotify_cdn() {
         assert!(allowed("https://i.scdn.co/image/ab67"));
+        assert!(allowed(
+            "https://blend-playlist-covers.spotifycdn.com/v2/blend_DEFAULT-x.jpg"
+        ));
+        assert!(allowed("https://thisis-images.spotifycdn.com/x"));
         assert!(!allowed("http://i.scdn.co/image/x"));
         assert!(!allowed("https://example.com/x.jpg"));
+        assert!(!allowed("https://scdn.co.evil.com/x.jpg"));
+        assert!(!allowed("https://evil.com@i.scdn.co/x"));
     }
 }

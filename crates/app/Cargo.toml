@@ -20,6 +20,10 @@ tracing-subscriber.workspace = true
 slint.workspace = true
 souvlaki.workspace = true
 directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Already in the tree (via librespot): local time for the greeting and date.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Already in the tree through Slint: reads the Soloist key the user copies on Spotify's page.
 arboard = { version = "3", default-features = false }
 open = "5"

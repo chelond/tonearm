@@ -2,6 +2,7 @@
 //!
 //! Runs next to the auth backend and gets the session through the same `watch` channel as the player.
 
+pub mod extras;
 mod internal;
 mod metadata;
 pub mod model;
@@ -10,6 +11,7 @@ mod webtoken;
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use librespot_core::Session;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -18,7 +20,9 @@ pub use model::*;
 use webapi::{ApiError, Http, HttpResponse, Method, TrackPage, WebApi};
 pub use webtoken::{WEBAPI_REFRESH_KEY, forget_own_token, use_own_client_id};
 
-const HOME_TILES: usize = 6;
+const HOME_TILES: usize = 12;
+/// Playlists without a picture that get a mosaic built at startup.
+const MOSAIC_LIMIT: usize = 40;
 /// Typing pause before a search request, so every keystroke does not hit the rate limit.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -39,6 +43,19 @@ pub enum LibraryCommand {
         uri: String,
         saved: bool,
     },
+    /// Cover of a track the player reported without one.
+    TrackCover(String),
+    /// Similar tracks for "Радио по треку"; `title` names the queue.
+    Radio {
+        uri: String,
+        title: String,
+    },
+    Lyrics {
+        uri: String,
+        title: String,
+        artist: String,
+        duration_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +73,11 @@ pub enum LibraryEvent {
         page_id: u64,
         tracks: Vec<TrackItem>,
         done: bool,
+    },
+    /// A picture for the page found after its header (mosaic of a playlist without one).
+    PageImage {
+        page_id: u64,
+        url: String,
     },
     /// Discography on an artist page.
     PageTiles {
@@ -81,6 +103,19 @@ pub enum LibraryEvent {
     Saved {
         uri: String,
         saved: bool,
+    },
+    TrackCover {
+        uri: String,
+        url: String,
+    },
+    Radio {
+        title: String,
+        tracks: Vec<TrackItem>,
+    },
+    /// `None`: no lyrics anywhere for this track.
+    Lyrics {
+        uri: String,
+        lyrics: Option<extras::Lyrics>,
     },
     Error(String),
 }
@@ -193,6 +228,7 @@ pub async fn run(
                 Some(LibraryCommand::Open(req)) => svc.open(req),
                 Some(LibraryCommand::Search { query, kind, offset }) => svc.search(query, kind, offset),
                 Some(LibraryCommand::SetSaved { uri, saved }) => svc.set_saved(uri, saved),
+                Some(cmd) => svc.extra(cmd),
             },
             changed = sessions.changed() => {
                 if changed.is_err() {
@@ -287,6 +323,38 @@ impl Service {
 }
 
 impl Service {
+    /// Track cover, radio and lyrics: independent one-shot requests.
+    fn extra(&mut self, cmd: LibraryCommand) {
+        let events = self.events.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let task = async move {
+            let ev = match cmd {
+                LibraryCommand::TrackCover(uri) => {
+                    let url = extras::track_cover(&session, &uri).await?;
+                    LibraryEvent::TrackCover { uri, url }
+                }
+                LibraryCommand::Radio { uri, title } => match extras::radio(&session, &uri).await {
+                    Ok(tracks) => LibraryEvent::Radio { title, tracks },
+                    Err(e) => LibraryEvent::Error(format!("Радио не запустилось: {e}")),
+                },
+                LibraryCommand::Lyrics {
+                    uri,
+                    title,
+                    artist,
+                    duration_ms,
+                } => LibraryEvent::Lyrics {
+                    lyrics: extras::lyrics(&session, &uri, &title, &artist, duration_ms).await,
+                    uri,
+                },
+                _ => return None,
+            };
+            events.send(ev).await.ok()
+        };
+        tokio::spawn(task);
+    }
+
     fn set_saved(&self, uri: String, saved: bool) {
         let events = self.events.clone();
         let Some(session) = self.session.clone() else {
@@ -465,24 +533,34 @@ async fn load_page(
 async fn refresh_internal(session: Session, events: mpsc::Sender<LibraryEvent>) {
     match internal::playlists(&session).await {
         Ok(lists) => {
-            let mut tiles = internal::home_tiles(&lists, HOME_TILES);
-            let _ = events.send(LibraryEvent::Playlists(lists)).await;
-            let _ = events.send(LibraryEvent::Home(tiles.clone())).await;
-            // Tiles without a picture get the first track's album cover, then a second update.
-            let missing: Vec<usize> = (0..tiles.len())
-                .filter(|&i| tiles[i].image_url.is_none())
+            let mut lists = lists;
+            let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+            let _ = events
+                .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                .await;
+            // Playlists without a picture get a mosaic of their albums (sidebar and home), a few
+            // at a time, then one more update with all of them.
+            let missing: Vec<usize> = (0..lists.len())
+                .filter(|&i| lists[i].image_url.is_none())
+                .take(MOSAIC_LIMIT)
                 .collect();
             if !missing.is_empty() {
-                let covers = futures_util::future::join_all(
-                    missing
-                        .iter()
-                        .map(|&i| internal::first_track_cover(&session, &tiles[i].uri)),
-                )
-                .await;
-                for (i, cover) in missing.into_iter().zip(covers) {
-                    tiles[i].image_url = cover;
+                let found: Vec<(usize, Option<String>)> = futures_util::stream::iter(missing)
+                    .map(|i| {
+                        let session = session.clone();
+                        let uri = lists[i].uri.clone();
+                        async move { (i, internal::fallback_cover(&session, &uri).await) }
+                    })
+                    .buffer_unordered(4)
+                    .collect()
+                    .await;
+                for (i, url) in found {
+                    lists[i].image_url = url;
                 }
-                let _ = events.send(LibraryEvent::Home(tiles)).await;
+                let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+                let _ = events
+                    .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                    .await;
             }
         }
         Err(e) => {
@@ -564,9 +642,18 @@ async fn load_page_internal(
             .map_err(|e| e.to_string())?,
         PageRequest::Artist(_) => return Err("артист грузится через metadata".into()),
     };
+    let needs_mosaic = header.image_url.is_none() && header.kind == CollectionKind::Playlist;
     events
         .send(LibraryEvent::PageHeader { page_id, header })
         .await
         .map_err(|_| "UI закрыт".to_owned())?;
+    if needs_mosaic && !uris.is_empty() {
+        let (session, events, uris) = (session.clone(), events.clone(), uris.clone());
+        tokio::spawn(async move {
+            if let Some(url) = internal::mosaic_for(&session, &uris).await {
+                let _ = events.send(LibraryEvent::PageImage { page_id, url }).await;
+            }
+        });
+    }
     send_track_uris(session, events, page_id, &uris).await
 }

@@ -34,6 +34,11 @@ pub enum PlayerCommand {
     JumpTo(usize),
     /// Drop the hand-queued tracks.
     ClearQueue,
+    /// Drag and drop in the queue panel: entry `from` of the upcoming list goes to `to`.
+    MoveInQueue {
+        from: usize,
+        to: usize,
+    },
     /// New audio settings; a new output/bitrate applies from the next track.
     Configure(AudioOptions),
     /// Pause if playing (playback moved to another device).

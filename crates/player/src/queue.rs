@@ -169,6 +169,28 @@ impl Queue {
         true
     }
 
+    /// Drag and drop in the queue panel: moves entry `from` of [`QueueSnapshot::upcoming`] to
+    /// `to`. Hand-queued tracks and the context are reordered each within its own part; a drop
+    /// across the border lands at the border.
+    pub fn move_upcoming(&mut self, from: usize, to: usize) {
+        let m = self.manual.len();
+        if from < m {
+            let to = to.min(m - 1);
+            if let Some(item) = self.manual.remove(from) {
+                self.manual.insert(to, item);
+            }
+            return;
+        }
+        let start = self.pos.map_or(0, |p| p + 1);
+        let (from, to) = (start + from - m, start + to.max(m) - m);
+        if from >= self.order.len() {
+            return;
+        }
+        let to = to.min(self.order.len() - 1);
+        let entry = self.order.remove(from);
+        self.order.insert(to, entry);
+    }
+
     pub fn clear_manual(&mut self) {
         self.manual.clear();
     }
@@ -232,6 +254,41 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    #[test]
+    fn move_reorders_within_each_part() {
+        let mut q = Queue::default();
+        q.set_context(items(5), 0, String::new());
+        q.set_shuffle(false);
+        q.add(QueueItem {
+            uri: "m1".into(),
+            ..QueueItem::default()
+        });
+        q.add(QueueItem {
+            uri: "m2".into(),
+            ..QueueItem::default()
+        });
+        let uris = |q: &Queue| -> Vec<String> {
+            q.snapshot(10).upcoming.into_iter().map(|i| i.uri).collect()
+        };
+        q.move_upcoming(1, 0);
+        assert_eq!(uris(&q)[..2], ["m2".to_owned(), "m1".to_owned()]);
+        // context: 1 2 3 4 after the current 0; move "4" to the front of the context
+        q.move_upcoming(5, 0);
+        assert_eq!(
+            uris(&q),
+            [
+                "m2",
+                "m1",
+                "spotify:track:4",
+                "spotify:track:1",
+                "spotify:track:2",
+                "spotify:track:3"
+            ]
+        );
+        q.move_upcoming(99, 99); // out of range: nothing happens
+        assert_eq!(uris(&q).len(), 6);
+    }
 
     fn items(n: usize) -> Vec<QueueItem> {
         (0..n)
