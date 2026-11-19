@@ -1,0 +1,23 @@
+[package]
+name = "tonearm-player"
+description = "Queue, shuffle/repeat, volume, seek and player events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+librespot-core.workspace = true
+librespot-metadata.workspace = true
+librespot-playback.workspace = true
+rand.workspace = true
+cpal.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

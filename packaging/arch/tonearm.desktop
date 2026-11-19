@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tonearm
+GenericName=Music Player
+Comment=Lightweight native music streaming client
+Exec=tonearm %U
+Icon=tonearm
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=tonearm

@@ -1,0 +1,36 @@
+[package]
+name = "tonearm"
+description = "Lightweight native desktop client (unofficial)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "tonearm"
+path = "src/main.rs"
+
+[dependencies]
+tonearm-core.workspace = true
+tonearm-player.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+slint.workspace = true
+souvlaki.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[lints]
+workspace = true
