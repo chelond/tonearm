@@ -405,6 +405,12 @@ impl Senders {
                         self.rt.spawn_blocking(move || store.save());
                     }
                 }
+                Effect::SaveResume(r) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt
+                            .spawn_blocking(move || history::save_resume(Some(&r)));
+                    }
+                }
             }
         }
     }
