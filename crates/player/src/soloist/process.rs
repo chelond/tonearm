@@ -24,12 +24,14 @@ pub struct Args<'a> {
     pub volume: u8,
 }
 
-/// No console window flashing up on Windows.
+/// No console (and no conhost.exe) for Soloist on Windows.
 pub fn hide_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // DETACHED_PROCESS: no console at all, so no conhost.exe next to Soloist (CREATE_NO_WINDOW
+        // only hides the window and still costs a conhost). Its output is piped to soloist.log.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
     }
     #[cfg(not(windows))]
     let _ = cmd;
