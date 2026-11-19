@@ -41,21 +41,28 @@ pub enum UiRequest {
 }
 
 /// Registers the media controls. Call after the window is shown (SMTC needs its handle).
+///
+/// Returns `false` when the native window does not exist yet (Windows): call again later.
+/// souvlaki panics without an HWND on Windows, so it is never called without one.
 pub fn init(
     window: &AppWindow,
     player: impl Fn(PlayerCommand) + Send + 'static,
     ui: impl Fn(UiRequest) + Send + 'static,
-) {
+) -> bool {
+    let hwnd = window_handle(window);
+    if cfg!(windows) && hwnd.is_none() {
+        return false;
+    }
     let config = PlatformConfig {
         display_name: "Tonearm",
         dbus_name: "tonearm",
-        hwnd: window_handle(window),
+        hwnd,
     };
     let mut controls = match MediaControls::new(config) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = ?e, "media controls unavailable");
-            return;
+            return true;
         }
     };
     let position = Arc::new(AtomicU32::new(0));
@@ -95,7 +102,7 @@ pub fn init(
     };
     if let Err(e) = controls.attach(handler) {
         tracing::warn!(error = ?e, "media controls: attach failed");
-        return;
+        return true;
     }
     MEDIA.with(|m| {
         *m.borrow_mut() = Some(OsMedia {
@@ -107,6 +114,7 @@ pub fn init(
             track_uri: String::new(),
         });
     });
+    true
 }
 
 fn seek_by(position: &AtomicU32, dir: SeekDirection, by: Duration) -> PlayerCommand {
