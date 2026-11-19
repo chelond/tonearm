@@ -109,6 +109,8 @@ struct Solo {
     seek_after_load: Option<u32>,
     /// The URI Soloist plays now, as we last saw it.
     playing_uri: Option<String>,
+    /// What the player bar got for it; a fuller report of the same track replaces it.
+    shown: Option<TrackInfo>,
     /// Position anchor for the 500 ms ticks (Soloist reports only changes).
     anchor: Option<(u32, Instant)>,
 }
@@ -631,7 +633,7 @@ impl Service {
                 if let Some(ms) = self.solo.seek_after_load.take() {
                     self.solo_send(json!({"command": "seek", "position_ms": ms}));
                 }
-                self.emit(PlayerEvent::Track(track)).await;
+                self.solo_show(track).await;
                 return;
             }
             if self.solo_waiting() {
@@ -639,15 +641,43 @@ impl Service {
             }
         }
         if self.solo.playing_uri.as_deref() == Some(track.uri.as_str()) {
+            // track_changed may carry only the title; playback_state the rest.
+            self.solo_show(track).await;
             return;
         }
         if self.solo.playing_uri.is_none() {
             // Something started on Soloist from another app: show it.
             self.solo.playing_uri = Some(track.uri.clone());
-            self.emit(PlayerEvent::Track(track)).await;
+            self.solo_show(track).await;
             return;
         }
         self.solo_advance().await;
+    }
+
+    /// Sends `track` to the player bar, keeping fields an earlier report of it had.
+    async fn solo_show(&mut self, mut track: TrackInfo) {
+        if let Some(old) = self.solo.shown.as_ref().filter(|o| o.uri == track.uri) {
+            if track.title.is_empty() {
+                track.title.clone_from(&old.title);
+            }
+            if track.artists.is_empty() {
+                track.artists.clone_from(&old.artists);
+            }
+            if track.album.is_empty() {
+                track.album.clone_from(&old.album);
+            }
+            if track.duration_ms == 0 {
+                track.duration_ms = old.duration_ms;
+            }
+            if track.cover_url.is_none() {
+                track.cover_url.clone_from(&old.cover_url);
+            }
+            if *old == track {
+                return;
+            }
+        }
+        self.solo.shown = Some(track.clone());
+        self.emit(PlayerEvent::Track(track)).await;
     }
 
     async fn solo_advance(&mut self) {

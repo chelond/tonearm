@@ -342,6 +342,12 @@ async fn run(
                         tracing::warn!(message = v["message"].as_str().unwrap_or(""), "soloist refused a command");
                     }
                     _ => {
+                        if v["type"] == "track_changed" {
+                            let raw = v["item"].to_string();
+                            tracing::info!(item = raw.get(..1500).unwrap_or(&raw), "soloist track_changed");
+                            // The full snapshot has the artists, duration and cover.
+                            let _ = send(&mut socket, json!({"command": "get_state"})).await;
+                        }
                         if let Some(ev) = parse_event(&v) {
                             let _ = events.send(ev);
                         }
