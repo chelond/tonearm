@@ -285,20 +285,25 @@ async fn run(
         let _ = spawned.child.kill().await;
         return Outcome::Crashed("Soloist не отвечает по WebSocket".into());
     };
-    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<Result<(), String>>();
-    let mut tried_pairing = false;
+    // Err((true, _)): Soloist took the account but did not log in; the next way may work.
+    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<Result<(), (bool, String)>>();
+    // Sign-in attempts made: 1 = stored credentials, 2 = access token.
+    let mut attempts = 0usize;
     let mut logged_in = false;
-    let start_pairing = |tried: &mut bool| {
-        *tried = true;
+    let start_pairing = |attempts: &mut usize| {
+        let way = *attempts;
+        *attempts += 1;
         let session = sessions.borrow().clone();
         let name = cfg.device_name.clone();
         let tx = pair_tx.clone();
         tokio::spawn(async move {
             let result = match session {
-                Some(s) => pair_with(&s, &name).await,
+                Some(s) => tokio::time::timeout(Duration::from_secs(45), pair_with(&s, &name, way))
+                    .await
+                    .unwrap_or_else(|_| Err("нет ответа за 45 секунд".into())),
                 None => Err("сначала войдите в аккаунт".into()),
             };
-            let _ = tx.send(result);
+            let _ = tx.send(result.map_err(|e| (false, e)));
         });
     };
     loop {
@@ -328,9 +333,9 @@ async fn run(
                         if logged_in {
                             status(ready.clone());
                             let _ = send(&mut socket, json!({"command": "get_state"})).await;
-                        } else if !tried_pairing {
+                        } else if attempts == 0 {
                             status(SoloistStatus::Pairing);
-                            start_pairing(&mut tried_pairing);
+                            start_pairing(&mut attempts);
                         }
                     }
                     "error" => {
@@ -345,8 +350,22 @@ async fn run(
             }
             Some(result) = pair_rx.recv() => {
                 match result {
-                    Ok(()) => tracing::info!("soloist signed in from tonearm"),
-                    Err(reason) if !logged_in => {
+                    Ok(()) => {
+                        tracing::info!("soloist accepted the account from tonearm");
+                        // It should report logged_in now; if it does not, say so instead of
+                        // spinning forever.
+                        let _ = send(&mut socket, json!({"command": "get_auth_state"})).await;
+                        let tx = pair_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            let _ = tx.send(Err((true, "Soloist принял данные, но не вошёл".into())));
+                        });
+                    }
+                    Err((true, _)) if !logged_in && attempts < PAIR_WAYS => {
+                        tracing::warn!(attempts, "soloist did not log in, trying the next way");
+                        start_pairing(&mut attempts);
+                    }
+                    Err((_, reason)) if !logged_in => {
                         tracing::warn!(reason, "automatic soloist sign-in failed");
                         status(SoloistStatus::NeedsPairing { reason });
                     }
@@ -364,7 +383,8 @@ async fn run(
                 Some(Ctl::Pair) => {
                     if !logged_in {
                         status(SoloistStatus::Pairing);
-                        start_pairing(&mut tried_pairing);
+                        attempts = 0;
+                        start_pairing(&mut attempts);
                     }
                 }
                 Some(Ctl::Stop) | None => {
@@ -400,13 +420,27 @@ async fn send(socket: &mut Socket, mut body: Value) -> Result<(), String> {
 }
 
 /// Signs Soloist in with the session's reusable credentials (see [`pair`]).
-async fn pair_with(session: &Session, device_name: &str) -> Result<(), String> {
+/// Ways to hand Soloist the account, tried in order.
+const PAIR_WAYS: usize = 2;
+
+/// `way` 0: the session's reusable credentials; 1: a fresh access token (login5).
+async fn pair_with(session: &Session, device_name: &str, way: usize) -> Result<(), String> {
+    let (auth_type, auth_data) = if way == 0 {
+        (pair::STORED_CREDENTIALS, session.auth_data())
+    } else {
+        let token = session
+            .login5()
+            .auth_token()
+            .await
+            .map_err(|e| e.to_string())?;
+        (pair::SPOTIFY_TOKEN, token.access_token.into_bytes())
+    };
     let mut last = String::new();
     // mDNS answers can take a moment after Soloist starts.
     for wait in [3, 6, 10] {
         match pair::find(device_name, Duration::from_secs(wait)).await {
             Ok(endpoint) => {
-                return pair::add_user(&endpoint, &session.username(), &session.auth_data())
+                return pair::add_user(&endpoint, &session.username(), auth_type, &auth_data)
                     .await
                     .map_err(|e| e.to_string());
             }

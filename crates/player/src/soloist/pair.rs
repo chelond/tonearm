@@ -22,7 +22,9 @@ type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 const SERVICE: &str = "_spotify-connect._tcp.local.";
 /// `AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS`: what a librespot session holds after login.
-const STORED_CREDENTIALS: u32 = 1;
+pub const STORED_CREDENTIALS: u32 = 1;
+/// `AUTHENTICATION_SPOTIFY_TOKEN`: an OAuth access token.
+pub const SPOTIFY_TOKEN: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairError {
@@ -126,6 +128,7 @@ async fn get_info(http: &reqwest::Client, url: &str) -> Result<serde_json::Value
 pub async fn add_user(
     endpoint: &Endpoint,
     username: &str,
+    auth_type: u32,
     auth_data: &[u8],
 ) -> Result<(), PairError> {
     let http = reqwest::Client::builder()
@@ -151,7 +154,7 @@ pub async fn add_user(
         .map_err(|e| PairError::Other(e.to_string()))?;
 
     let keys = DhLocalKeys::random(&mut rand::rng());
-    let inner = credentials_blob(username, STORED_CREDENTIALS, auth_data, device_id);
+    let inner = credentials_blob(username, auth_type, auth_data, device_id);
     let mut iv = [0u8; 16];
     rand::Rng::fill(&mut rand::rng(), &mut iv);
     let blob = outer_blob(&keys.shared_secret(&public_key), &iv, inner.as_bytes());

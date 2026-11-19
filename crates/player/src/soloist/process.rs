@@ -52,7 +52,9 @@ pub async fn spawn(args: &Args<'_>, log: PathBuf) -> std::io::Result<Spawned> {
         .arg(&args.data_dir)
         .arg("--cache-dir")
         .arg(&args.cache_dir)
+        // --verbose: soloist.log then says why a sign-in did not go through.
         .args([
+            "--verbose",
             "--cache-size",
             "200",
             "--ws",
