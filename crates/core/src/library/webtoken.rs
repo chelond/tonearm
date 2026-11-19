@@ -64,6 +64,12 @@ pub fn use_own_client_id(client_id: &str, store: Arc<dyn SecretStore>) {
     });
 }
 
+/// Whether the user configured an own app (then the library uses the public Web API).
+#[must_use]
+pub fn has_own_client_id() -> bool {
+    OWN_APP.get().is_some()
+}
+
 /// Drops the own app's tokens (logout).
 pub fn forget_own_token() {
     if let Some(app) = OWN_APP.get() {

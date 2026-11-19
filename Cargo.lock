@@ -6732,6 +6732,8 @@ dependencies = [
  "librespot-metadata",
  "librespot-oauth",
  "librespot-protocol",
+ "protobuf",
+ "protobuf-json-mapping",
  "reqwest",
  "ring",
  "serde",

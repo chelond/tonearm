@@ -2,6 +2,7 @@
 //!
 //! Runs next to the auth backend and gets the session through the same `watch` channel as the player.
 
+mod internal;
 mod metadata;
 pub mod model;
 pub mod webapi;
@@ -228,6 +229,10 @@ impl Service {
             t.abort();
         }
         let events = self.events.clone();
+        if !webtoken::has_own_client_id() {
+            self.refresh_task = Some(tokio::spawn(refresh_internal(session, events)));
+            return;
+        }
         self.refresh_task = Some(tokio::spawn(async move {
             let api = WebApi::new(SessionHttp::new(session));
             match api.my_playlists().await {
@@ -289,6 +294,14 @@ impl Service {
             return;
         };
         tokio::spawn(async move {
+            if !webtoken::has_own_client_id() {
+                let ev = match internal::set_saved(&session, &uri, saved).await {
+                    Ok(()) => LibraryEvent::Saved { uri, saved },
+                    Err(e) => LibraryEvent::Error(format!("Не удалось изменить «Любимые»: {e}")),
+                };
+                let _ = events.send(ev).await;
+                return;
+            }
             let api = WebApi::new(SessionHttp::new(session));
             let ev = match api.set_saved(std::slice::from_ref(&uri), saved).await {
                 Ok(()) => LibraryEvent::Saved { uri, saved },
@@ -323,9 +336,21 @@ impl Service {
             if offset == 0 {
                 tokio::time::sleep(SEARCH_DEBOUNCE).await;
             }
-            let api = WebApi::new(SessionHttp::new(session));
-            let kinds = kind.map_or(SearchKind::ALL.to_vec(), |k| vec![k]);
-            let ev = match api.search(&query, &kinds, offset).await {
+            let result = if webtoken::has_own_client_id() {
+                let api = WebApi::new(SessionHttp::new(session));
+                let kinds = kind.map_or(SearchKind::ALL.to_vec(), |k| vec![k]);
+                api.search(&query, &kinds, offset)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else if offset > 0 {
+                // The search context has no further pages here.
+                Ok(SearchResults::default())
+            } else {
+                internal::search(&session, &query)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let ev = match result {
                 Ok(results) => LibraryEvent::Search {
                     query,
                     kind,
@@ -363,6 +388,9 @@ async fn load_page(
     req: PageRequest,
     events: &mpsc::Sender<LibraryEvent>,
 ) -> Result<(), String> {
+    if !webtoken::has_own_client_id() && !matches!(req, PageRequest::Artist(_)) {
+        return load_page_internal(session, page_id, req, events).await;
+    }
     let api = WebApi::new(SessionHttp::new(session.clone()));
     let header = |header: PageHeader| LibraryEvent::PageHeader { page_id, header };
     let err = |e: ApiError| e.to_string();
@@ -431,4 +459,98 @@ async fn load_page(
         }
     }
     Ok(())
+}
+
+/// Sidebar, Liked count and home through the internal endpoints.
+async fn refresh_internal(session: Session, events: mpsc::Sender<LibraryEvent>) {
+    match internal::playlists(&session).await {
+        Ok(lists) => {
+            let tiles = internal::home_tiles(&lists, HOME_TILES);
+            let _ = events.send(LibraryEvent::Playlists(lists)).await;
+            let _ = events.send(LibraryEvent::Home(tiles)).await;
+        }
+        Err(e) => {
+            let _ = events
+                .send(LibraryEvent::Error(format!(
+                    "Плейлисты не загрузились: {e}"
+                )))
+                .await;
+        }
+    }
+    match internal::liked_uris(&session).await {
+        Ok(uris) => {
+            let n = u32::try_from(uris.len()).unwrap_or(u32::MAX);
+            let _ = events.send(LibraryEvent::LikedCount(n)).await;
+        }
+        Err(e) => tracing::info!(%e, "liked songs count unavailable"),
+    }
+}
+
+/// Loads track metadata in chunks so long lists appear progressively.
+async fn send_track_uris(
+    session: &Session,
+    events: &mpsc::Sender<LibraryEvent>,
+    page_id: u64,
+    uris: &[String],
+) -> Result<(), String> {
+    if uris.is_empty() {
+        let empty = TrackPage {
+            tracks: Vec::new(),
+            next: None,
+            total: Some(0),
+        };
+        return send_tracks(events, page_id, &empty).await;
+    }
+    let chunks: Vec<&[String]> = uris.chunks(internal::CHUNK).collect();
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let tracks = internal::tracks(session, chunk).await;
+        events
+            .send(LibraryEvent::PageTracks {
+                page_id,
+                tracks,
+                done: i == last,
+            })
+            .await
+            .map_err(|_| "UI закрыт".to_owned())?;
+    }
+    Ok(())
+}
+
+async fn load_page_internal(
+    session: &Session,
+    page_id: u64,
+    req: PageRequest,
+    events: &mpsc::Sender<LibraryEvent>,
+) -> Result<(), String> {
+    let (header, uris) = match req {
+        PageRequest::Liked => {
+            let uris = internal::liked_uris(session)
+                .await
+                .map_err(|e| e.to_string())?;
+            let header = PageHeader {
+                kind: CollectionKind::Liked,
+                uri: "liked".into(),
+                title: "Любимые треки".into(),
+                byline: session.username(),
+                byline_uri: None,
+                year: None,
+                total_tracks: Some(u32::try_from(uris.len()).unwrap_or(u32::MAX)),
+                image_url: None,
+            };
+            (header, uris)
+        }
+        PageRequest::Playlist(uri) => internal::playlist(session, &uri)
+            .await
+            .map_err(|e| e.to_string())?,
+        PageRequest::Album(uri) => internal::album(session, &uri)
+            .await
+            .map_err(|e| e.to_string())?,
+        PageRequest::Artist(_) => return Err("артист грузится через metadata".into()),
+    };
+    events
+        .send(LibraryEvent::PageHeader { page_id, header })
+        .await
+        .map_err(|_| "UI закрыт".to_owned())?;
+    send_track_uris(session, events, page_id, &uris).await
 }
