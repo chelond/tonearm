@@ -1,0 +1,264 @@
+// Tonearm "Пульт" theme: monochrome hi-fi panel + one signal colour.
+// Drop into crates/app/ui/, bundle fonts (Inter, Inter Display, JetBrains Mono — all OFL) via
+// `import "fonts/....ttf";` and `import { Theme, Fonts, ... } from "theme.slint";`.
+// Rules: square corners, 1px grid lines, covers grayscale (converted in Rust on load) except the playing one,
+// signal red only for "live" things: playhead, playing row, active nav mark, active SHF/RPT, errors.
+
+import "fonts/Inter-Regular.ttf";
+import "fonts/Inter-SemiBold.ttf";
+import "fonts/InterDisplay-Bold.ttf";
+import "fonts/JetBrainsMono-Regular.ttf";
+
+export global Theme {
+    out property <color> bg: #0B0B0A;
+    out property <color> raise: #121211;      // player deck, menus
+    out property <color> hover: #171716;
+    out property <color> selected: #1F1F1D;
+    out property <color> line: #262624;
+    out property <color> line-2: #3A3A37;     // button borders, dotted leaders, empty LEDs
+    out property <color> text-1: #ECEAE4;     // warm paper white
+    out property <color> text-2: #8C8A84;
+    out property <color> text-3: #55534F;
+    out property <color> signal: #FF4A1C;
+}
+
+export global Fonts {
+    out property <string> display: "Inter Display";   // huge titles, 700, tracking -3..-6px
+    out property <string> text: "Inter";
+    out property <string> mono: "JetBrains Mono";      // numbers, labels, buttons
+}
+
+export global Layout {
+    out property <length> sidebar-width: 232px;
+    out property <length> deck-height: 96px;
+    out property <length> queue-width: 312px;
+    out property <length> header-height: 64px;
+    out property <length> row-height: 40px;
+    out property <length> page-x: 40px;
+}
+
+// Mono uppercase label: "§ 01 — НЕДАВНО", "ГРОМКОСТЬ".
+export component Label inherits Text {
+    font-family: Fonts.mono;
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    color: Theme.text-3;
+}
+
+export enum KeyKind { solid, outline, ghost, danger }
+
+// Rectangular mono button ("ПАУЗА", "ПЕРЕМЕШАТЬ", "ВЫЙТИ →").
+export component Key inherits Rectangle {
+    in property <string> text;
+    in property <KeyKind> kind: KeyKind.outline;
+    in property <bool> lit;           // small signal square in the corner (SHF/RPT on)
+    callback clicked();
+    height: 40px;
+    min-width: t.preferred-width + 36px;
+    border-width: kind == KeyKind.outline ? 1px : 0px;
+    border-color: touch.has-hover ? Theme.text-2 : Theme.line-2;
+    background: kind == KeyKind.solid ? (touch.pressed ? Theme.text-2 : Theme.text-1)
+        : touch.has-hover ? Theme.hover : transparent;
+    t := Text {
+        text: root.text;
+        font-family: Fonts.mono;
+        font-size: 12px;
+        letter-spacing: 1.4px;
+        color: root.kind == KeyKind.solid ? Theme.bg
+            : root.kind == KeyKind.danger ? Theme.signal
+            : root.kind == KeyKind.ghost ? Theme.text-2 : Theme.text-1;
+    }
+    if root.lit: Rectangle {
+        x: root.width - 8px;
+        y: 4px;
+        width: 4px;
+        height: 4px;
+        background: Theme.signal;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Segmented switch: [96|160|320], [ВЫКЛ|ВКЛ]. Also used as on/off toggle.
+export component Switch inherits Rectangle {
+    in property <[string]> items;
+    in-out property <int> current;
+    callback changed(int);
+    border-width: 1px;
+    border-color: Theme.line-2;
+    height: 30px;
+    width: row.preferred-width + 2px;
+    row := HorizontalLayout {
+        padding: 1px;
+        for item[i] in root.items: Rectangle {
+            width: tx.preferred-width + 20px;
+            background: i == root.current ? Theme.text-1 : transparent;
+            tx := Text {
+                text: item;
+                font-family: Fonts.mono;
+                font-size: 11px;
+                color: i == root.current ? Theme.bg : Theme.text-3;
+            }
+            TouchArea {
+                clicked => {
+                    root.current = i;
+                    root.changed(i);
+                }
+            }
+        }
+    }
+}
+
+// Tuner-dial progress: 64 ticks, every 8th taller, played ticks light, signal playhead. Click/drag to seek.
+export component TickRuler inherits Rectangle {
+    in property <float> value;     // 0..1
+    callback seek(float);
+    property <int> ticks: 64;
+    property <float> drag: -1;
+    property <float> shown: drag >= 0 ? drag : max(0, min(1, value));
+    height: 18px;
+    HorizontalLayout {
+        spacing: 3px;
+        alignment: stretch;
+        for i in root.ticks: Rectangle {
+            Rectangle {
+                y: parent.height - self.height;
+                height: Math.mod(i, 8) == 0 ? 12px : 6px;
+                background: i / root.ticks < root.shown ? Theme.text-1 : Theme.text-3;
+            }
+        }
+    }
+    Rectangle {
+        x: root.width * root.shown - 1px;
+        y: -4px;
+        width: 2px;
+        height: root.height + 8px;
+        background: Theme.signal;
+    }
+    TouchArea {
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                root.drag = max(0, min(1, self.mouse-x / self.width));
+            } else if e.kind == PointerEventKind.up && root.drag >= 0 {
+                root.seek(root.drag);
+                root.drag = -1;
+            }
+        }
+        moved => {
+            if self.pressed { root.drag = max(0, min(1, self.mouse-x / self.width)); }
+        }
+    }
+}
+
+// Segment meter: volume (12) or cache usage (20). Click sets the level.
+export component LedMeter inherits Rectangle {
+    in property <int> segments: 12;
+    in-out property <int> level: 8;
+    in property <bool> interactive: true;
+    callback changed(int);
+    height: 10px;
+    HorizontalLayout {
+        spacing: 3px;
+        for i in root.segments: Rectangle {
+            background: i < root.level ? Theme.text-1 : Theme.line-2;
+        }
+    }
+    TouchArea {
+        enabled: root.interactive;
+        clicked => {
+            root.level = Math.ceil(self.mouse-x / self.width * root.segments);
+            root.changed(root.level);
+        }
+        scroll-event(e) => {
+            root.level = max(0, min(root.segments, root.level + (e.delta-y > 0 ? 1 : -1)));
+            root.changed(root.level);
+            accept
+        }
+    }
+}
+
+export enum RowState { normal, playing, unavailable }
+
+// Sleeve-style track row: code (001 / A1) · title · artist · dotted leader · m:ss. ListView delegate.
+export component TrackRow inherits Rectangle {
+    in property <string> code;          // "001", "A1", "B3"
+    in property <string> title;
+    in property <string> artist;
+    in property <string> duration;
+    in property <bool> selected;
+    in property <RowState> state: RowState.normal;
+    // Navigation lists (library, discography) open on a single click; track lists play on double click.
+    in property <bool> single-click;
+    callback play();
+    callback context-menu(Point);
+
+    height: Layout.row-height;
+    background: selected ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    opacity: state == RowState.unavailable ? 0.3 : 1.0;
+
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+
+    touch := TouchArea {
+        mouse-cursor: root.single-click ? pointer : default;
+        clicked => { if root.single-click { root.play(); } }
+        double-clicked => { if !root.single-click && root.state != RowState.unavailable { root.play(); } }
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right {
+                root.context-menu({ x: self.mouse-x, y: self.mouse-y });
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 16px;
+        Text {
+            width: 32px;
+            vertical-alignment: center;
+            text: touch.has-hover && root.state == RowState.normal && !root.single-click ? "▶" : root.code;
+            font-family: Fonts.mono;
+            font-size: 12px;
+            color: root.state == RowState.playing ? Theme.signal : Theme.text-3;
+        }
+        Text {
+            vertical-alignment: center;
+            text: root.title;
+            font-family: Fonts.text;
+            font-size: 15px;
+            color: root.state == RowState.playing ? Theme.signal : Theme.text-1;
+            overflow: elide;
+        }
+        Text {
+            vertical-alignment: center;
+            text: root.artist;
+            font-size: 13px;
+            color: Theme.text-2;
+            overflow: elide;
+        }
+        // dotted leader: a clipped run of dots fills the remaining width
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 20px;
+            clip: true;
+            Text {
+                x: 0;
+                y: parent.height / 2 - 4px;
+                text: "······································································································································································································································································································";
+                font-family: Fonts.mono;
+                font-size: 10px;
+                color: Theme.line-2;
+            }
+        }
+        Text {
+            vertical-alignment: center;
+            text: root.duration;
+            font-family: Fonts.mono;
+            font-size: 12px;
+            color: Theme.text-2;
+        }
+    }
+}
+

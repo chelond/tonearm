@@ -1,0 +1,175 @@
+//! User settings in `config.toml` (platform config dir). Never holds secrets: tokens and the
+//! login live in the keyring / encrypted store. Unknown or broken values fall back to defaults,
+//! so a hand-edited file can never stop the app from starting.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub spotify: SpotifySettings,
+    pub audio: AudioSettings,
+    pub cache: CacheSettings,
+    pub ui: UiSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpotifySettings {
+    /// Own app from developer.spotify.com, reserved for a Web API fallback. Not a secret (PKCE).
+    pub client_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioSettings {
+    /// 96 | 160 | 320 kbit/s.
+    pub bitrate: u16,
+    pub normalisation: bool,
+    /// Preload the next track so there is no gap.
+    pub gapless: bool,
+    /// Output device name; empty = system default.
+    pub device: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheSettings {
+    pub max_size_mb: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Desktop notification on track change (only while the window is in the background).
+    pub notifications: bool,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            bitrate: 320,
+            normalisation: false,
+            gapless: true,
+            device: String::new(),
+        }
+    }
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self { max_size_mb: 512 }
+    }
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            notifications: true,
+        }
+    }
+}
+
+pub const BITRATES: [u16; 3] = [96, 160, 320];
+pub const CACHE_SIZES_MB: [u32; 4] = [128, 256, 512, 1024];
+
+impl Settings {
+    /// Clamps values a hand-edited file may have broken.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        if !BITRATES.contains(&self.audio.bitrate) {
+            self.audio.bitrate = 320;
+        }
+        self.cache.max_size_mb = self.cache.max_size_mb.clamp(32, 16_384);
+        self
+    }
+
+    #[must_use]
+    pub fn path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("", "", "tonearm")
+            .map(|d| d.config_dir().join("config.toml"))
+    }
+
+    /// Loads the settings; a missing or unreadable file gives defaults (and a log line).
+    #[must_use]
+    pub fn load() -> Self {
+        Self::path()
+            .map(|p| Self::load_from(&p))
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<Self>(&text)
+                .map(Self::sanitized)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "config.toml is invalid, using defaults");
+                    Self::default()
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read config.toml, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        match Self::path() {
+            Some(p) => self.save_to(&p),
+            None => Ok(()),
+        }
+    }
+
+    /// Atomic write: temp file + rename, so a crash never leaves half a config.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(
+            &tmp,
+            format!("# Tonearm settings. Tokens are never stored here.\n\n{text}"),
+        )?;
+        std::fs::rename(tmp, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/config.toml");
+        assert_eq!(Settings::load_from(&path), Settings::default());
+        let mut s = Settings::default();
+        s.audio.bitrate = 160;
+        s.audio.device = "USB DAC".into();
+        s.ui.notifications = false;
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path), s);
+    }
+
+    #[test]
+    fn broken_values_are_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[audio]\nbitrate = 999\n[cache]\nmax_size_mb = 1\n[extra]\nx = 1\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.audio.bitrate, 320);
+        assert_eq!(s.cache.max_size_mb, 32);
+        assert!(s.audio.gapless, "missing keys default");
+        std::fs::write(&path, "not toml [").unwrap();
+        assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+}

@@ -1,0 +1,441 @@
+//! Library service: sidebar playlists, home tiles, playlist / album / artist / Liked Songs pages, search.
+//!
+//! Runs next to the auth backend and gets the session through the same `watch` channel as the player.
+
+mod metadata;
+pub mod model;
+pub mod webapi;
+
+use std::time::Duration;
+
+use librespot_core::Session;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+pub use model::*;
+use webapi::{ApiError, Http, HttpResponse, Method, TrackPage, WebApi};
+
+/// Scopes for the session's Web API token.
+const SCOPES: &str = "playlist-read-private,playlist-read-collaborative,user-library-read,\
+user-library-modify,user-read-recently-played,user-read-private,user-read-playback-state,\
+user-modify-playback-state";
+const HOME_TILES: usize = 6;
+/// Typing pause before a search request, so every keystroke does not hit the rate limit.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryCommand {
+    /// Reload sidebar and home.
+    Refresh,
+    Open(PageRequest),
+    /// Search `query`; `kind` limits it to one type (a tab), `offset` loads the next page.
+    /// A new search cancels the previous one.
+    Search {
+        query: String,
+        kind: Option<SearchKind>,
+        offset: u32,
+    },
+    /// Add a track (or album, playlist…) to the library, or remove it.
+    SetSaved {
+        uri: String,
+        saved: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryEvent {
+    Playlists(Vec<PlaylistSummary>),
+    LikedCount(u32),
+    Home(Vec<Tile>),
+    /// A page started loading; later events for other ids are stale.
+    PageHeader {
+        page_id: u64,
+        header: PageHeader,
+    },
+    /// More tracks of the page; `done` on the last chunk.
+    PageTracks {
+        page_id: u64,
+        tracks: Vec<TrackItem>,
+        done: bool,
+    },
+    /// Discography on an artist page.
+    PageTiles {
+        page_id: u64,
+        tiles: Vec<Tile>,
+    },
+    PageError {
+        page_id: u64,
+        message: String,
+    },
+    /// Results for `query`; `offset > 0` means "append to what is shown".
+    Search {
+        query: String,
+        kind: Option<SearchKind>,
+        offset: u32,
+        results: SearchResults,
+    },
+    SearchError {
+        query: String,
+        message: String,
+    },
+    /// [`LibraryCommand::SetSaved`] went through.
+    Saved {
+        uri: String,
+        saved: bool,
+    },
+    Error(String),
+}
+
+/// Web API over reqwest with the session's token (librespot `TokenProvider`).
+#[derive(Clone)]
+pub struct SessionHttp {
+    client: reqwest::Client,
+    session: Session,
+}
+
+impl SessionHttp {
+    #[must_use]
+    pub fn new(session: Session) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()
+                .unwrap_or_default(),
+            session,
+        }
+    }
+}
+
+impl SessionHttp {
+    async fn execute(&self, req: reqwest::RequestBuilder) -> Result<HttpResponse, ApiError> {
+        let token = self
+            .session
+            .token_provider()
+            .get_token(SCOPES)
+            .await
+            .map_err(|e| ApiError::Network(format!("токен: {e}")))?;
+        let resp = req
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| ApiError::Network(e.without_url().to_string()))?
+            .to_vec();
+        Ok(HttpResponse {
+            status,
+            body,
+            retry_after,
+        })
+    }
+}
+
+impl Http for SessionHttp {
+    async fn get(&self, url: &str) -> Result<HttpResponse, ApiError> {
+        self.execute(self.client.get(url)).await
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<String>,
+    ) -> Result<HttpResponse, ApiError> {
+        let req = match method {
+            Method::Put => self.client.put(url),
+            Method::Post => self.client.post(url),
+            Method::Delete => self.client.delete(url),
+        };
+        let req = match body {
+            Some(b) => req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(b),
+            // Spotify wants an explicit zero length on empty PUT/POST.
+            None => req.header(reqwest::header::CONTENT_LENGTH, "0"),
+        };
+        self.execute(req).await
+    }
+}
+
+struct Service {
+    events: mpsc::Sender<LibraryEvent>,
+    session: Option<Session>,
+    page_id: u64,
+    page_task: Option<JoinHandle<()>>,
+    refresh_task: Option<JoinHandle<()>>,
+    search_task: Option<JoinHandle<()>>,
+}
+
+pub async fn run(
+    mut commands: mpsc::Receiver<LibraryCommand>,
+    events: mpsc::Sender<LibraryEvent>,
+    mut sessions: watch::Receiver<Option<Session>>,
+) {
+    let mut svc = Service {
+        events,
+        session: sessions.borrow_and_update().clone(),
+        page_id: 0,
+        page_task: None,
+        refresh_task: None,
+        search_task: None,
+    };
+    if svc.session.is_some() {
+        svc.refresh();
+    }
+    loop {
+        tokio::select! {
+            cmd = commands.recv() => match cmd {
+                None => break,
+                Some(LibraryCommand::Refresh) => svc.refresh(),
+                Some(LibraryCommand::Open(req)) => svc.open(req),
+                Some(LibraryCommand::Search { query, kind, offset }) => svc.search(query, kind, offset),
+                Some(LibraryCommand::SetSaved { uri, saved }) => svc.set_saved(uri, saved),
+            },
+            changed = sessions.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let session = sessions.borrow_and_update().clone();
+                let was_none = svc.session.is_none();
+                svc.session = session;
+                // Reload only after a fresh login, not on every reconnect.
+                if was_none && svc.session.is_some() {
+                    svc.refresh();
+                }
+            }
+        }
+    }
+    for task in [
+        svc.page_task.take(),
+        svc.refresh_task.take(),
+        svc.search_task.take(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        task.abort();
+    }
+}
+
+impl Service {
+    fn refresh(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        if let Some(t) = self.refresh_task.take() {
+            t.abort();
+        }
+        let events = self.events.clone();
+        self.refresh_task = Some(tokio::spawn(async move {
+            let api = WebApi::new(SessionHttp::new(session));
+            match api.my_playlists().await {
+                Ok(lists) => {
+                    let _ = events.send(LibraryEvent::Playlists(lists)).await;
+                }
+                Err(e) => {
+                    let _ = events
+                        .send(LibraryEvent::Error(format!(
+                            "Плейлисты не загрузились: {e}"
+                        )))
+                        .await;
+                }
+            }
+            if let Ok(page) = api.liked(None).await {
+                let _ = events
+                    .send(LibraryEvent::LikedCount(page.total.unwrap_or(0)))
+                    .await;
+            }
+            // Recently played is optional: without it the home page shows playlists only.
+            match api.recent_albums(HOME_TILES).await {
+                Ok(tiles) => {
+                    let _ = events.send(LibraryEvent::Home(tiles)).await;
+                }
+                Err(e) => tracing::info!(%e, "recently played unavailable"),
+            }
+        }));
+    }
+
+    fn open(&mut self, req: PageRequest) {
+        if let Some(t) = self.page_task.take() {
+            t.abort();
+        }
+        self.page_id += 1;
+        let page_id = self.page_id;
+        let events = self.events.clone();
+        let Some(session) = self.session.clone() else {
+            let _ = events.try_send(LibraryEvent::PageError {
+                page_id,
+                message: "Нет подключения к Spotify".into(),
+            });
+            return;
+        };
+        self.page_task = Some(tokio::spawn(async move {
+            if let Err(message) = load_page(&session, page_id, req, &events).await {
+                let _ = events
+                    .send(LibraryEvent::PageError { page_id, message })
+                    .await;
+            }
+        }));
+    }
+}
+
+impl Service {
+    fn set_saved(&self, uri: String, saved: bool) {
+        let events = self.events.clone();
+        let Some(session) = self.session.clone() else {
+            let _ = events.try_send(LibraryEvent::Error("Нет подключения к Spotify".into()));
+            return;
+        };
+        tokio::spawn(async move {
+            let api = WebApi::new(SessionHttp::new(session));
+            let ev = match api.set_saved(std::slice::from_ref(&uri), saved).await {
+                Ok(()) => LibraryEvent::Saved { uri, saved },
+                // The token comes from Spotify's own client id; it may not be granted write scopes.
+                Err(ApiError::Forbidden(_)) => LibraryEvent::Error(
+                    "Spotify не разрешил менять медиатеку из Tonearm. Сделайте это в другом клиенте".into(),
+                ),
+                Err(e) => LibraryEvent::Error(format!("Не удалось изменить «Любимые»: {e}")),
+            };
+            let _ = events.send(ev).await;
+        });
+    }
+
+    fn search(&mut self, query: String, kind: Option<SearchKind>, offset: u32) {
+        if let Some(t) = self.search_task.take() {
+            t.abort();
+        }
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let events = self.events.clone();
+        let Some(session) = self.session.clone() else {
+            let _ = events.try_send(LibraryEvent::SearchError {
+                query,
+                message: "Нет подключения к Spotify".into(),
+            });
+            return;
+        };
+        self.search_task = Some(tokio::spawn(async move {
+            // Paging is an explicit click; only typing is debounced.
+            if offset == 0 {
+                tokio::time::sleep(SEARCH_DEBOUNCE).await;
+            }
+            let api = WebApi::new(SessionHttp::new(session));
+            let kinds = kind.map_or(SearchKind::ALL.to_vec(), |k| vec![k]);
+            let ev = match api.search(&query, &kinds, offset).await {
+                Ok(results) => LibraryEvent::Search {
+                    query,
+                    kind,
+                    offset,
+                    results,
+                },
+                Err(e) => LibraryEvent::SearchError {
+                    query,
+                    message: format!("Поиск не удался: {e}"),
+                },
+            };
+            let _ = events.send(ev).await;
+        }));
+    }
+}
+
+async fn send_tracks(
+    events: &mpsc::Sender<LibraryEvent>,
+    page_id: u64,
+    page: &TrackPage,
+) -> Result<(), String> {
+    events
+        .send(LibraryEvent::PageTracks {
+            page_id,
+            tracks: page.tracks.clone(),
+            done: page.next.is_none(),
+        })
+        .await
+        .map_err(|_| "UI закрыт".to_owned())
+}
+
+async fn load_page(
+    session: &Session,
+    page_id: u64,
+    req: PageRequest,
+    events: &mpsc::Sender<LibraryEvent>,
+) -> Result<(), String> {
+    let api = WebApi::new(SessionHttp::new(session.clone()));
+    let header = |header: PageHeader| LibraryEvent::PageHeader { page_id, header };
+    let err = |e: ApiError| e.to_string();
+    match req {
+        PageRequest::Liked => {
+            let mut page = api.liked(None).await.map_err(err)?;
+            let _ = events
+                .send(header(PageHeader {
+                    kind: CollectionKind::Liked,
+                    uri: "liked".into(),
+                    title: "Любимые треки".into(),
+                    byline: session.username(),
+                    byline_uri: None,
+                    year: None,
+                    total_tracks: page.total,
+                    image_url: None,
+                }))
+                .await;
+            send_tracks(events, page_id, &page).await?;
+            while let Some(next) = page.next.take() {
+                page = api.liked(Some(&next)).await.map_err(err)?;
+                send_tracks(events, page_id, &page).await?;
+            }
+        }
+        PageRequest::Playlist(uri) => {
+            let id = uri_id(&uri).to_owned();
+            let (h, mut page) = api.playlist(&id).await.map_err(err)?;
+            let _ = events.send(header(h)).await;
+            send_tracks(events, page_id, &page).await?;
+            while let Some(next) = page.next.take() {
+                page = api.playlist_items(&id, Some(&next)).await.map_err(err)?;
+                send_tracks(events, page_id, &page).await?;
+            }
+        }
+        PageRequest::Album(uri) => {
+            let (h, mut page) = api.album(uri_id(&uri)).await.map_err(err)?;
+            let (name, album_uri) = (h.title.clone(), h.uri.clone());
+            let _ = events.send(header(h)).await;
+            send_tracks(events, page_id, &page).await?;
+            while let Some(next) = page.next.take() {
+                page = api
+                    .album_tracks(&name, &album_uri, &next)
+                    .await
+                    .map_err(err)?;
+                send_tracks(events, page_id, &page).await?;
+            }
+        }
+        PageRequest::Artist(uri) => {
+            let a = metadata::artist(session, &uri)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = events.send(header(a.header)).await;
+            let _ = events
+                .send(LibraryEvent::PageTracks {
+                    page_id,
+                    tracks: a.top_tracks,
+                    done: true,
+                })
+                .await;
+            let _ = events
+                .send(LibraryEvent::PageTiles {
+                    page_id,
+                    tiles: a.albums,
+                })
+                .await;
+        }
+    }
+    Ok(())
+}

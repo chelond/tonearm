@@ -1,0 +1,1684 @@
+// Tonearm UI, "Пульт" design (see docs/DESIGN.md). Presentation only: all data and actions go
+// through properties and callbacks handled in Rust.
+import { ListView, ScrollView } from "std-widgets.slint";
+import { Theme, Fonts, Layout, Label, Key, KeyKind, Switch, TickRuler, LedMeter, TrackRow, RowState } from "theme.slint";
+export { RowState }
+
+export enum AuthView { checking, logged-out, waiting, connecting, reconnecting, logged-in }
+export enum PlayView { stopped, loading, playing, paused }
+export enum Page { home, search, library, settings, collection }
+
+export struct PlaylistEntry { uri: string, name: string, count: int }
+// kind: 0 liked, 1 playlist, 2 album, 3 artist
+export struct TileData { uri: string, kind: int, title: string, subtitle: string, image: image, has-image: bool }
+export struct TrackData { code: string, title: string, artist: string, duration: string, state: RowState }
+export struct DeviceRow { id: string, name: string, kind: string, active: bool }
+export struct QueueRow { code: string, title: string, artist: string, manual: bool }
+
+export global Fmt {
+    // "01:24"
+    pure public function clock(ms: int) -> string {
+        let total = floor(max(0, ms) / 1000);
+        let m = floor(total / 60);
+        let s = Math.mod(total, 60);
+        return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    }
+}
+
+// ───────────── small pieces ─────────────
+
+component Logo inherits HorizontalLayout {
+    spacing: 14px;
+    alignment: start;
+    VerticalLayout {
+        alignment: center;
+        Image {
+            source: @image-url("../../../assets/icon-256.png");
+            width: 28px;
+            height: 28px;
+        }
+    }
+    Text {
+        text: "TONEARM";
+        font-family: Fonts.mono;
+        font-size: 14px;
+        letter-spacing: 4px;
+        color: Theme.text-1;
+        vertical-alignment: center;
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> num;
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    height: 44px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        spacing: 20px;
+        Text { text: root.num; font-family: Fonts.mono; font-size: 12px; color: Theme.text-3; vertical-alignment: center; }
+        Text {
+            text: root.label;
+            font-family: Fonts.mono;
+            font-size: 12px;
+            letter-spacing: 2.4px;
+            color: root.active ? Theme.text-1 : Theme.text-2;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if root.active: Rectangle {
+            width: 7px;
+            height: 7px;
+            y: (parent.height - self.height) / 2;
+            background: Theme.signal;
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component SidebarRow inherits Rectangle {
+    in property <string> name;
+    in property <int> count;
+    in property <bool> active;
+    callback clicked();
+    height: 36px;
+    background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        spacing: 8px;
+        if root.active: Text { text: "▶"; font-size: 9px; color: Theme.signal; vertical-alignment: center; }
+        Text {
+            text: root.name;
+            font-family: Fonts.text;
+            font-size: 14px;
+            color: root.active ? Theme.text-1 : Theme.text-2;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text { text: root.count; font-family: Fonts.mono; font-size: 11px; color: Theme.text-3; vertical-alignment: center; }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Grayscale tile ("Недавно слушали", discography).
+component TileView inherits Rectangle {
+    in property <TileData> tile;
+    in property <bool> round; // artists
+    callback clicked();
+    border-width: 1px;
+    border-color: Theme.line;
+    background: touch.has-hover ? Theme.hover : transparent;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        Rectangle {
+            height: self.width;
+            background: Theme.selected;
+            border-radius: root.round ? self.width / 2 : 0px;
+            clip: root.round;
+            if root.tile.has-image: Image {
+                source: root.tile.image;
+                width: parent.width;
+                height: parent.height;
+                image-fit: cover;
+            }
+        }
+        Text { text: root.tile.title; font-family: Fonts.text; font-size: 15px; color: Theme.text-1; overflow: elide; }
+        Text { text: root.tile.subtitle; font-family: Fonts.mono; font-size: 11px; letter-spacing: 1.2px; color: Theme.text-3; overflow: elide; }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Transport glyphs drawn as paths: fonts do not reliably carry ⏮ ⏭.
+component Glyph inherits Path {
+    in property <string> kind; // play, pause, prev, next
+    in property <color> ink: Theme.text-1;
+    width: 12px;
+    height: 12px;
+    fill: ink;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    commands: kind == "play" ? "M 2 0 L 12 6 L 2 12 Z"
+        : kind == "pause" ? "M 2 0 L 5 0 L 5 12 L 2 12 Z M 7 0 L 10 0 L 10 12 L 7 12 Z"
+        : kind == "prev" ? "M 0 0 L 2 0 L 2 12 L 0 12 Z M 12 0 L 3 6 L 12 12 Z"
+        : "M 10 0 L 12 0 L 12 12 L 10 12 Z M 0 0 L 9 6 L 0 12 Z";
+}
+
+component DeckKey inherits Rectangle {
+    in property <string> text;
+    in property <string> glyph;
+    in property <bool> solid;
+    in property <bool> lit;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: root.solid ? 88px : 68px;
+    height: 44px;
+    border-width: 1px;
+    border-color: Theme.line-2;
+    background: root.solid ? (touch.pressed ? Theme.text-2 : Theme.text-1) : touch.has-hover && root.enabled ? Theme.hover : transparent;
+    if root.glyph != "": Glyph {
+        kind: root.glyph;
+        ink: root.solid ? Theme.bg : root.enabled ? Theme.text-1 : Theme.text-3;
+    }
+    if root.glyph == "": Text {
+        text: root.text;
+        font-family: Fonts.mono;
+        font-size: 12px;
+        letter-spacing: 1.4px;
+        color: root.enabled ? Theme.text-1 : Theme.text-3;
+    }
+    if root.lit: Rectangle { x: root.width - 9px; y: 5px; width: 4px; height: 4px; background: Theme.signal; }
+    touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Concentric grooves + tonearm, drawn with rectangles and one path (cheap for the software renderer).
+component Record inherits Rectangle {
+    property <length> d: min(self.width, self.height) * 0.9;
+    for i in 22: Rectangle {
+        width: root.d - i * root.d / 34;
+        height: self.width;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        border-width: 1px;
+        border-color: i == 21 ? Theme.line-2 : Theme.line;
+    }
+    Rectangle {
+        width: 10px; height: 10px; border-radius: 5px;
+        x: (root.width - 10px) / 2; y: (root.height - 10px) / 2;
+        background: Theme.text-1;
+    }
+    // tonearm: pivot block top right, vertical arm, elbow, diagonal to the stylus on the groove
+    property <float> cx: root.width / 1px / 2;
+    property <float> cy: root.height / 1px / 2;
+    property <float> r: root.d / 1px / 2;
+    Path {
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.width / 1px;
+        viewbox-height: root.height / 1px;
+        stroke: Theme.text-1;
+        stroke-width: 5px;
+        MoveTo { x: root.cx + root.r * 0.82; y: root.cy - root.r * 0.95; }
+        LineTo { x: root.cx + root.r * 0.82; y: root.cy - root.r * 0.04; }
+        LineTo { x: root.cx + root.r * 0.30; y: root.cy + root.r * 0.48; }
+    }
+    Rectangle {
+        x: (root.cx + root.r * 0.82) * 1px - 15px;
+        y: (root.cy - root.r * 1.04) * 1px;
+        width: 30px; height: 40px;
+        background: Theme.text-1;
+    }
+    Path {
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.width / 1px;
+        viewbox-height: root.height / 1px;
+        stroke: Theme.text-1;
+        stroke-width: 16px;
+        MoveTo { x: root.cx + root.r * 0.36; y: root.cy + root.r * 0.42; }
+        LineTo { x: root.cx + root.r * 0.25; y: root.cy + root.r * 0.53; }
+    }
+    Rectangle {
+        x: (root.cx + root.r * 0.26) * 1px - 4px;
+        y: (root.cy + root.r * 0.53) * 1px - 4px;
+        width: 8px; height: 8px; border-radius: 4px;
+        background: Theme.signal;
+    }
+}
+
+// A titled grid of tiles, six per row (search sections and tabs).
+component SearchTiles inherits VerticalLayout {
+    in property <string> title;
+    in property <[TileData]> tiles;
+    in property <int> limit;
+    callback open(int, string);
+    property <int> per-row: 6;
+    property <length> cell: (self.width - 2 * Layout.page-x) / self.per-row;
+    property <int> shown: min(self.limit, self.tiles.length);
+    padding-top: 32px;
+    spacing: 16px;
+    if root.title != "": HorizontalLayout {
+        padding-left: Layout.page-x;
+        Label { text: root.title; color: Theme.text-1; }
+    }
+    Rectangle {
+        height: Math.ceil(root.shown / root.per-row) * (root.cell + 64px);
+        for t[i] in root.tiles: TileView {
+            visible: i < root.limit;
+            x: Layout.page-x + Math.mod(i, root.per-row) * root.cell;
+            y: Math.floor(i / root.per-row) * (root.cell + 64px);
+            width: root.cell;
+            height: root.cell + 64px;
+            tile: t;
+            round: t.kind == 3;
+            clicked => { root.open(t.kind, t.uri); }
+        }
+    }
+}
+
+// Queue panel pieces.
+component QueueHeading inherits Rectangle {
+    in property <string> text;
+    in property <bool> clear-visible;
+    callback clear();
+    height: 44px;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 16px;
+        Label { text: root.text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        if root.clear-visible: Label {
+            text: "ОЧИСТИТЬ";
+            vertical-alignment: center;
+            color: clear-touch.has-hover ? Theme.signal : Theme.text-2;
+            clear-touch := TouchArea { mouse-cursor: pointer; clicked => { root.clear(); } }
+        }
+    }
+}
+
+component QueueLine inherits VerticalLayout {
+    in property <string> heading;
+    in property <bool> clear-visible;
+    in property <string> code;
+    in property <string> title;
+    in property <string> artist;
+    in property <bool> playing;
+    callback clicked();
+    callback clear();
+    if root.heading != "": QueueHeading {
+        text: root.heading;
+        clear-visible: root.clear-visible;
+        clear => { root.clear(); }
+    }
+    Rectangle {
+        height: 60px;
+        background: root.playing ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+        touch := TouchArea { mouse-cursor: pointer; double-clicked => { root.clicked(); } }
+        HorizontalLayout {
+            padding-left: 24px;
+            padding-right: 16px;
+            spacing: 16px;
+            Text {
+                width: 24px;
+                text: root.code;
+                font-family: Fonts.mono; font-size: 12px;
+                color: root.playing ? Theme.signal : Theme.text-3;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                Text { text: root.title; font-size: 15px; color: root.playing ? Theme.signal : Theme.text-1; overflow: elide; }
+                if root.artist != "": Text {
+                    text: root.artist;
+                    font-family: Fonts.mono; font-size: 11px; letter-spacing: 1.2px;
+                    color: Theme.text-3; overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+// A Connect device in the device picker.
+component DeviceItem inherits Rectangle {
+    in property <string> name;
+    in property <string> kind;
+    in property <bool> active;
+    callback clicked();
+    height: 52px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+        Rectangle {
+            width: 6px; height: 6px;
+            y: (parent.height - self.height) / 2;
+            background: root.active ? Theme.signal : Theme.line-2;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            Text { text: root.name; font-size: 15px; color: root.active ? Theme.signal : Theme.text-1; overflow: elide; }
+            Text { text: root.kind; font-family: Fonts.mono; font-size: 10px; letter-spacing: 1.2px; color: Theme.text-3; }
+        }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Settings page pieces (mockup 08): "§ 01 — ЗВУК" heading and numbered rows with controls on the right.
+component SettingsSection inherits Rectangle {
+    in property <string> text;
+    height: 60px;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    HorizontalLayout {
+        padding-left: Layout.page-x;
+        Label { text: root.text; color: Theme.text-1; vertical-alignment: center; }
+    }
+}
+
+component SettingRow inherits Rectangle {
+    in property <string> num;
+    in property <string> title;
+    in property <string> hint;
+    height: 78px;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    HorizontalLayout {
+        padding-left: Layout.page-x;
+        padding-right: Layout.page-x;
+        spacing: 24px;
+        Text { width: 64px; text: root.num; font-family: Fonts.mono; font-size: 12px; color: Theme.text-3; vertical-alignment: center; }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 6px;
+            Text { text: root.title; font-size: 16px; color: Theme.text-1; overflow: elide; }
+            if root.hint != "": Label { text: root.hint; overflow: elide; }
+        }
+        HorizontalLayout {
+            spacing: 16px;
+            alignment: end;
+            padding-top: 19px;
+            padding-bottom: 19px;
+            @children
+        }
+    }
+}
+
+// Right-click menu item: label + mono shortcut hint.
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <string> hint;
+    callback clicked();
+    height: 42px;
+    background: touch.has-hover ? Theme.text-1 : transparent;
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        Text { text: root.text; font-size: 15px; color: touch.has-hover ? Theme.bg : Theme.text-1; vertical-alignment: center; horizontal-stretch: 1; }
+        Text { text: root.hint; font-family: Fonts.mono; font-size: 11px; color: Theme.text-3; vertical-alignment: center; }
+    }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component CheckLine inherits HorizontalLayout {
+    in property <int> status; // 0 todo, 1 active, 2 done
+    in property <string> text;
+    spacing: 16px;
+    alignment: start;
+    Text {
+        text: root.status == 2 ? "[✓]" : root.status == 1 ? "[•]" : "[ ]";
+        font-family: Fonts.mono; font-size: 14px;
+        color: root.status == 1 ? Theme.signal : root.status == 2 ? Theme.text-1 : Theme.text-3;
+    }
+    Text {
+        text: root.text;
+        font-family: Fonts.mono; font-size: 14px;
+        color: root.status == 1 ? Theme.signal : root.status == 2 ? Theme.text-1 : Theme.text-3;
+    }
+}
+
+// ───────────── login ─────────────
+
+component LoginScreen inherits Rectangle {
+    in property <AuthView> view;
+    in property <string> version;
+    in property <int> waited-secs;
+    callback login();
+    callback cancel-login();
+    callback reopen();
+
+    property <bool> waiting: view == AuthView.waiting || view == AuthView.connecting;
+    background: Theme.bg;
+
+    Rectangle {
+        x: 24px; y: 24px;
+        width: parent.width - 48px; height: parent.height - 48px;
+        border-width: 1px;
+        border-color: Theme.line;
+        clip: true;
+
+        Record {
+            x: parent.width * 0.55;
+            y: 0;
+            width: parent.width * 0.5;
+            height: parent.height;
+        }
+
+        VerticalLayout {
+            padding: 24px;
+            HorizontalLayout {
+                Label { text: "TONEARM · V" + root.version; }
+                Rectangle { horizontal-stretch: 1; }
+                Label { text: "НЕОФИЦИАЛЬНЫЙ КЛИЕНТ SPOTIFY"; }
+            }
+            Rectangle { vertical-stretch: 1; }
+            VerticalLayout {
+                width: min(parent.width * 0.55, 620px);
+                spacing: 18px;
+                if !root.waiting: Label {
+                    text: root.view == AuthView.logged-out ? "НАТИВНЫЙ · БЕЗ БРАУЗЕРНОГО ДВИЖКА · <100 МБ"
+                        : root.view == AuthView.reconnecting ? "● НЕТ СВЯЗИ · ПОВТОРЯЕМ" : "● ПРОВЕРЯЕМ СОХРАНЁННЫЙ ВХОД";
+                    color: root.view == AuthView.reconnecting ? Theme.signal : Theme.text-3;
+                }
+                if root.waiting: Label {
+                    text: "● ОЖИДАНИЕ · " + Fmt.clock(root.waited-secs * 1000);
+                    color: Theme.signal;
+                }
+                // two lines with a tight 0.92 line height (Text has no line-height of its own)
+                VerticalLayout { spacing: 0px;
+                for line in (root.waiting ? ["Войдите", "в браузере"] : ["Tone", "arm"]): Text {
+                    property <length> fs: min(150px, root.width / 9);
+                    text: line;
+                    height: self.fs * 0.92;
+                    vertical-alignment: center;
+                    font-family: Fonts.display; line-height-factor: 0.76;
+                    font-weight: 700;
+                    font-size: self.fs;
+                    letter-spacing: -5px;
+                    color: Theme.text-1;
+                }
+                }
+                Text {
+                    text: root.waiting
+                        ? "Страница входа Spotify уже открыта. Как только войдёте, Tonearm подключится сам."
+                        : "Вход через браузер. Пароль вы вводите только на сайте Spotify. Нужен Premium.";
+                    font-family: Fonts.text;
+                    font-size: 17px;
+                    color: Theme.text-2;
+                    wrap: word-wrap;
+                }
+                if root.waiting: VerticalLayout {
+                    spacing: 10px;
+                    padding-top: 8px;
+                    CheckLine { status: 2; text: "Страница входа открыта"; }
+                    CheckLine { status: root.view == AuthView.waiting ? 1 : 2; text: "Ждём подтверждения"; }
+                    CheckLine { status: root.view == AuthView.connecting ? 1 : 0; text: "Подключение к сессии"; }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 24px;
+                    padding-top: 12px;
+                    if root.view == AuthView.logged-out: Key {
+                        text: "ВОЙТИ ЧЕРЕЗ БРАУЗЕР  →";
+                        kind: KeyKind.solid;
+                        height: 56px;
+                        clicked => { root.login(); }
+                    }
+                    if root.view == AuthView.waiting: Key {
+                        text: "ОТМЕНА";
+                        height: 48px;
+                        clicked => { root.cancel-login(); }
+                    }
+                    if root.view == AuthView.waiting: Key {
+                        text: "ОТКРЫТЬ СНОВА ↗";
+                        kind: KeyKind.ghost;
+                        height: 48px;
+                        clicked => { root.reopen(); }
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                Label { text: "НЕ СВЯЗАН СО SPOTIFY AB"; }
+                Rectangle { horizontal-stretch: 1; }
+                Label { text: "ARCH · WINDOWS"; }
+            }
+        }
+    }
+}
+
+// ───────────── main window ─────────────
+
+export component AppWindow inherits Window {
+    // auth
+    in property <AuthView> auth-view: AuthView.checking;
+    in property <string> username;
+    in property <string> version: "0.0.0";
+    in property <int> waited-secs;
+    // notices: offline = red bar with countdown
+    in property <string> notice;
+    in property <bool> notice-is-error;
+    in property <bool> offline;
+    in property <int> retry-in-secs;
+    // navigation
+    in-out property <Page> page: Page.home;
+    in property <string> date-label;
+    // sidebar
+    in property <[PlaylistEntry]> playlists;
+    in property <int> liked-count;
+    in property <string> active-uri;
+    // home
+    in property <[TileData]> home-tiles;
+    // collection page
+    in property <int> page-kind;
+    in property <string> page-title;
+    in property <string> page-byline;
+    in property <string> page-tracks-label;
+    in property <string> page-length-label;
+    in property <string> page-year-label;
+    in property <image> page-image;
+    in property <bool> page-has-image;
+    in property <bool> page-loading;
+    in property <string> page-error;
+    in property <[TrackData]> page-tracks;
+    in property <[TileData]> page-tiles;
+    // search
+    in-out property <string> search-query;
+    in-out property <int> search-tab;                 // 0 all, 1 tracks, 2 albums, 3 artists, 4 playlists
+    in property <[string]> search-tab-labels: ["ВСЕ", "ТРЕКИ", "АЛЬБОМЫ", "ИСПОЛНИТЕЛИ", "ПЛЕЙЛИСТЫ"];
+    in property <[TrackData]> search-tracks;
+    in property <[TileData]> search-albums;
+    in property <[TileData]> search-artists;
+    in property <[TileData]> search-playlists;
+    in property <TileData> search-best;
+    in property <bool> search-has-best;
+    in property <string> search-status: "ВВЕДИТЕ ЗАПРОС";   // "", ИЩЕМ…, НИЧЕГО НЕ НАЙДЕНО, error
+    in property <bool> search-status-error;
+    in property <string> search-hint;                 // "ENTER — ОТКРЫТЬ ССЫЛКУ"
+    in property <bool> search-more;                   // the current tab has another page
+    in property <bool> search-loading-more;
+    // player
+    in property <PlayView> play-view: PlayView.stopped;
+    in property <string> track-title;
+    in property <string> track-artists;
+    in property <string> track-context;
+    in property <image> track-image;
+    in property <bool> track-has-image;
+    in property <int> position-ms;
+    in property <int> duration-ms;
+    in-out property <int> volume-level: 8;
+    // queue
+    in-out property <bool> queue-open;
+    in property <[QueueRow]> queue-items;
+    in property <string> queue-context;
+    in property <bool> shuffle-on;
+    in property <int> repeat-mode;                    // 0 off, 1 all, 2 one
+    // Spotify Connect: "" plays here, otherwise the remote device's name
+    in property <string> remote-name;
+    in property <[DeviceRow]> devices;
+    in property <bool> devices-loading;
+    // settings
+    in-out property <int> set-bitrate: 2;             // 96 | 160 | 320
+    in-out property <int> set-normalisation;
+    in-out property <int> set-gapless: 1;
+    in-out property <int> set-notifications: 1;
+    in-out property <string> set-device;
+    in-out property <int> set-cache: 2;               // 128 | 256 | 512 | 1024 MB
+    in property <[string]> audio-devices;
+    in property <int> cache-used-mb;
+    // right-click menu over a track row
+    property <int> menu-source;                       // 0 page, 1 search
+    property <int> menu-index;
+    property <length> menu-x;
+    property <length> menu-y;
+
+    callback login();
+    callback cancel-login();
+    callback reopen-login();
+    callback logout();
+    callback dismiss-notice();
+    callback retry-now();
+    callback open-liked();
+    callback open(int /* kind */, string /* uri */);
+    callback open-byline();
+    callback play-row(int);
+    callback play-page();
+    callback toggle-play();
+    callback seek(float);
+    callback volume-changed(int);
+    callback back();
+    callback search-edited(string);
+    callback search-accepted(string);
+    callback search-tab-changed(int);
+    callback search-load-more();
+    callback search-play(int);
+    callback play-shuffled();
+    callback next();
+    callback prev();
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback queue-jump(int);
+    callback queue-clear();
+    // action: 0 queue, 1 go to artist, 2 go to album
+    callback row-action(int /* source */, int /* index */, int /* action */);
+    callback refresh-devices();
+    callback settings-changed();
+    callback clear-cache();
+    callback refresh-audio-devices();
+    callback pick-device(string /* id, "" = this computer */);
+
+    function seek-relative(delta-ms: int) {
+        if self.duration-ms > 0 {
+            self.seek(max(0, min(1, (self.position-ms + delta-ms) / self.duration-ms)));
+        }
+    }
+
+    public function show-devices() {
+        device-menu.show();
+    }
+
+    public function show-row-menu(source: int, index: int, x: length, y: length) {
+        self.menu-source = source;
+        self.menu-index = index;
+        self.menu-x = min(x, self.width - 260px);
+        self.menu-y = min(y, self.height - 140px);
+        row-menu.show();
+    }
+
+    device-menu := PopupWindow {
+        x: root.width - 300px;
+        y: root.height - Layout.deck-height - self.height - 8px;
+        width: 290px;
+        Rectangle {
+            background: Theme.raise;
+            border-width: 1px;
+            border-color: Theme.line-2;
+            VerticalLayout {
+                padding: 1px;
+                HorizontalLayout {
+                    height: 40px;
+                    padding-left: 16px;
+                    Label { text: root.devices-loading ? "УСТРОЙСТВА · ИЩЕМ…" : "УСТРОЙСТВА"; vertical-alignment: center; }
+                }
+                Rectangle { height: 1px; background: Theme.line; }
+                DeviceItem {
+                    name: "Этот компьютер";
+                    kind: "TONEARM";
+                    active: root.remote-name == "";
+                    clicked => { root.pick-device(""); }
+                }
+                for d in root.devices: DeviceItem {
+                    name: d.name;
+                    kind: d.kind;
+                    active: root.remote-name != "" && d.active;
+                    clicked => { root.pick-device(d.id); }
+                }
+                if root.devices.length == 0 && !root.devices-loading: HorizontalLayout {
+                    padding: 16px;
+                    Label { text: "ДРУГИХ УСТРОЙСТВ НЕТ.\nОТКРОЙТЕ SPOTIFY НА ТЕЛЕФОНЕ\nИЛИ КОЛОНКЕ В ТОЙ ЖЕ СЕТИ"; wrap: word-wrap; }
+                }
+            }
+        }
+    }
+
+    row-menu := PopupWindow {
+        x: root.menu-x;
+        y: root.menu-y;
+        width: 240px;
+        Rectangle {
+            background: Theme.raise;
+            border-width: 1px;
+            border-color: Theme.line-2;
+            VerticalLayout {
+                padding: 1px;
+                MenuItem { text: "В очередь"; hint: ""; clicked => { root.row-action(root.menu-source, root.menu-index, 0); } }
+                MenuItem { text: "К исполнителю"; hint: ""; clicked => { root.row-action(root.menu-source, root.menu-index, 1); } }
+                MenuItem { text: "К альбому"; hint: ""; clicked => { root.row-action(root.menu-source, root.menu-index, 2); } }
+                MenuItem {
+                    text: root.menu-source == 0 && root.page-kind == 0 ? "Убрать из любимых" : "В любимые";
+                    hint: "";
+                    clicked => { root.row-action(root.menu-source, root.menu-index, 3); }
+                }
+            }
+        }
+    }
+
+    title: "Tonearm";
+    icon: @image-url("../../../assets/icon-256.png");
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 960px;
+    min-height: 600px;
+    background: Theme.bg;
+    default-font-family: Fonts.text;
+    default-font-size: 14px;
+
+    // Window-wide shortcuts. Typing in the search box keeps its keys; the rest land here.
+    changed page => {
+        if self.page != Page.search { keys.focus(); }
+        if self.page == Page.settings { root.refresh-audio-devices(); }
+    }
+    keys := FocusScope {
+        width: root.width;
+        height: root.height;
+        init => { self.focus(); }
+        key-pressed(e) => {
+            if root.auth-view != AuthView.logged-in { return reject; }
+            if e.text == " " { root.toggle-play(); return accept; }
+            if e.text == "q" || e.text == "Q" || e.text == "й" || e.text == "Й" {
+                root.queue-open = !root.queue-open;
+                return accept;
+            }
+            if e.text == "/" || (e.modifiers.control && (e.text == "f" || e.text == "а")) {
+                root.page = Page.search;
+                return accept;
+            }
+            if e.text == Key.RightArrow {
+                if e.modifiers.control { root.next(); } else { root.seek-relative(5000); }
+                return accept;
+            }
+            if e.text == Key.LeftArrow {
+                if e.modifiers.control { root.prev(); } else { root.seek-relative(-5000); }
+                return accept;
+            }
+            if e.text == Key.UpArrow || e.text == Key.DownArrow {
+                root.volume-level = max(0, min(12, root.volume-level + (e.text == Key.UpArrow ? 1 : -1)));
+                root.volume-changed(root.volume-level);
+                return accept;
+            }
+            if e.text == Key.Escape && root.page == Page.collection {
+                root.back();
+                return accept;
+            }
+            reject
+        }
+        if root.auth-view != AuthView.logged-in: LoginScreen {
+            width: root.width;
+            height: root.height;
+            view: root.auth-view;
+            version: root.version;
+            waited-secs: root.waited-secs;
+            login => { root.login(); }
+            cancel-login => { root.cancel-login(); }
+            reopen => { root.reopen-login(); }
+        }
+
+        if root.auth-view == AuthView.logged-in: VerticalLayout {
+            HorizontalLayout {
+                vertical-stretch: 1;
+
+                // ── sidebar
+                Rectangle {
+                    width: Layout.sidebar-width;
+                    Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
+                    VerticalLayout {
+                        Rectangle {
+                            height: Layout.header-height;
+                            Logo { x: 24px; height: parent.height; }
+                            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                        }
+                        VerticalLayout {
+                            padding-top: 16px;
+                            padding-bottom: 16px;
+                            NavItem { num: "01"; label: "ГЛАВНАЯ"; active: root.page == Page.home; clicked => { root.page = Page.home; } }
+                            NavItem { num: "02"; label: "ПОИСК"; active: root.page == Page.search; clicked => { root.page = Page.search; } }
+                            NavItem { num: "03"; label: "МЕДИАТЕКА"; active: root.page == Page.library || root.page == Page.collection; clicked => { root.page = Page.library; } }
+                            NavItem { num: "04"; label: "НАСТРОЙКИ"; active: root.page == Page.settings; clicked => { root.page = Page.settings; } }
+                        }
+                        Rectangle { height: 1px; background: Theme.line; }
+                        HorizontalLayout {
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            height: 48px;
+                            Label { text: "ПЛЕЙЛИСТЫ"; vertical-alignment: center; }
+                        }
+                        SidebarRow {
+                            name: "Любимые треки";
+                            count: root.liked-count;
+                            active: root.active-uri == "liked";
+                            clicked => { root.open-liked(); }
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for p in root.playlists: SidebarRow {
+                                name: p.name;
+                                count: p.count;
+                                active: root.active-uri == p.uri;
+                                clicked => { root.open(1, p.uri); }
+                            }
+                        }
+                        Rectangle { height: 1px; background: Theme.line; }
+                        HorizontalLayout {
+                            height: 56px;
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            Label {
+                                text: root.offline ? "ПЕРЕПОДКЛЮЧЕНИЕ…" : root.username;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Rectangle {
+                                width: 7px; height: 7px;
+                                y: (parent.height - self.height) / 2;
+                                background: root.offline ? Theme.signal : Theme.text-3;
+                            }
+                        }
+                    }
+                }
+
+                // ── content
+                VerticalLayout {
+                    horizontal-stretch: 1;
+
+                    // header / signal bar
+                    Rectangle {
+                        height: Layout.header-height;
+                        background: root.offline || (root.notice != "" && root.notice-is-error) ? Theme.signal : transparent;
+                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                        HorizontalLayout {
+                            padding-left: Layout.page-x;
+                            padding-right: Layout.page-x;
+                            spacing: 16px;
+                            if root.offline: Text {
+                                text: "НЕТ СВЯЗИ СО SPOTIFY · ПОВТОР ЧЕРЕЗ " + Fmt.clock(root.retry-in-secs * 1000);
+                                font-family: Fonts.mono; font-size: 12px; letter-spacing: 2px;
+                                color: Theme.bg; vertical-alignment: center; horizontal-stretch: 1;
+                            }
+                            if root.offline: Key {
+                                y: 12px; height: 40px;
+                                text: "ПОВТОРИТЬ";
+                                clicked => { root.retry-now(); }
+                            }
+                            if !root.offline && root.notice != "": Text {
+                                text: root.notice;
+                                font-family: Fonts.mono; font-size: 12px; letter-spacing: 1px;
+                                color: root.notice-is-error ? Theme.bg : Theme.text-2;
+                                vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                            }
+                            if !root.offline && root.notice != "": Key {
+                                y: 12px; height: 40px;
+                                text: "✕";
+                                kind: KeyKind.ghost;
+                                clicked => { root.dismiss-notice(); }
+                            }
+                            if !root.offline && root.notice == "" && root.page == Page.collection: Text {
+                                text: "←";
+                                font-size: 18px; color: Theme.text-2; vertical-alignment: center;
+                                TouchArea { mouse-cursor: pointer; clicked => { root.back(); } }
+                            }
+                            if !root.offline && root.notice == "": Label {
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                text: root.page == Page.home ? root.date-label
+                                    : root.page == Page.search ? "ПОИСК"
+                                    : root.page == Page.settings ? "НАСТРОЙКИ"
+                                    : root.page == Page.library ? "МЕДИАТЕКА"
+                                    : "МЕДИАТЕКА / " + (root.page-kind == 2 ? "АЛЬБОМ" : root.page-kind == 3 ? "ИСПОЛНИТЕЛЬ" : "ПЛЕЙЛИСТ");
+                            }
+                        }
+                    }
+
+                    // pages
+                    Rectangle {
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        if root.page == Page.home: VerticalLayout {
+                            padding-left: Layout.page-x;
+                            padding-right: Layout.page-x;
+                            padding-top: 40px;
+                            spacing: 24px;
+                            alignment: start;
+                            // "Continue": the only coloured cover on the screen is the one playing
+                            if root.track-title != "": HorizontalLayout {
+                                spacing: 40px;
+                                height: 240px;
+                                Rectangle {
+                                    width: 240px;
+                                    background: Theme.selected;
+                                    if root.track-has-image: Image {
+                                        source: root.track-image;
+                                        width: parent.width; height: parent.height;
+                                        image-fit: cover;
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 14px;
+                                    alignment: center;
+                                    Label { text: "ПРОДОЛЖИТЬ · " + root.track-context; color: Theme.text-2; }
+                                    Text {
+                                        text: root.track-title;
+                                        font-family: Fonts.display; line-height-factor: 0.76;
+                                        font-weight: 700;
+                                        font-size: clamp((root.width - Layout.sidebar-width) / 11, 56px, 96px);
+                                        letter-spacing: -4px;
+                                        color: Theme.text-1;
+                                        overflow: elide;
+                                    }
+                                    Text { text: root.track-artists; font-size: 15px; color: Theme.text-2; }
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        alignment: start;
+                                        padding-top: 8px;
+                                        Key {
+                                            text: root.play-view == PlayView.playing ? "❚❚ ПАУЗА" : "▶ СЛУШАТЬ";
+                                            kind: KeyKind.solid;
+                                            clicked => { root.toggle-play(); }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.track-title != "": Rectangle { height: 1px; background: Theme.line; }
+                            Label { text: "§ 01 — " + (root.home-tiles.length > 0 && root.home-tiles[0].kind == 2 ? "НЕДАВНО СЛУШАЛИ" : "ВАША МЕДИАТЕКА"); color: Theme.text-1; }
+                            if root.home-tiles.length == 0: Text {
+                                text: "Загружаем медиатеку…";
+                                color: Theme.text-3;
+                            }
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                for t in root.home-tiles: TileView {
+                                    width: (root.width - Layout.sidebar-width - 2 * Layout.page-x) / 6;
+                                    tile: t;
+                                    clicked => { root.open(t.kind, t.uri); }
+                                }
+                            }
+                        }
+
+                        if root.page == Page.search: VerticalLayout {
+                            // query in huge type
+                            HorizontalLayout {
+                                height: 96px;
+                                padding-left: Layout.page-x;
+                                padding-right: Layout.page-x;
+                                spacing: 20px;
+                                Path {
+                                    width: 22px; height: 22px;
+                                    y: (parent.height - self.height) / 2;
+                                    viewbox-width: 22; viewbox-height: 22;
+                                    stroke: Theme.text-2; stroke-width: 2px;
+                                    commands: "M 9 1 A 8 8 0 1 1 8.99 1 Z M 15 15 L 21 21";
+                                }
+                                FocusScope {
+                                    horizontal-stretch: 1;
+                                    key-pressed(e) => {
+                                        if e.text == Key.Escape {
+                                            root.search-query = "";
+                                            root.search-edited("");
+                                            return accept;
+                                        }
+                                        reject
+                                    }
+                                    query := TextInput {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        vertical-alignment: center;
+                                        text <=> root.search-query;
+                                        font-family: Fonts.display;
+                                        font-weight: 700;
+                                        font-size: 52px;
+                                        letter-spacing: -2px;
+                                        color: Theme.text-1;
+                                        selection-background-color: Theme.signal;
+                                        selection-foreground-color: Theme.bg;
+                                        single-line: true;
+                                        init => { self.focus(); }
+                                        edited => { root.search-edited(self.text); }
+                                        accepted => { root.search-accepted(self.text); }
+                                    }
+                                    if root.search-query == "": Text {
+                                        height: parent.height;
+                                        vertical-alignment: center;
+                                        text: "Трек, альбом, исполнитель или ссылка";
+                                        font-family: Fonts.display;
+                                        font-weight: 700;
+                                        font-size: 52px;
+                                        letter-spacing: -2px;
+                                        color: Theme.text-3;
+                                    }
+                                }
+                                Label {
+                                    vertical-alignment: center;
+                                    text: root.search-hint != "" ? root.search-hint : "ESC — ОЧИСТИТЬ";
+                                    color: root.search-hint != "" ? Theme.signal : Theme.text-3;
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            // tabs with counts
+                            HorizontalLayout {
+                                height: 52px;
+                                alignment: start;
+                                for label[i] in root.search-tab-labels: Rectangle {
+                                    width: tab-text.preferred-width + 64px;
+                                    background: i == root.search-tab ? Theme.text-1 : tab-touch.has-hover ? Theme.hover : transparent;
+                                    Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
+                                    tab-text := Text {
+                                        text: label;
+                                        font-family: Fonts.mono; font-size: 12px; letter-spacing: 1.4px;
+                                        color: i == root.search-tab ? Theme.bg : Theme.text-3;
+                                    }
+                                    tab-touch := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.search-tab = i; root.search-tab-changed(i); }
+                                    }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+
+                            if root.search-status != "": HorizontalLayout {
+                                height: 64px;
+                                padding-left: Layout.page-x;
+                                Label {
+                                    vertical-alignment: center;
+                                    text: root.search-status;
+                                    color: root.search-status-error ? Theme.signal : Theme.text-2;
+                                }
+                            }
+                            if root.search-status != "": Rectangle { vertical-stretch: 1; }
+
+                            // ВСЕ: tracks | best + artists, then albums and playlists
+                            if root.search-tab == 0 && root.search-status == "": ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    alignment: start;
+                                    HorizontalLayout {
+                                        VerticalLayout {
+                                            horizontal-stretch: 3;
+                                            alignment: start;
+                                            padding-left: Layout.page-x - 12px;
+                                            padding-right: 32px;
+                                            padding-top: 32px;
+                                            HorizontalLayout { padding-left: 12px; height: 32px; Label { text: "§ ТРЕКИ"; color: Theme.text-1; } }
+                                            for t[i] in root.search-tracks: TrackRow {
+                                                visible: i < 6;
+                                                height: i < 6 ? Layout.row-height : 0px;
+                                                code: t.code; title: t.title; artist: t.artist;
+                                                duration: t.duration; state: t.state;
+                                                play => { root.search-play(i); }
+                                                context-menu(p) => { root.show-row-menu(1, i, self.absolute-position.x + p.x, self.absolute-position.y + p.y); }
+                                            }
+                                        }
+                                        Rectangle { width: 1px; background: Theme.line; }
+                                        VerticalLayout {
+                                            horizontal-stretch: 2;
+                                            alignment: start;
+                                            padding-left: 32px;
+                                            padding-right: Layout.page-x;
+                                            padding-top: 32px;
+                                            spacing: 16px;
+                                            if root.search-has-best: Label { text: "§ ЛУЧШИЙ РЕЗУЛЬТАТ"; color: Theme.text-1; }
+                                            if root.search-has-best: HorizontalLayout {
+                                                spacing: 20px;
+                                                height: 150px;
+                                                Rectangle {
+                                                    width: 130px;
+                                                    height: 130px;
+                                                    y: (parent.height - self.height) / 2;
+                                                    background: Theme.selected;
+                                                    border-radius: root.search-best.kind == 3 ? self.width / 2 : 0px;
+                                                    clip: true;
+                                                    if root.search-best.has-image: Image {
+                                                        source: root.search-best.image;
+                                                        width: parent.width; height: parent.height;
+                                                        image-fit: cover;
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    spacing: 6px;
+                                                    Label {
+                                                        text: root.search-best.kind == 2 ? "АЛЬБОМ" : root.search-best.kind == 3 ? "ИСПОЛНИТЕЛЬ" : "ПЛЕЙЛИСТ";
+                                                    }
+                                                    Text {
+                                                        text: root.search-best.title;
+                                                        font-family: Fonts.display; line-height-factor: 0.76;
+                                                        font-weight: 700; font-size: 40px; letter-spacing: -1.5px;
+                                                        color: best-touch.has-hover ? Theme.signal : Theme.text-1;
+                                                        wrap: word-wrap;
+                                                    }
+                                                    Text { text: root.search-best.subtitle; font-size: 13px; color: Theme.text-2; overflow: elide; }
+                                                }
+                                                best-touch := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => { root.open(root.search-best.kind, root.search-best.uri); }
+                                                }
+                                            }
+                                            if root.search-artists.length > 0: Label { text: "§ ИСПОЛНИТЕЛИ"; color: Theme.text-1; }
+                                            if root.search-artists.length > 0: HorizontalLayout {
+                                                spacing: 16px;
+                                                alignment: start;
+                                                for a[i] in root.search-artists: VerticalLayout {
+                                                    visible: i < 4;
+                                                    width: i < 4 ? 92px : 0px;
+                                                    spacing: 10px;
+                                                    Rectangle {
+                                                        height: 92px;
+                                                        border-radius: 46px;
+                                                        clip: true;
+                                                        background: Theme.selected;
+                                                        if a.has-image: Image {
+                                                            source: a.image;
+                                                            width: parent.width; height: parent.height;
+                                                            image-fit: cover;
+                                                        }
+                                                        TouchArea { mouse-cursor: pointer; clicked => { root.open(3, a.uri); } }
+                                                    }
+                                                    Text {
+                                                        text: a.title; font-size: 13px; color: Theme.text-1;
+                                                        horizontal-alignment: center; overflow: elide;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if root.search-albums.length > 0: SearchTiles {
+                                        title: "§ АЛЬБОМЫ";
+                                        tiles: root.search-albums;
+                                        limit: 6;
+                                        open(k, u) => { root.open(k, u); }
+                                    }
+                                    if root.search-playlists.length > 0: SearchTiles {
+                                        title: "§ ПЛЕЙЛИСТЫ";
+                                        tiles: root.search-playlists;
+                                        limit: 6;
+                                        open(k, u) => { root.open(k, u); }
+                                    }
+                                    Rectangle { height: 32px; }
+                                }
+                            }
+
+                            // ТРЕКИ: the full list, paged by 10
+                            if root.search-tab == 1 && root.search-status == "": ListView {
+                                vertical-stretch: 1;
+                                for t[i] in root.search-tracks: TrackRow {
+                                    code: t.code; title: t.title; artist: t.artist;
+                                    duration: t.duration; state: t.state;
+                                    play => { root.search-play(i); }
+                                    context-menu(p) => { root.show-row-menu(1, i, self.absolute-position.x + p.x, self.absolute-position.y + p.y); }
+                                }
+                            }
+                            // АЛЬБОМЫ / ИСПОЛНИТЕЛИ / ПЛЕЙЛИСТЫ: grid
+                            if root.search-tab >= 2 && root.search-status == "": ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    alignment: start;
+                                    SearchTiles {
+                                        title: "";
+                                        tiles: root.search-tab == 2 ? root.search-albums : root.search-tab == 3 ? root.search-artists : root.search-playlists;
+                                        limit: 1000;
+                                        open(k, u) => { root.open(k, u); }
+                                    }
+                                }
+                            }
+                            if root.search-tab > 0 && root.search-more && root.search-status == "": HorizontalLayout {
+                                height: 72px;
+                                padding-left: Layout.page-x;
+                                padding-top: 16px;
+                                padding-bottom: 16px;
+                                alignment: start;
+                                Key {
+                                    text: root.search-loading-more ? "ЗАГРУЖАЕМ…" : "ЕЩЁ 10 ↓";
+                                    clicked => { root.search-load-more(); }
+                                }
+                            }
+                        }
+
+                        if root.page == Page.settings: ScrollView {
+                            VerticalLayout {
+                                alignment: start;
+                                HorizontalLayout {
+                                    padding-left: Layout.page-x;
+                                    padding-right: Layout.page-x;
+                                    height: 112px;
+                                    Text {
+                                        text: "Настройки";
+                                        font-family: Fonts.display; line-height-factor: 0.76; font-weight: 700;
+                                        font-size: 64px; letter-spacing: -2.5px; color: Theme.text-1;
+                                        vertical-alignment: center; horizontal-stretch: 1;
+                                    }
+                                    Label { text: "СОХРАНЯЮТСЯ СРАЗУ"; vertical-alignment: center; }
+                                }
+                                SettingsSection { text: "§ 01 — ЗВУК"; }
+                                SettingRow {
+                                    num: "1.1"; title: "Качество потока"; hint: "OGG VORBIS, КБИТ/С";
+                                    Switch {
+                                        items: ["96", "160", "320"];
+                                        current <=> root.set-bitrate;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                }
+                                SettingRow {
+                                    num: "1.2"; title: "Нормализация громкости"; hint: "ВЫРАВНИВАЕТ ГРОМКОСТЬ ТРЕКОВ";
+                                    Switch {
+                                        items: ["Выкл", "Вкл"];
+                                        current <=> root.set-normalisation;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                }
+                                SettingRow {
+                                    num: "1.3"; title: "Без пауз между треками"; hint: "СЛЕДУЮЩИЙ ТРЕК ГРУЗИТСЯ ЗАРАНЕЕ";
+                                    Switch {
+                                        items: ["Выкл", "Вкл"];
+                                        current <=> root.set-gapless;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                }
+                                SettingRow {
+                                    num: "1.4"; title: "Аудиовыход"; hint: "ПРИМЕНИТСЯ СО СЛЕДУЮЩЕГО ТРЕКА";
+                                    Rectangle {
+                                        width: min(360px, dev-text.preferred-width + 48px);
+                                        height: 40px;
+                                        border-width: 1px;
+                                        border-color: out-touch.has-hover ? Theme.text-2 : Theme.line-2;
+                                        HorizontalLayout {
+                                            padding-left: 16px;
+                                            padding-right: 16px;
+                                            spacing: 10px;
+                                            dev-text := Text {
+                                                text: root.set-device == "" ? "Системный по умолчанию" : root.set-device;
+                                                font-family: Fonts.mono; font-size: 12px; color: Theme.text-1;
+                                                vertical-alignment: center; overflow: elide; horizontal-stretch: 1;
+                                            }
+                                            Text { text: "▾"; font-size: 12px; color: Theme.text-2; vertical-alignment: center; }
+                                        }
+                                        out-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.refresh-audio-devices();
+                                                output-menu.show();
+                                            }
+                                        }
+                                        output-menu := PopupWindow {
+                                            y: parent.height + 4px;
+                                            width: 360px;
+                                            Rectangle {
+                                                background: Theme.raise;
+                                                border-width: 1px;
+                                                border-color: Theme.line-2;
+                                                VerticalLayout {
+                                                    padding: 1px;
+                                                    MenuItem {
+                                                        text: "Системный по умолчанию";
+                                                        clicked => { root.set-device = ""; root.settings-changed(); }
+                                                    }
+                                                    for name in root.audio-devices: MenuItem {
+                                                        text: name;
+                                                        clicked => { root.set-device = name; root.settings-changed(); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                SettingRow {
+                                    num: "1.5"; title: "Уведомление о новом треке"; hint: "КОГДА ОКНО В ФОНЕ";
+                                    Switch {
+                                        items: ["Выкл", "Вкл"];
+                                        current <=> root.set-notifications;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                }
+                                SettingsSection { text: "§ 02 — КЭШ"; }
+                                SettingRow {
+                                    num: "2.1"; title: "Обложки";
+                                    hint: root.cache-used-mb + " ИЗ " + (root.set-cache == 0 ? 128 : root.set-cache == 1 ? 256 : root.set-cache == 2 ? 512 : 1024) + " МБ";
+                                    LedMeter {
+                                        width: 200px;
+                                        y: 15px;
+                                        segments: 20;
+                                        interactive: false;
+                                        level: min(20, Math.ceil(root.cache-used-mb * 20 / (root.set-cache == 0 ? 128 : root.set-cache == 1 ? 256 : root.set-cache == 2 ? 512 : 1024)));
+                                    }
+                                    Switch {
+                                        items: ["128", "256", "512", "1024"];
+                                        current <=> root.set-cache;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                    Key { text: "ОЧИСТИТЬ"; kind: KeyKind.ghost; clicked => { root.clear-cache(); } }
+                                }
+                                SettingsSection { text: "§ 03 — АККАУНТ"; }
+                                SettingRow {
+                                    num: "3.1"; title: root.username; hint: "ВХОД ЗАШИФРОВАН, В CONFIG.TOML ЕГО НЕТ";
+                                    Key { text: "ВЫЙТИ →"; kind: KeyKind.danger; clicked => { root.logout(); } }
+                                }
+                                HorizontalLayout {
+                                    padding-left: Layout.page-x;
+                                    padding-top: 24px;
+                                    padding-bottom: 32px;
+                                    Label { text: "TONEARM " + root.version + " · НЕ СВЯЗАН СО SPOTIFY AB"; }
+                                }
+                            }
+                        }
+
+                        if root.page == Page.library: VerticalLayout {
+                            padding-left: Layout.page-x;
+                            padding-right: Layout.page-x;
+                            padding-top: 32px;
+                            spacing: 16px;
+                            Text { text: "Медиатека"; font-family: Fonts.display; line-height-factor: 0.76; font-weight: 700; font-size: 96px; letter-spacing: -4px; color: Theme.text-1; }
+                            Label { text: "§ 01 — ПЛЕЙЛИСТЫ · " + (root.playlists.length + 1); color: Theme.text-1; }
+                            VerticalLayout {
+                            spacing: 0px;
+                            TrackRow {
+                                single-click: true;
+                                code: "♥";
+                                title: "Любимые треки";
+                                artist: "";
+                                duration: root.liked-count;
+                                play => { root.open-liked(); }
+                            }
+                            ListView {
+                                vertical-stretch: 1;
+                                for p[i] in root.playlists: TrackRow {
+                                    single-click: true;
+                                    code: (i + 1 < 9 ? "00" : i + 1 < 99 ? "0" : "") + (i + 1);
+                                    title: p.name;
+                                    artist: "";
+                                    duration: p.count;
+                                    play => { root.open(1, p.uri); }
+                                }
+                            }
+                            }
+                        }
+
+                        if root.page == Page.collection: VerticalLayout {
+                            // header: huge title, meta, grayscale cover on the right
+                            HorizontalLayout {
+                                height: 320px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    padding-left: Layout.page-x;
+                                    padding-right: Layout.page-x;
+                                    padding-top: 24px;
+                                    padding-bottom: 24px;
+                                    spacing: 18px;
+                                    alignment: end;
+                                    Text {
+                                        text: root.page-title;
+                                        font-family: Fonts.display; line-height-factor: 0.76;
+                                        font-weight: 700;
+                                        font-size: clamp((root.width - Layout.sidebar-width - (root.queue-open ? Layout.queue-width : 0px) - 300px - 2 * Layout.page-x) / 6, 44px, 110px);
+                                        letter-spacing: -4px;
+                                        color: Theme.text-1;
+                                        wrap: word-wrap;
+                                        overflow: elide;
+                                        vertical-stretch: 1;
+                                        vertical-alignment: bottom;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 40px;
+                                        alignment: start;
+                                        if root.page-byline != "": VerticalLayout {
+                                            spacing: 6px;
+                                            Label { text: root.page-kind == 2 ? "ИСПОЛНИТЕЛЬ" : "АВТОР"; }
+                                            Text {
+                                                text: root.page-byline;
+                                                font-family: Fonts.mono; font-size: 18px;
+                                                color: root.page-kind == 2 && byline-touch.has-hover ? Theme.signal : Theme.text-1;
+                                                byline-touch := TouchArea { enabled: root.page-kind == 2; mouse-cursor: pointer; clicked => { root.open-byline(); } }
+                                            }
+                                        }
+                                        if root.page-year-label != "": VerticalLayout {
+                                            spacing: 6px;
+                                            Label { text: "ГОД"; }
+                                            Text { text: root.page-year-label; font-family: Fonts.mono; font-size: 18px; color: Theme.text-1; }
+                                        }
+                                        if root.page-tracks-label != "": VerticalLayout {
+                                            spacing: 6px;
+                                            Label { text: "ТРЕКОВ"; }
+                                            Text { text: root.page-tracks-label; font-family: Fonts.mono; font-size: 18px; color: Theme.text-1; }
+                                        }
+                                        if root.page-length-label != "": VerticalLayout {
+                                            spacing: 6px;
+                                            Label { text: "ДЛИНА"; }
+                                            Text { text: root.page-length-label; font-family: Fonts.mono; font-size: 18px; color: Theme.text-1; }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 300px;
+                                    background: Theme.raise;
+                                    Rectangle { width: 1px; x: 0; background: Theme.line; }
+                                    if root.page-has-image: Image {
+                                        source: root.page-image;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        image-fit: cover;
+                                    }
+                                    if !root.page-has-image: Text {
+                                        text: root.page-kind == 0 ? "♥" : "";
+                                        font-size: 96px;
+                                        color: Theme.text-3;
+                                    }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                height: 76px;
+                                padding-left: Layout.page-x;
+                                padding-right: Layout.page-x;
+                                padding-top: 16px;
+                                padding-bottom: 16px;
+                                spacing: 16px;
+                                alignment: start;
+                                Key {
+                                    text: "▶ СЛУШАТЬ";
+                                    kind: KeyKind.solid;
+                                    clicked => { root.play-page(); }
+                                }
+                                Key {
+                                    text: "ПЕРЕМЕШАТЬ";
+                                    clicked => { root.play-shuffled(); }
+                                }
+                                if root.page-loading: Label { text: "ЗАГРУЗКА…"; vertical-alignment: center; }
+                                if root.page-error != "": Text {
+                                    text: root.page-error;
+                                    font-family: Fonts.mono; font-size: 12px;
+                                    color: Theme.signal; vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+
+                            if root.page-kind != 3: ListView {
+                                vertical-stretch: 1;
+                                for t[i] in root.page-tracks: TrackRow {
+                                    code: t.code;
+                                    title: t.title;
+                                    artist: t.artist;
+                                    duration: t.duration;
+                                    state: t.state;
+                                    play => { root.play-row(i); }
+                                    context-menu(p) => { root.show-row-menu(0, i, self.absolute-position.x + p.x, self.absolute-position.y + p.y); }
+                                }
+                            }
+                            if root.page-kind == 3: ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                alignment: start;
+                                Rectangle {
+                                    height: 48px;
+                                    Label { x: Layout.page-x; text: "§ 01 — ПОПУЛЯРНОЕ"; color: Theme.text-1; }
+                                }
+                                for t[i] in root.page-tracks: TrackRow {
+                                    code: t.code;
+                                    title: t.title;
+                                    artist: t.artist;
+                                    duration: t.duration;
+                                    state: t.state;
+                                    play => { root.play-row(i); }
+                                    context-menu(p) => { root.show-row-menu(0, i, self.absolute-position.x + p.x, self.absolute-position.y + p.y); }
+                                }
+                                Rectangle {
+                                    height: 64px;
+                                    Label { x: Layout.page-x; y: 32px; text: "§ 02 — ДИСКОГРАФИЯ"; color: Theme.text-1; }
+                                }
+                                for a in root.page-tiles: TrackRow {
+                                    single-click: true;
+                                    code: a.subtitle;
+                                    title: a.title;
+                                    artist: "";
+                                    duration: "→";
+                                    play => { root.open(a.kind, a.uri); }
+                                }
+                                }
+                            }
+                        }
+                    }
+                }
+                // ── queue panel
+                if root.queue-open: Rectangle { width: 1px; background: Theme.line; }
+                if root.queue-open: VerticalLayout {
+                    width: Layout.queue-width;
+                    HorizontalLayout {
+                        height: Layout.header-height;
+                        padding-left: 24px;
+                        padding-right: 16px;
+                        Label { text: "ОЧЕРЕДЬ"; color: Theme.text-1; vertical-alignment: center; horizontal-stretch: 1; }
+                        Key { y: 12px; height: 40px; text: "✕"; kind: KeyKind.ghost; clicked => { root.queue-open = false; } }
+                    }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    QueueHeading { text: "СЕЙЧАС"; }
+                    if root.track-title != "": QueueLine {
+                        code: "▸";
+                        title: root.track-title;
+                        artist: root.track-artists;
+                        playing: true;
+                    }
+                    if root.track-title == "": QueueLine { code: ""; title: "Ничего не играет"; artist: ""; }
+                    ListView {
+                        vertical-stretch: 1;
+                        for q[i] in root.queue-items: QueueLine {
+                            heading: i == 0 && q.manual ? "ДАЛЕЕ · ВРУЧНУЮ"
+                                : (i == 0 || root.queue-items[i - 1].manual) && !q.manual ? "ДАЛЕЕ · " + root.queue-context
+                                : "";
+                            clear-visible: i == 0 && q.manual;
+                            code: q.code;
+                            title: q.title;
+                            artist: q.artist;
+                            clicked => { root.queue-jump(i); }
+                            clear => { root.queue-clear(); }
+                        }
+                    }
+                    if root.queue-items.length == 0: HorizontalLayout {
+                        padding: 24px;
+                        vertical-stretch: 1;
+                        Label {
+                            text: "ДАЛЬШЕ ПУСТО.\nПРАВЫЙ КЛИК ПО ТРЕКУ → «В ОЧЕРЕДЬ»";
+                            wrap: word-wrap;
+                            vertical-alignment: top;
+                        }
+                    }
+                }
+            }
+
+            // ── deck
+            Rectangle {
+                height: Layout.deck-height;
+                background: Theme.raise;
+                Rectangle { height: 1px; y: 0; background: Theme.line; }
+                HorizontalLayout {
+                    // now playing
+                    HorizontalLayout {
+                        width: Layout.sidebar-width;
+                        padding-left: 24px;
+                        padding-right: 16px;
+                        spacing: 14px;
+                        Rectangle {
+                            width: 56px; height: 56px;
+                            y: (parent.height - self.height) / 2;
+                            background: Theme.selected;
+                            if root.track-has-image: Image {
+                                source: root.track-image;
+                                width: parent.width; height: parent.height;
+                                image-fit: cover;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            Label {
+                                text: root.remote-name != "" ? "● НА: " + root.remote-name
+                                : root.play-view == PlayView.playing ? "● ИГРАЕТ"
+                                    : root.play-view == PlayView.loading ? "● ЗАГРУЗКА"
+                                    : root.play-view == PlayView.paused ? "❚❚ ПАУЗА" : "НИЧЕГО НЕ ИГРАЕТ";
+                                color: root.remote-name != "" || root.play-view == PlayView.playing ? Theme.signal : Theme.text-3;
+                            }
+                            Text { text: root.track-title; font-family: Fonts.text; font-size: 15px; font-weight: 600; color: Theme.text-1; overflow: elide; }
+                            Text { text: root.track-artists; font-family: Fonts.text; font-size: 13px; color: Theme.text-2; overflow: elide; }
+                        }
+                    }
+                    Rectangle { width: 1px; background: Theme.line; }
+                    // dial + counter + keys
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        padding-left: Layout.page-x;
+                        padding-right: Layout.page-x;
+                        padding-top: 14px;
+                        padding-bottom: 12px;
+                        spacing: 8px;
+                        TickRuler {
+                            value: root.duration-ms > 0 ? root.position-ms / root.duration-ms : 0;
+                            seek(v) => { root.seek(v); }
+                        }
+                        HorizontalLayout {
+                            spacing: 14px;
+                            Text {
+                                text: Fmt.clock(root.position-ms);
+                                font-family: Fonts.mono; font-size: 26px; color: Theme.text-1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "−" + Fmt.clock(root.duration-ms - root.position-ms);
+                                font-family: Fonts.mono; font-size: 13px; color: Theme.text-3;
+                                vertical-alignment: center;
+                            }
+                            Label { text: root.track-context; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                            HorizontalLayout {
+                                spacing: 0px;
+                                DeckKey { text: "SHF"; lit: root.shuffle-on; clicked => { root.toggle-shuffle(); } }
+                                DeckKey { glyph: "prev"; clicked => { root.prev(); } }
+                                DeckKey {
+                                    glyph: root.play-view == PlayView.playing || root.play-view == PlayView.loading ? "pause" : "play";
+                                    solid: true;
+                                    clicked => { root.toggle-play(); }
+                                }
+                                DeckKey { glyph: "next"; clicked => { root.next(); } }
+                                DeckKey { text: root.repeat-mode == 2 ? "RPT1" : "RPT"; lit: root.repeat-mode != 0; clicked => { root.cycle-repeat(); } }
+                            }
+                        }
+                    }
+                    Rectangle { width: 1px; background: Theme.line; }
+                    // volume
+                    VerticalLayout {
+                        width: 280px;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        alignment: center;
+                        spacing: 12px;
+                        HorizontalLayout {
+                            Label { text: "ГРОМКОСТЬ"; horizontal-stretch: 1; }
+                            Label { text: round(root.volume-level * 100 / 12) + "%"; color: Theme.text-2; }
+                        }
+                        LedMeter {
+                            segments: 12;
+                            level <=> root.volume-level;
+                            changed(l) => { root.volume-changed(l); }
+                        }
+                        HorizontalLayout {
+                            Label {
+                                text: "[Q] ОЧЕРЕДЬ";
+                                horizontal-stretch: 1;
+                                color: root.queue-open ? Theme.text-1 : q-touch.has-hover ? Theme.text-2 : Theme.text-3;
+                                q-touch := TouchArea { mouse-cursor: pointer; clicked => { root.queue-open = !root.queue-open; } }
+                            }
+                            Label {
+                                text: root.remote-name == "" ? "◫ ЭТОТ КОМПЬЮТЕР" : "● " + root.remote-name;
+                                color: root.remote-name != "" ? Theme.signal : dev-touch.has-hover ? Theme.text-1 : Theme.text-3;
+                                overflow: elide;
+                                horizontal-alignment: right;
+                                dev-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.refresh-devices();
+                                        root.show-devices();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

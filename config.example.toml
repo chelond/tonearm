@@ -1,0 +1,23 @@
+# Copy to the config directory as config.toml:
+#   Linux:   ~/.config/tonearm/config.toml
+#   Windows: %APPDATA%\tonearm\config\config.toml
+# Tokens are never stored here: they live in the system keyring or, without one,
+# in an encrypted file (~/.local/share/tonearm/secrets, mode 0600).
+# The settings page writes this file too; unknown or broken values fall back to defaults.
+
+[spotify]
+# Your own app from https://developer.spotify.com/dashboard (Web API, PKCE).
+# Redirect URI to register: http://127.0.0.1:8898/login
+client_id = ""
+
+[audio]
+bitrate = 320          # 96 | 160 | 320
+normalisation = false
+gapless = true         # preload the next track
+device = ""            # empty = system default; names as in Settings → Audio output
+
+[cache]
+max_size_mb = 512      # covers; the settings page offers 128 | 256 | 512 | 1024
+
+[ui]
+notifications = true   # notify on track change while the window is in the background

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/player", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/chelond/tonearm"
+
+[workspace.dependencies]
+tonearm-core = { path = "crates/core" }
+tonearm-player = { path = "crates/player" }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+serde_json = "1"
+# librespot: rustls instead of the default native-tls, so Linux builds do not need OpenSSL.
+librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-oauth = { version = "0.8.0", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-protocol = "0.8.0"
+librespot-metadata = { version = "0.8.0", default-features = false, features = ["rustls-tls-native-roots"] }
+# rodio/cpal come from here (rodio 0.21, cpal 0.16); do not add them directly.
+librespot-playback = { version = "0.8.0", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
+# v1 feature: Secret Service over zbus (pure Rust) on Linux, Credential Manager on Windows.
+keyring = "4.2"
+# Already in the tree via rustls; used for the encrypted fallback secret file on Linux.
+ring = "0.17"
+directories = "6"
+# Same versions that are already in the tree (via librespot-oauth / slint / librespot).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+futures-util = "0.3"
+# Same version librespot already pulls in; for queue shuffle.
+rand = "0.9"
+# Same version as already in the tree (via slint-build).
+toml = "1"
+# Same version librespot uses through rodio; only to list output devices.
+cpal = "0.16"
+# Software renderer by default: ~20 MB RSS vs ~140 MB with the OpenGL (femtovg) renderer.
+# femtovg stays compiled in so it can be tried with SLINT_BACKEND=winit-femtovg.
+slint = { version = "1.19", default-features = false, features = ["std", "backend-winit", "renderer-software", "renderer-femtovg", "accessibility", "compat-1-2", "raw-window-handle-06", "unstable-winit-030"] }
+slint-build = "1.19"
+# MPRIS over zbus (pure Rust, no libdbus) on Linux, SMTC on Windows.
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+zbus = "5"
+raw-window-handle = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Dependencies without debug info: faster links and a much smaller target/ in debug builds.
+[profile.dev.package."*"]
+debug = false

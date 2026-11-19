@@ -1,0 +1,48 @@
+# Maintainer: chelond
+# Build from a local checkout: cd packaging/arch && makepkg -si
+pkgname=tonearm
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Lightweight native music streaming client (unofficial, requires Premium)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/chelond/tonearm"
+license=('MIT')
+# TLS is rustls and the keyring talks D-Bus via zbus, so no openssl/libdbus.
+# Audio goes through ALSA (cpal); PipeWire/PulseAudio users get it via pipewire-alsa / pulseaudio-alsa.
+depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
+         'libx11' 'libxcursor' 'libxi' 'libxrandr' 'alsa-lib')
+optdepends=('gnome-keyring: keep the login in Secret Service instead of the encrypted file'
+            'playerctl: control playback from the command line over MPRIS')
+makedepends=('cargo')
+options=('!lto')
+source=()
+
+_srcroot() { realpath "$startdir/../.."; }
+
+prepare() {
+  cd "$(_srcroot)"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$(_srcroot)"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --frozen --release -p tonearm
+}
+
+check() {
+  cd "$(_srcroot)"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --frozen --workspace
+}
+
+package() {
+  local root; root="$(_srcroot)"
+  install -Dm755 "$srcdir/target/release/tonearm" "$pkgdir/usr/bin/tonearm"
+  install -Dm644 "$root/packaging/arch/tonearm.desktop" "$pkgdir/usr/share/applications/tonearm.desktop"
+  install -Dm644 "$root/assets/icon.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/tonearm.svg"
+  install -Dm644 "$root/assets/icon-256.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/tonearm.png"
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
