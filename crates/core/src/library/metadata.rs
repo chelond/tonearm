@@ -16,7 +16,7 @@ const CONCURRENCY: usize = 8;
 #[error("не удалось загрузить данные артиста: {0}")]
 pub struct MetadataError(String);
 
-fn image_url(images: &Images) -> Option<String> {
+pub(super) fn image_url(images: &Images) -> Option<String> {
     images
         .iter()
         .max_by_key(|i| i.width)
@@ -28,7 +28,7 @@ fn uri_string(uri: &SpotifyUri) -> String {
     uri.to_uri().unwrap_or_default()
 }
 
-fn track_item(t: &Track) -> TrackItem {
+pub(super) fn track_item(t: &Track) -> TrackItem {
     TrackItem {
         uri: uri_string(&t.id),
         title: t.name.clone(),
