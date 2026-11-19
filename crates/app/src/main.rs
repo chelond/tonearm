@@ -24,7 +24,7 @@ fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     // librespot logs raw OAuth/token responses at trace level: cap these targets whatever RUST_LOG says.
-    for directive in ["librespot_oauth=info", "librespot_core=debug"] {
+    for directive in ["librespot_oauth=info", "librespot_core=info"] {
         if let Ok(d) = directive.parse() {
             filter = filter.add_directive(d);
         }
