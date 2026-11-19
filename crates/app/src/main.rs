@@ -598,6 +598,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (session_tx, session_rx) = watch::channel(None);
 
     let settings = Settings::load();
+    tonearm_core::library::use_own_client_id(
+        &settings.spotify.client_id,
+        tonearm_core::system_store(),
+    );
     let window = AppWindow::new()?;
     ui_state::init(&window);
     show_settings(&window, &settings);

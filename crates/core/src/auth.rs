@@ -18,7 +18,7 @@ use crate::secret::Secret;
 
 /// Loopback redirect accepted for librespot's client id; the port is fixed by registration.
 pub const REDIRECT_PORT: u16 = 8898;
-const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
+pub(crate) const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 
 /// Scopes for the streaming session; Web API tokens are requested separately.
 const SCOPES: &[&str] = &[

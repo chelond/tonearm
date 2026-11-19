@@ -6,7 +6,8 @@
 # The settings page writes this file too; unknown or broken values fall back to defaults.
 
 [spotify]
-# Your own app from https://developer.spotify.com/dashboard (Web API, PKCE).
+# Own app from https://developer.spotify.com/dashboard for the Web API (PKCE, no secret).
+# Use it when the shared client id hits "rate limited" (429). See README.
 # Redirect URI to register: http://127.0.0.1:8898/login
 client_id = ""
 

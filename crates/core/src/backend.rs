@@ -298,6 +298,7 @@ impl<A: AuthProvider> Backend<A> {
         if let Some(session) = self.session.take() {
             A::shutdown(&session);
         }
+        crate::library::forget_own_token();
         if let Err(err) = self.store_call(|s| s.delete(CREDENTIALS_KEY)).await {
             self.notice(Notice::Error(format!(
                 "Не удалось удалить сохранённый вход: {err}"
