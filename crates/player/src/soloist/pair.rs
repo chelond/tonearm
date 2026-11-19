@@ -136,6 +136,13 @@ pub async fn add_user(
         .no_proxy()
         .build()
         .map_err(|e| PairError::Other(e.to_string()))?;
+    // Drop any half-finished login first, as the ZeroConf guide asks of controllers.
+    let _ = http
+        .post(&endpoint.url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("action=resetUsers")
+        .send()
+        .await;
     let info = get_info(&http, &endpoint.url).await?;
     let token_type = info["tokenType"].as_str().unwrap_or("default");
     tracing::info!(
@@ -159,6 +166,12 @@ pub async fn add_user(
     rand::Rng::fill(&mut rand::rng(), &mut iv);
     let blob = outer_blob(&keys.shared_secret(&public_key), &iv, inner.as_bytes());
     let client_key = BASE64.encode(keys.public_key());
+    // The rest of what Spotify's desktop app sends (captured traces): our own 40-hex device id,
+    // a login id and the ZeroConf version it speaks.
+    let our_device = hex(&Sha1::digest(
+        format!("tonearm-controller-{username}").as_bytes(),
+    ));
+    let login_id = hex(&rand::random::<[u8; 16]>());
 
     let body = [
         ("action", "addUser"),
@@ -166,7 +179,10 @@ pub async fn add_user(
         ("blob", blob.as_str()),
         ("clientKey", client_key.as_str()),
         ("tokenType", "default"),
+        ("loginId", login_id.as_str()),
         ("deviceName", "Tonearm"),
+        ("deviceId", our_device.as_str()),
+        ("version", "2.7.1"),
     ]
     .iter()
     .map(|(k, v)| format!("{k}={}", form_encode(v)))
@@ -190,6 +206,10 @@ pub async fn add_user(
             answer["statusString"].as_str().unwrap_or("?").to_owned(),
         ))
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn form_encode(s: &str) -> String {
