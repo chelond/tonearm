@@ -6705,6 +6705,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 name = "tonearm"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "raw-window-handle",
  "slint",
  "slint-build",
@@ -6714,6 +6715,7 @@ dependencies = [
  "tonearm-player",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "winresource",
  "zbus",
 ]

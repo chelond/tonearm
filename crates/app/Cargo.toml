@@ -19,12 +19,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 slint.workspace = true
 souvlaki.workspace = true
+directories.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle.workspace = true
+# Same version already in the tree; only for the fatal-error message box.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 slint-build.workspace = true
