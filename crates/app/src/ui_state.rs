@@ -288,7 +288,9 @@ impl UiState {
         (uris, None)
     }
 
-    pub fn on_devices(&mut self, w: &AppWindow, list: Vec<tonearm_core::connect::Device>) {
+    pub fn on_devices(&mut self, w: &AppWindow, mut list: Vec<tonearm_core::connect::Device>) {
+        // Our own Soloist is "this computer", not a remote device.
+        list.retain(|d| d.name != tonearm_player::soloist::DEVICE_NAME);
         let rows: Vec<crate::DeviceRow> = list
             .iter()
             .map(|d| crate::DeviceRow {

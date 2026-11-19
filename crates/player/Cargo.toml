@@ -7,7 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 librespot-core.workspace = true
@@ -15,9 +14,31 @@ librespot-metadata.workspace = true
 librespot-playback.workspace = true
 rand.workspace = true
 cpal.workspace = true
+# Soloist engine: WebSocket control, download, ZeroConf sign-in (same crypto crates as librespot).
+tokio = { workspace = true, features = ["process", "io-util", "net"] }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+futures-util.workspace = true
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect"] }
+mdns-sd = "0.22"
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+librespot-protocol.workspace = true
 
 [lints]
 workspace = true

@@ -614,6 +614,11 @@ export component AppWindow inherits Window {
     in-out property <int> set-notifications: 1;
     in-out property <string> set-device;
     in-out property <int> set-cache: 2;               // 128 | 256 | 512 | 1024 MB
+    in-out property <int> set-engine;                 // 0 built-in librespot, 1 Spotify Soloist
+    in property <string> soloist-status: "ВЫКЛЮЧЕН";
+    in property <string> soloist-detail;
+    in property <bool> soloist-need-key;
+    in property <bool> soloist-can-retry;
     in property <[string]> audio-devices;
     in property <int> cache-used-mb;
     // right-click menu over a track row
@@ -653,6 +658,9 @@ export component AppWindow inherits Window {
     callback row-action(int /* source */, int /* index */, int /* action */);
     callback refresh-devices();
     callback settings-changed();
+    callback soloist-get-key();
+    callback soloist-key-entered(string);
+    callback soloist-retry();
     callback clear-cache();
     callback refresh-audio-devices();
     callback pick-device(string /* id, "" = this computer */);
@@ -1327,9 +1335,58 @@ export component AppWindow inherits Window {
                                     }
                                     Key { text: "ОЧИСТИТЬ"; kind: KeyKind.ghost; clicked => { root.clear-cache(); } }
                                 }
-                                SettingsSection { text: "§ 03 — АККАУНТ"; }
+                                SettingsSection { text: "§ 03 — ПЛЕЕР"; }
                                 SettingRow {
-                                    num: "3.1"; title: root.username; hint: "ВХОД ЗАШИФРОВАН, В CONFIG.TOML ЕГО НЕТ";
+                                    num: "3.1"; title: "Чем играть";
+                                    hint: root.set-engine == 0 ? "ВСТРОЕННЫЙ ПЛЕЕР (LIBRESPOT)" : "SPOTIFY SOLOIST · ОФИЦИАЛЬНЫЙ ПЛЕЕР SPOTIFY, НУЖЕН PREMIUM";
+                                    Switch {
+                                        items: ["Встроенный", "Soloist"];
+                                        current <=> root.set-engine;
+                                        changed => { root.settings-changed(); }
+                                    }
+                                }
+                                if root.set-engine == 1: SettingRow {
+                                    num: "3.2"; title: "Soloist"; hint: root.soloist-status;
+                                    if root.soloist-need-key: Rectangle {
+                                        width: 240px;
+                                        height: 40px;
+                                        border-width: 1px;
+                                        border-color: key-input.has-focus ? Theme.text-2 : Theme.line-2;
+                                        key-input := TextInput {
+                                            x: 12px;
+                                            width: parent.width - 24px;
+                                            height: parent.height;
+                                            vertical-alignment: center;
+                                            single-line: true;
+                                            input-type: password;
+                                            font-family: Fonts.mono; font-size: 12px; color: Theme.text-1;
+                                            accepted => { root.soloist-key-entered(self.text); self.text = ""; }
+                                        }
+                                        if key-input.text == "": Text {
+                                            x: 12px;
+                                            height: parent.height;
+                                            vertical-alignment: center;
+                                            text: "или вставьте ключ, Enter";
+                                            font-family: Fonts.mono; font-size: 12px; color: Theme.text-3;
+                                        }
+                                    }
+                                    if root.soloist-need-key: Key { text: "ПОЛУЧИТЬ КЛЮЧ ↗"; kind: KeyKind.solid; clicked => { root.soloist-get-key(); } }
+                                    if root.soloist-can-retry: Key { text: "ПОВТОРИТЬ"; kind: KeyKind.ghost; clicked => { root.soloist-retry(); } }
+                                }
+                                if root.set-engine == 1 && root.soloist-detail != "": HorizontalLayout {
+                                    padding-left: Layout.page-x + 88px;
+                                    padding-right: Layout.page-x;
+                                    padding-top: 12px;
+                                    padding-bottom: 16px;
+                                    Text {
+                                        text: root.soloist-detail;
+                                        wrap: word-wrap;
+                                        font-size: 14px; color: Theme.text-2;
+                                    }
+                                }
+                                SettingsSection { text: "§ 04 — АККАУНТ"; }
+                                SettingRow {
+                                    num: "4.1"; title: root.username; hint: "ВХОД ЗАШИФРОВАН, В CONFIG.TOML ЕГО НЕТ";
                                     Key { text: "ВЫЙТИ →"; kind: KeyKind.danger; clicked => { root.logout(); } }
                                 }
                                 HorizontalLayout {

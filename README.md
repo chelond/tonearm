@@ -90,6 +90,22 @@ librespot выдаёт многоразовые учётные данные, о�
 
 Для проверки интерфейса без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран: `home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `menu`, `devices`, `settings`, `login`, `waiting`, `offline`.
 
+## Плеер Spotify Soloist
+
+Некоторым аккаунтам (чаще новым) Spotify не выдаёт ключи для встроенного плеера на librespot
+(librespot issue #1649), и треки не играют. Тогда включите **Настройки → Плеер → Soloist**.
+Soloist — официальный фоновый плеер Spotify; нужен Premium.
+
+1. Нажмите «Получить ключ»: откроется developer.spotify.com/dashboard/soloist. Нажмите там
+   «Copy» у своего ключа. Tonearm заберёт его из буфера обмена сам (или вставьте в поле и Enter).
+   Ключ хранится в системном хранилище паролей, в файлы не пишется.
+2. Tonearm скачивает Soloist с серверов Spotify (в архив Tonearm он не входит: распространять
+   его нельзя), запускает в фоне и входит в него вашим аккаунтом сам, через Spotify Connect.
+   Если автоматический вход не прошёл, один раз выберите устройство «Tonearm» в Spotify на телефоне.
+3. Сборки Soloist живут 90 дней; Tonearm сам скачивает новую, когда текущей больше 60 дней.
+
+Soloist закрывается вместе с Tonearm. Его журнал: `soloist/soloist.log` в папке данных Tonearm.
+
 ## Настройки
 
 Пример конфига: [config.example.toml](config.example.toml). Токены хранятся только в системном keyring
