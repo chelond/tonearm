@@ -1,0 +1,19 @@
+name = "Сакура"
+base = "dark"
+accent_from_cover = false
+
+[colors]
+bg = "#140E12"
+sidebar = "#100A0E"
+surface = "#1E151B"
+surface-2 = "#291D25"
+hover = "#FFC2E00F"
+pressed = "#FFC2E01C"
+selected = "#FFC2E016"
+line = "#FFC2E014"
+line-2 = "#FFC2E02C"
+text-1 = "#FBEFF5"
+text-2 = "#C2A9B6"
+text-3 = "#86707C"
+accent = "#FF7EB6"
+on-accent = "#1A0A12"

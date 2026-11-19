@@ -3,6 +3,7 @@
 
 mod history;
 mod os_media;
+mod themes;
 mod ui_state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -723,6 +724,22 @@ fn index_of<T: PartialEq>(values: &[T], value: &T, default: usize) -> i32 {
     i32::try_from(i).unwrap_or(0)
 }
 
+/// Opens the themes folder (made on first use, with a short readme) in the file manager.
+fn open_themes_folder() {
+    let Some(dir) = themes::dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let readme = dir.join("README.txt");
+        if !readme.exists() {
+            let _ = std::fs::write(&readme, themes::README);
+        }
+    }
+    if let Err(e) = open::that_detached(&dir) {
+        tracing::warn!(error = %e, "cannot open the themes folder");
+    }
+}
+
 /// Settings → the settings page.
 fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_bitrate(index_of(&BITRATES, &s.audio.bitrate, 2));
@@ -747,6 +764,7 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.audio.gapless = w.get_set_gapless() != 0;
     s.audio.device = w.get_set_device().to_string();
     s.ui.notifications = w.get_set_notifications() != 0;
+    s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
     s
@@ -804,6 +822,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window = AppWindow::new()?;
     ui_state::init(&window);
     show_settings(&window, &settings);
+    // TONEARM_THEME=<id> overrides the saved theme (screenshots of every theme).
+    let theme = std::env::var("TONEARM_THEME").unwrap_or_else(|_| settings.ui.theme.clone());
+    ui_state::with(|st| st.load_themes(&window, &theme));
     window.set_version(env!("CARGO_PKG_VERSION").into());
     window.set_date_label(date_label().into());
     window.set_greeting(greeting().into());
@@ -852,6 +873,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     window.on_soloist_retry(move || s.local(PlayerCommand::SoloistRetry));
     let s = senders.clone();
     window.on_settings_changed(move || s.settings_changed());
+    let s = senders.clone();
+    window.on_theme_picked(move |id| {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.pick_theme(&w, &id));
+            s.settings_changed();
+        }
+    });
+    let s = senders.clone();
+    window.on_theme_new(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.new_theme(&w));
+            s.settings_changed();
+            open_themes_folder();
+        }
+    });
+    let s = senders.clone();
+    window.on_theme_reload(move || {
+        if let Some(w) = s.window.upgrade() {
+            let id = w.get_theme_id().to_string();
+            ui_state::with(|st| st.load_themes(&w, &id));
+        }
+    });
+    window.on_theme_open_folder(open_themes_folder);
     let s = senders.clone();
     window.on_clear_cache(move || {
         let covers = Arc::clone(&s.covers);
@@ -1144,6 +1188,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let ms = (f64::from(ratio.clamp(0.0, 1.0)) * f64::from(w.get_duration_ms())) as u32;
             s.player(PlayerCommand::Seek { position_ms: ms });
+            w.set_position_ms(i32::try_from(ms).unwrap_or(0));
         }
     });
     let s = senders.clone();
@@ -1173,6 +1218,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let next = (w.get_position_ms() + 1000).min(w.get_duration_ms());
                     w.set_position_ms(next);
                 }
+                ui_state::with(|st| st.watch_theme(&w));
                 let fx = ui_state::with(|st| st.tick(&w, playing));
                 tick_senders.run(fx);
             }

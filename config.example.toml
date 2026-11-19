@@ -22,3 +22,4 @@ max_size_mb = 512      # covers; the settings page offers 128 | 256 | 512 | 1024
 
 [ui]
 notifications = true   # notify on track change while the window is in the background
+theme = "graphite"     # graphite, midnight, oled, forest, sakura, synthwave, light, sand, or "file:<name>.toml"

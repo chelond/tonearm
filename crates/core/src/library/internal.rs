@@ -211,7 +211,7 @@ pub async fn fallback_cover(session: &Session, playlist_uri: &str) -> Option<Str
 pub async fn mosaic_for(session: &Session, uris: &[String]) -> Option<String> {
     let ids: Vec<SpotifyUri> = uris
         .iter()
-        .take(16)
+        .take(12)
         .filter_map(|u| SpotifyUri::from_uri(u).ok())
         .collect();
     let tracks = futures_util::future::join_all(ids.iter().map(|id| Track::get(session, id))).await;

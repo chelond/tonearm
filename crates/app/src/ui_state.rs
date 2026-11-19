@@ -16,9 +16,10 @@ use tonearm_core::library::{
 use tonearm_player::{PlaybackState, PlayerCommand, QueueItem, QueueSnapshot, TrackInfo};
 
 use crate::history::{self, Context, Entry, QueuedTrack, Resume, Store};
+use crate::themes;
 use crate::{
     AppWindow, LyricRow, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState, StatRow, Theme,
-    TileData, TrackData,
+    ThemeCard, TileData, TrackData,
 };
 
 /// Requests from the UI state to the async side (covers, playback, navigation).
@@ -124,6 +125,17 @@ pub struct UiState {
     lyrics: Vec<LyricLine>,
     lyrics_uri: String,
     lyrics_index: Option<usize>,
+    /// The player reported the track only partly; its details are on the way.
+    meta_pending: bool,
+    /// The theme's accent when it does not follow the cover.
+    theme_accent: Option<Color>,
+    theme_light: bool,
+    /// Colour picked from the playing cover, kept for theme switches.
+    cover_rgb: Option<[u8; 3]>,
+    themes: Option<themes::Catalog>,
+    /// When the active theme file last changed (custom themes reload on edit).
+    theme_mtime: Option<std::time::SystemTime>,
+    theme_check: u32,
     palette: Vec<PaletteAction>,
     /// Seconds since the resume state was last written.
     since_save: u32,
@@ -241,9 +253,8 @@ pub fn backdrop(cover: &Cover) -> Image {
     Image::from_rgba8(out)
 }
 
-fn accent_color(cover: &Cover) -> Color {
-    let [r, g, b] = cover.accent;
-    Color::from_rgb_u8(r, g, b)
+fn rgba(c: themes::Rgba) -> Color {
+    Color::from_argb_u8(c[3], c[0], c[1], c[2])
 }
 
 fn kind_code(kind: CollectionKind) -> i32 {
@@ -689,7 +700,7 @@ impl UiState {
                 }
             })
             .collect();
-        self.playlist_rows.set_vec(rows);
+        update_rows(&self.playlist_rows, rows);
         self.playlists = lists;
         fx
     }
@@ -811,13 +822,8 @@ impl UiState {
                 );
                 w.set_notice_is_error(false);
             }
-            LibraryEvent::TrackCover { uri, url } if uri == self.playing_uri => {
-                self.playing.cover_url = Some(url.clone());
-                fx.push(Effect::Cover {
-                    url,
-                    size: 320,
-                    target: CoverTarget::Deck(uri),
-                });
+            LibraryEvent::TrackMeta(item) if item.uri == self.playing_uri => {
+                fx.extend(self.on_track_meta(w, &item));
             }
             LibraryEvent::Radio { title, tracks } => {
                 w.set_notice(format!("Радио по «{title}»").into());
@@ -921,7 +927,7 @@ impl UiState {
                 tile_data(t)
             })
             .collect();
-        self.home_rows.set_vec(rows);
+        update_rows(&self.home_rows, rows);
         self.home = tiles;
         fx
     }
@@ -997,6 +1003,114 @@ impl UiState {
             .unwrap_or_default()
     }
 
+    /// A cover colour made to read on the theme: covers give light tints, light themes need
+    /// darker ones.
+    fn tint(&self, [r, g, b]: [u8; 3]) -> Color {
+        let c = Color::from_rgb_u8(r, g, b);
+        if self.theme_light { c.darker(0.45) } else { c }
+    }
+
+    /// Reads the built-in and user themes, lists them and applies `id`.
+    pub fn load_themes(&mut self, w: &AppWindow, id: &str) {
+        let catalog = themes::Catalog::load(themes::dir().as_deref());
+        let cards: Vec<ThemeCard> = catalog
+            .themes
+            .iter()
+            .map(|t| ThemeCard {
+                id: t.id.clone().into(),
+                name: t.name.clone().into(),
+                bg: rgba(t.colors.get("bg")),
+                surface: rgba(t.colors.get("surface-2")),
+                text: rgba(t.colors.get("text-1")),
+                muted: rgba(t.colors.get("text-3")),
+                accent: rgba(t.colors.get("accent")),
+                custom: t.is_custom(),
+            })
+            .collect();
+        w.set_themes(ModelRc::from(Rc::new(VecModel::from(cards))));
+        w.set_theme_errors(catalog.errors.join("; ").into());
+        let theme = catalog.get(id).clone();
+        w.set_theme_id(theme.id.clone().into());
+        self.theme_mtime = themes::modified(&theme.id);
+        self.apply_theme(w, &theme);
+        self.themes = Some(catalog);
+    }
+
+    /// A theme was picked on the settings page.
+    pub fn pick_theme(&mut self, w: &AppWindow, id: &str) {
+        let Some(theme) = self.themes.as_ref().map(|c| c.get(id).clone()) else {
+            return;
+        };
+        w.set_theme_id(theme.id.clone().into());
+        self.theme_mtime = themes::modified(&theme.id);
+        self.apply_theme(w, &theme);
+    }
+
+    /// "Создать из текущей": a copy in the themes folder, picked right away.
+    pub fn new_theme(&mut self, w: &AppWindow) {
+        let id = w.get_theme_id().to_string();
+        let Some(current) = self.themes.as_ref().map(|c| c.get(&id).clone()) else {
+            return;
+        };
+        match themes::save_copy(&current) {
+            Ok(new_id) => {
+                self.load_themes(w, &new_id);
+                w.set_notice("Тема сохранена в папке тем: откройте файл и меняйте цвета".into());
+                w.set_notice_is_error(false);
+            }
+            Err(e) => {
+                w.set_notice(format!("Не удалось создать тему: {e}").into());
+                w.set_notice_is_error(true);
+            }
+        }
+    }
+
+    /// Called every second: re-reads the active custom theme when its file changed.
+    pub fn watch_theme(&mut self, w: &AppWindow) {
+        self.theme_check += 1;
+        if self.theme_check < 2 {
+            return;
+        }
+        self.theme_check = 0;
+        let id = w.get_theme_id().to_string();
+        if !id.starts_with("file:") {
+            return;
+        }
+        let now = themes::modified(&id);
+        if now != self.theme_mtime {
+            self.load_themes(w, &id);
+        }
+    }
+
+    /// Puts the theme's colours on the window.
+    pub fn apply_theme(&mut self, w: &AppWindow, t: &themes::ThemeDef) {
+        let th = Theme::get(w);
+        let c = |k: &str| rgba(t.colors.get(k));
+        th.set_bg(c("bg"));
+        th.set_sidebar(c("sidebar"));
+        th.set_surface(c("surface"));
+        th.set_surface_2(c("surface-2"));
+        th.set_hover(c("hover"));
+        th.set_pressed(c("pressed"));
+        th.set_selected(c("selected"));
+        th.set_line(c("line"));
+        th.set_line_2(c("line-2"));
+        th.set_text_1(c("text-1"));
+        th.set_text_2(c("text-2"));
+        th.set_text_3(c("text-3"));
+        th.set_danger(c("danger"));
+        th.set_on_accent(c("on-accent"));
+        th.set_light(t.light);
+        self.theme_light = t.light;
+        self.theme_accent = (!t.accent_from_cover).then(|| c("accent"));
+        let accent = match (self.theme_accent, self.cover_rgb) {
+            (Some(fixed), _) => fixed,
+            (None, Some(rgb)) => self.tint(rgb),
+            (None, None) => c("accent"),
+        };
+        th.set_accent(accent);
+    }
+
     pub fn on_cover(&mut self, w: &AppWindow, target: &CoverTarget, cover: &Cover) {
         let set_tiles = |model: &VecModel<TileData>, uri: &str| {
             for i in 0..model.row_count_() {
@@ -1037,7 +1151,7 @@ impl UiState {
             CoverTarget::Page(id) if *id == self.page_id => {
                 w.set_page_image(to_image(cover));
                 w.set_page_has_image(true);
-                Theme::get(w).set_page_accent(accent_color(cover));
+                Theme::get(w).set_page_accent(self.tint(cover.accent));
             }
             CoverTarget::Search(uri) => {
                 for model in [
@@ -1086,36 +1200,80 @@ impl UiState {
                 w.set_track_image(to_image(cover));
                 w.set_track_backdrop(backdrop(cover));
                 w.set_track_has_image(true);
-                Theme::get(w).set_accent(accent_color(cover));
+                self.cover_rgb = Some(cover.accent);
+                if self.theme_accent.is_none() {
+                    Theme::get(w).set_accent(self.tint(cover.accent));
+                }
             }
             _ => {}
         }
     }
 
-    /// Cover of a track: what the player reported, else what a list we showed knows.
-    fn known_cover(&self, track: &TrackInfo) -> Option<String> {
-        track
-            .cover_url
-            .clone()
-            .or_else(|| {
-                self.tracks
-                    .iter()
-                    .chain(&self.search.results.tracks)
-                    .find(|t| t.uri == track.uri)
-                    .and_then(|t| t.image_url.clone())
-            })
-            .or_else(|| {
-                self.store
-                    .entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.uri == track.uri)
-                    .and_then(|e| e.image_url.clone())
-            })
+    /// Fills what the player left out (Soloist often reports only the title) from the lists
+    /// we showed, the queue and the history.
+    fn fill_known(&self, track: &mut TrackInfo) {
+        if let Some(t) = self
+            .tracks
+            .iter()
+            .chain(&self.search.results.tracks)
+            .find(|t| t.uri == track.uri)
+        {
+            merge_track(track, t);
+            return;
+        }
+        if let Some(q) = self.context_items.iter().find(|q| q.uri == track.uri) {
+            fill(&mut track.title, &q.title);
+            fill(&mut track.artists, &q.artists);
+            if track.duration_ms == 0 {
+                track.duration_ms = q.duration_ms;
+            }
+        }
+        if let Some(e) = self.store.entries.iter().rev().find(|e| e.uri == track.uri) {
+            fill(&mut track.title, &e.title);
+            fill(&mut track.artists, &e.artists);
+            fill(&mut track.album, &e.album);
+            if track.duration_ms == 0 {
+                track.duration_ms = e.duration_ms;
+            }
+            if track.cover_url.is_none() {
+                track.cover_url.clone_from(&e.image_url);
+            }
+        }
+    }
+
+    /// Details of the playing track arrived from the metadata service.
+    fn on_track_meta(&mut self, w: &AppWindow, item: &TrackItem) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        self.meta_pending = false;
+        let had_cover = self.playing.cover_url.is_some();
+        merge_track(&mut self.playing, item);
+        let t = &self.playing;
+        w.set_track_title(t.title.clone().into());
+        w.set_track_artists(t.artists.clone().into());
+        w.set_duration_ms(i32::try_from(t.duration_ms).unwrap_or(i32::MAX));
+        if self.context.title.is_empty() {
+            w.set_track_context(t.album.clone().into());
+        }
+        if !had_cover && let Some(u) = t.cover_url.clone() {
+            fx.push(Effect::Cover {
+                url: u,
+                size: 320,
+                target: CoverTarget::Deck(t.uri.clone()),
+            });
+        }
+        if w.get_lyrics_open() {
+            fx.extend(self.lyrics_opened(w));
+        }
+        fx
     }
 
     pub fn on_track(&mut self, w: &AppWindow, track: &TrackInfo) -> Vec<Effect> {
         let mut fx = self.finish_listen(w);
+        let mut track = track.clone();
+        self.fill_known(&mut track);
+        let track = &track;
+        self.meta_pending = track.uri.starts_with("spotify:track:")
+            && (track.duration_ms == 0 || track.artists.is_empty() || track.cover_url.is_none());
         let previous = std::mem::replace(&mut self.playing_uri, track.uri.clone());
         self.playing = track.clone();
         self.listened_ms = 0;
@@ -1152,20 +1310,17 @@ impl UiState {
             .into(),
         );
         w.set_track_has_image(false);
-        let cover = self.known_cover(track);
-        self.playing.cover_url.clone_from(&cover);
-        match cover {
-            Some(u) => fx.push(Effect::Cover {
+        if let Some(u) = track.cover_url.clone() {
+            fx.push(Effect::Cover {
                 url: u,
                 size: 320,
                 target: CoverTarget::Deck(track.uri.clone()),
-            }),
-            None if track.uri.starts_with("spotify:track:") => {
-                fx.push(Effect::Library(LibraryCommand::TrackCover(
-                    track.uri.clone(),
-                )));
-            }
-            None => {}
+            });
+        }
+        if self.meta_pending {
+            fx.push(Effect::Library(LibraryCommand::TrackMeta(
+                track.uri.clone(),
+            )));
         }
         // Lyrics: reload for the new track if the panel is open, otherwise when it opens.
         self.lyrics.clear();
@@ -1250,6 +1405,10 @@ impl UiState {
             return Vec::new();
         }
         w.set_lyrics_status("Загружаем текст…".into());
+        if self.meta_pending {
+            // Asked again once the artist and length are known: LRCLIB matches on them.
+            return Vec::new();
+        }
         w.set_lyrics_provider("".into());
         vec![Effect::Library(LibraryCommand::Lyrics {
             uri: self.playing.uri.clone(),
@@ -1949,6 +2108,40 @@ impl<T: Clone + 'static> VecModelExt<T> for VecModel<T> {
     }
     fn set_row(&self, i: usize, v: T) {
         slint::Model::set_row_data(self, i, v);
+    }
+}
+
+/// Replaces a list's rows, touching only the ones that changed when the length is the same:
+/// a reset would re-create every tile and replay its entrance animation.
+fn update_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    use slint::Model as _;
+    if model.row_count() != rows.len() {
+        model.set_vec(rows);
+        return;
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if model.row_data(i).as_ref() != Some(&row) {
+            model.set_row_data(i, row);
+        }
+    }
+}
+
+fn fill(field: &mut String, value: &str) {
+    if field.is_empty() && !value.is_empty() {
+        value.clone_into(field);
+    }
+}
+
+/// Copies the fields the player left empty from a fuller track.
+fn merge_track(track: &mut TrackInfo, from: &TrackItem) {
+    fill(&mut track.title, &from.title);
+    fill(&mut track.artists, &from.artists);
+    fill(&mut track.album, &from.album);
+    if track.duration_ms == 0 {
+        track.duration_ms = from.duration_ms;
+    }
+    if track.cover_url.is_none() {
+        track.cover_url.clone_from(&from.image_url);
     }
 }
 

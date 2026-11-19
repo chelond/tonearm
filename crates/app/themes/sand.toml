@@ -1,0 +1,19 @@
+name = "Песок"
+base = "light"
+accent_from_cover = false
+
+[colors]
+bg = "#F4EEE3"
+sidebar = "#EAE2D3"
+surface = "#FBF7F0"
+surface-2 = "#FFFDF8"
+hover = "#5A3E1B0D"
+pressed = "#5A3E1B1A"
+selected = "#5A3E1B14"
+line = "#5A3E1B17"
+line-2 = "#5A3E1B2E"
+text-1 = "#2B2116"
+text-2 = "#6B5B48"
+text-3 = "#9C8C78"
+accent = "#C0612B"
+on-accent = "#FFFFFF"
