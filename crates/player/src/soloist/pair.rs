@@ -234,7 +234,7 @@ fn credentials_blob(username: &str, auth_type: u32, auth_data: &[u8], device_id:
     }
     let key = blob_key(device_id, username);
     let cipher = aes::Aes192::new(GenericArray::from_slice(&key));
-    for chunk in plain.chunks_exact_mut(16) {
+    for chunk in plain.as_chunks_mut::<16>().0 {
         cipher.encrypt_block(GenericArray::from_mut_slice(chunk));
     }
     BASE64.encode(plain)
