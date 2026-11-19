@@ -2,6 +2,7 @@
 **/*.rs.bk
 # Local config and secrets: never commit
 config.toml
+!/.cargo/config.toml
 *.local.toml
 .env
 *.token

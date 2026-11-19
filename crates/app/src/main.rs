@@ -29,7 +29,72 @@ fn init_logging() {
             filter = filter.add_directive(d);
         }
     }
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Also log to a file: a Windows release build has no console, so this is the only trace.
+    let file = log_path().and_then(|p| {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).ok()?;
+        }
+        std::fs::File::create(p).ok()
+    });
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match file {
+        Some(f) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            builder
+                .with_ansi(false)
+                .with_writer(std::io::stderr.and(Mutex::new(f)))
+                .init();
+        }
+        None => builder.init(),
+    }
+}
+
+/// `tonearm.log` in the local data dir (`%LOCALAPPDATA%\tonearm\data` on Windows).
+fn log_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "tonearm")
+        .map(|d| d.data_local_dir().join("tonearm.log"))
+}
+
+/// Logs a fatal error and, on Windows (no console), shows it in a message box.
+fn report_fatal(message: &str) {
+    tracing::error!("{message}");
+    let log = log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let text = format!("Tonearm не смог запуститься.\n\n{message}\n\nЛог: {log}");
+    eprintln!("{text}");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        let wide = |s: &str| {
+            s.encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let (body, title) = (wide(&text), wide("Tonearm"));
+        // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call.
+        #[allow(unsafe_code)]
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let bt = std::backtrace::Backtrace::force_capture();
+        tracing::error!("panic: {info}\n{bt}");
+        if std::thread::current().name() == Some("main") {
+            report_fatal(&format!("Внутренняя ошибка: {info}"));
+        }
+    }));
 }
 
 /// Senders for everything the UI can ask for.
@@ -488,10 +553,25 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s
 }
 
-#[allow(clippy::too_many_lines)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     init_logging();
+    install_panic_hook();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        os = std::env::consts::OS,
+        "starting"
+    );
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            report_fatal(&e.to_string());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+#[allow(clippy::too_many_lines)]
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Prefer the lightweight software renderer unless the user overrides it via SLINT_BACKEND.
     if std::env::var_os("SLINT_BACKEND").is_none() {
         slint::BackendSelector::new()
@@ -826,28 +906,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Media keys / MPRIS / SMTC, once the event loop runs and the window has a native handle.
     let weak = window.as_weak();
     let media_senders = senders.clone();
-    slint::Timer::single_shot(Duration::ZERO, move || {
-        let Some(w) = weak.upgrade() else { return };
-        let ui_weak = weak.clone();
-        let s = media_senders.clone();
-        os_media::init(
-            &w,
-            move |cmd| s.player(cmd),
-            move |req| {
-                let ui_weak = ui_weak.clone();
-                let _ = slint::invoke_from_event_loop(move || match req {
-                    os_media::UiRequest::Raise => {
-                        if let Some(w) = ui_weak.upgrade() {
-                            raise(&w);
+    // winit creates the native window lazily, so retry until it has a handle (gives up after ~10 s).
+    let media_timer = std::rc::Rc::new(slint::Timer::default());
+    let attempts = std::cell::Cell::new(0u32);
+    let timer_weak = std::rc::Rc::downgrade(&media_timer);
+    media_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(100),
+        move || {
+            let stop = || {
+                if let Some(t) = timer_weak.upgrade() {
+                    t.stop();
+                }
+            };
+            let Some(w) = weak.upgrade() else {
+                return stop();
+            };
+            attempts.set(attempts.get() + 1);
+            let ui_weak = weak.clone();
+            let s = media_senders.clone();
+            let done = os_media::init(
+                &w,
+                move |cmd| s.player(cmd),
+                move |req| {
+                    let ui_weak = ui_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || match req {
+                        os_media::UiRequest::Raise => {
+                            if let Some(w) = ui_weak.upgrade() {
+                                raise(&w);
+                            }
                         }
-                    }
-                    os_media::UiRequest::Quit => {
-                        let _ = slint::quit_event_loop();
-                    }
-                });
-            },
-        );
-    });
+                        os_media::UiRequest::Quit => {
+                            let _ = slint::quit_event_loop();
+                        }
+                    });
+                },
+            );
+            if done {
+                stop();
+            } else if attempts.get() >= 100 {
+                tracing::warn!("media controls: no native window handle, giving up");
+                stop();
+            }
+        },
+    );
 
     window.run()?;
 
