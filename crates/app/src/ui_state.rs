@@ -823,7 +823,7 @@ impl UiState {
                 w.set_notice_is_error(false);
             }
             LibraryEvent::TrackMeta(item) if item.uri == self.playing_uri => {
-                fx.extend(self.on_track_meta(w, &item));
+                fx.extend(self.on_track_meta(w, &item, false));
             }
             LibraryEvent::Radio { title, tracks } => {
                 w.set_notice(format!("Радио по «{title}»").into());
@@ -1242,9 +1242,15 @@ impl UiState {
     }
 
     /// Details of the playing track arrived from the metadata service.
-    fn on_track_meta(&mut self, w: &AppWindow, item: &TrackItem) -> Vec<Effect> {
+    /// `still_pending`: a fuller report is expected (lyrics wait for it unless the track is
+    /// complete now).
+    fn on_track_meta(
+        &mut self,
+        w: &AppWindow,
+        item: &TrackItem,
+        still_pending: bool,
+    ) -> Vec<Effect> {
         let mut fx = Vec::new();
-        self.meta_pending = false;
         let had_cover = self.playing.cover_url.is_some();
         merge_track(&mut self.playing, item);
         let t = &self.playing;
@@ -1261,6 +1267,9 @@ impl UiState {
                 target: CoverTarget::Deck(t.uri.clone()),
             });
         }
+        let t = &self.playing;
+        let complete = t.duration_ms > 0 && !t.artists.is_empty() && t.cover_url.is_some();
+        self.meta_pending = still_pending && !complete;
         if w.get_lyrics_open() {
             fx.extend(self.lyrics_opened(w));
         }
@@ -1268,6 +1277,23 @@ impl UiState {
     }
 
     pub fn on_track(&mut self, w: &AppWindow, track: &TrackInfo) -> Vec<Effect> {
+        // The same track again with more details (Soloist fills them in later): merge, keep
+        // the listening time and the lyrics.
+        if !track.uri.is_empty() && track.uri == self.playing_uri {
+            let item = TrackItem {
+                uri: track.uri.clone(),
+                title: track.title.clone(),
+                artists: track.artists.clone(),
+                album: track.album.clone(),
+                duration_ms: track.duration_ms,
+                image_url: track.cover_url.clone(),
+                ..TrackItem::default()
+            };
+            // A metadata request may still be on its way; it is harmless when it lands.
+            let pending = self.meta_pending;
+            let fx = self.on_track_meta(w, &item, pending);
+            return fx;
+        }
         let mut fx = self.finish_listen(w);
         let mut track = track.clone();
         self.fill_known(&mut track);
