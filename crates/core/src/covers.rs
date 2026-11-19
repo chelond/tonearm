@@ -256,7 +256,7 @@ fn decode(url: &str, bytes: &[u8], size: u32) -> Result<Cover, CoverError> {
 #[must_use]
 pub fn accent(rgba: &[u8]) -> [u8; 3] {
     let (mut r, mut g, mut b, mut wsum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for px in rgba.chunks_exact(4).step_by(3) {
+    for px in rgba.as_chunks::<4>().0.iter().step_by(3) {
         let (pr, pg, pb) = (f32::from(px[0]), f32::from(px[1]), f32::from(px[2]));
         let max = pr.max(pg).max(pb);
         let min = pr.min(pg).min(pb);
