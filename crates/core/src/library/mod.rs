@@ -108,12 +108,19 @@ impl SessionHttp {
 
 impl SessionHttp {
     async fn execute(&self, req: reqwest::RequestBuilder) -> Result<HttpResponse, ApiError> {
-        let token = self
-            .session
-            .token_provider()
-            .get_token(SCOPES)
-            .await
-            .map_err(|e| ApiError::Network(format!("токен: {e}")))?;
+        // login5 first: Spotify retired the Mercury keymaster endpoint (it answers
+        // "Service unavailable"). Keymaster stays as a fallback for older accounts/servers.
+        let token = match self.session.login5().auth_token().await {
+            Ok(t) => t,
+            Err(login5_err) => {
+                tracing::warn!(error = %login5_err, "login5 token failed, trying keymaster");
+                self.session
+                    .token_provider()
+                    .get_token(SCOPES)
+                    .await
+                    .map_err(|e| ApiError::Network(format!("токен: {login5_err}; {e}")))?
+            }
+        };
         let resp = req
             .bearer_auth(&token.access_token)
             .send()
