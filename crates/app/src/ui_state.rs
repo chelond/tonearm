@@ -40,8 +40,10 @@ pub enum Effect {
         saved: bool,
     },
     Library(LibraryCommand),
-    /// Write the history / resume file (off the UI thread).
+    /// Write the history and resume files (off the UI thread).
     Save(Box<Store>),
+    /// Write only the resume point (cheap; every few seconds while playing).
+    SaveResume(Box<Resume>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -500,7 +502,7 @@ impl UiState {
         self.start_context(&shown, None, &name, Some(shuffle), ctx)
     }
 
-    fn mark_context(&self, w: &AppWindow) {
+    pub fn mark_context(&self, w: &AppWindow) {
         w.set_context_uri(self.context.uri.clone().into());
     }
 
@@ -613,6 +615,7 @@ impl UiState {
             };
             self.mark_context(w);
         }
+        self.mark_context(w);
         self.context_name.clone_from(&q.context_name);
         self.queue = q.clone();
     }
@@ -1211,7 +1214,10 @@ impl UiState {
             self.since_save += 1;
             if self.since_save >= 15 {
                 let pos = u32::try_from(w.get_position_ms()).unwrap_or(0);
-                fx.push(self.save_resume(pos));
+                drop(self.save_resume(pos));
+                if let Some(r) = &self.store.resume {
+                    fx.push(Effect::SaveResume(Box::new(r.clone())));
+                }
             }
         }
         self.update_lyrics_line(w);

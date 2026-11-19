@@ -86,9 +86,34 @@ pub struct Stats {
     pub top_artists: Vec<(String, Option<String>, usize, u64)>,
 }
 
-fn path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "tonearm").map(|d| d.data_dir().join("history.json"))
+fn path(name: &str) -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "tonearm").map(|d| d.data_dir().join(name))
 }
+
+/// Writes atomically (temp file + rename) so a crash never leaves half a file.
+fn write_json<T: Serialize>(name: &str, value: &T) {
+    let Some(p) = path(name) else {
+        return;
+    };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(data) = serde_json::to_vec(value) else {
+        return;
+    };
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    let bytes = std::fs::read(path(name)?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+const HISTORY_FILE: &str = "history.json";
+const RESUME_FILE: &str = "resume.json";
 
 #[must_use]
 pub fn now() -> u64 {
@@ -100,32 +125,17 @@ pub fn now() -> u64 {
 impl Store {
     #[must_use]
     pub fn load() -> Self {
-        let Some(p) = path() else {
-            return Self::default();
-        };
-        std::fs::read(&p)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        Self {
+            entries: read_json(HISTORY_FILE).unwrap_or_default(),
+            resume: read_json(RESUME_FILE),
+        }
     }
 
-    /// Writes atomically (temp file + rename) so a crash never leaves half a file.
+    /// The history (written when a track ends) and the resume point.
     pub fn save(&self) {
-        let Some(p) = path() else {
-            return;
-        };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let Ok(data) = serde_json::to_vec(self) else {
-            return;
-        };
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, data).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
-        }
+        write_json(HISTORY_FILE, &self.entries);
+        save_resume(self.resume.as_ref());
     }
-
     pub fn add(&mut self, e: Entry) {
         self.entries.push(e);
         if self.entries.len() > MAX_ENTRIES {
@@ -213,6 +223,13 @@ impl Store {
             top_tracks,
             top_artists,
         }
+    }
+}
+
+/// Only the small resume file (written every few seconds while playing).
+pub fn save_resume(resume: Option<&Resume>) {
+    if let Some(r) = resume {
+        write_json(RESUME_FILE, r);
     }
 }
 
