@@ -2,22 +2,28 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod history;
+mod mini;
 mod os_media;
+mod smart;
 mod themes;
 mod ui_state;
 mod updater;
+mod wrapped;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use slint::Model;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
-use tonearm_core::config::{BITRATES, CACHE_SIZES_MB, Settings};
+use tonearm_core::config::{BITRATES, CACHE_SIZES_MB, FADE_SECS, Settings};
 use tonearm_core::connect::{ConnectCommand, ConnectEvent, RemoteAction};
 use tonearm_core::covers::CoverCache;
+use tonearm_core::lastfm::{LastFmCommand, LastFmEvent};
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
+use tonearm_player::effects::{self, EffectsOptions};
 use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
 use ui_state::{CoverTarget, Effect, UiState};
 
@@ -25,6 +31,8 @@ slint::include_modules!();
 
 /// How long an informational notice stays up.
 const NOTICE_SECS: u32 = 5;
+/// The library is fetched again on coming back to the window, at most this often.
+const LIBRARY_REFRESH: Duration = Duration::from_secs(300);
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
@@ -121,6 +129,7 @@ fn soloist_config(api_key: String) -> Option<SoloistConfig> {
         root,
         cache_dir,
         device_name: tonearm_player::soloist::DEVICE_NAME.into(),
+        pipewire_device: None,
     })
 }
 
@@ -171,6 +180,7 @@ struct Senders {
     player: mpsc::Sender<PlayerCommand>,
     library: mpsc::Sender<LibraryCommand>,
     connect: mpsc::Sender<ConnectCommand>,
+    lastfm: mpsc::Sender<LastFmCommand>,
     /// Spotify Connect: id of the remote device that plays now (`None` = this computer).
     remote: Arc<Mutex<Option<String>>>,
     remote_playing: Arc<AtomicBool>,
@@ -203,12 +213,20 @@ impl Senders {
         if new.audio != current.audio {
             self.local(PlayerCommand::Configure(audio_options(&new)));
         }
+        if new.effects != current.effects {
+            self.local(PlayerCommand::Effects(effects_options(&new)));
+        }
         if new.player != current.player {
             if new.player.soloist {
                 self.start_soloist();
             } else {
                 self.local(PlayerCommand::Soloist(None));
             }
+        }
+        if new.lastfm.scrobble != current.lastfm.scrobble {
+            self.lastfm_cmd(LastFmCommand::SetEnabled(new.lastfm.scrobble));
+            let on = new.lastfm.scrobble && w.get_lastfm_state() == 3;
+            ui_state::with(|st| st.lastfm_on = on);
         }
         if new.cache != current.cache {
             let covers = Arc::clone(&self.covers);
@@ -328,11 +346,16 @@ impl Senders {
                         ConnectCommand::Control(RemoteAction::Seek(position_ms))
                     }
                     PlayerCommand::SetVolume(p) => ConnectCommand::Control(RemoteAction::Volume(p)),
-                    PlayerCommand::PlayContext { items, start, .. } => ConnectCommand::PlayOn {
+                    PlayerCommand::PlayContext {
+                        items,
+                        start,
+                        position_ms,
+                        ..
+                    } => ConnectCommand::PlayOn {
                         device_id,
                         uris: items.into_iter().map(|i| i.uri).collect(),
                         offset: start,
-                        position_ms: 0,
+                        position_ms,
                     },
                     PlayerCommand::Load(uri) => ConnectCommand::PlayOn {
                         device_id,
@@ -352,6 +375,12 @@ impl Senders {
     fn local(&self, cmd: PlayerCommand) {
         if self.player.try_send(cmd).is_err() {
             tracing::debug!("player busy, command dropped");
+        }
+    }
+
+    fn lastfm_cmd(&self, cmd: LastFmCommand) {
+        if self.lastfm.try_send(cmd).is_err() {
+            tracing::debug!("last.fm busy, command dropped");
         }
     }
 
@@ -415,6 +444,91 @@ impl Senders {
                         self.rt
                             .spawn_blocking(move || history::save_resume(Some(&r)));
                     }
+                }
+                Effect::LogPlay(e) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt.spawn_blocking(move || {
+                            if let Some(log) = history::PlayLog::open()
+                                && let Err(err) = log.append(&e)
+                            {
+                                tracing::warn!(error = %err, "cannot write the play log");
+                            }
+                        });
+                    }
+                }
+                Effect::SaveRules(rules) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt.spawn_blocking(move || smart::save(&rules));
+                    }
+                }
+                Effect::LastFm(cmd) => self.lastfm_cmd(cmd),
+                Effect::Smart {
+                    token,
+                    rule,
+                    liked,
+                    plays,
+                } => {
+                    let s = self.clone();
+                    self.rt.spawn_blocking(move || {
+                        let plays = plays.unwrap_or_else(|| {
+                            history::PlayLog::open().map_or_else(Vec::new, |l| l.read_all())
+                        });
+                        let tracks = smart::evaluate(&rule, &liked, &plays, history::now());
+                        drop(plays);
+                        let weak = s.window.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                let fx = ui_state::with(|st| st.on_smart(&w, token, tracks));
+                                s.run(fx);
+                            }
+                        });
+                    });
+                }
+                Effect::Wrapped { year, plays } => {
+                    let s = self.clone();
+                    self.rt.spawn_blocking(move || {
+                        let (years, entries) = match plays {
+                            Some(all) => {
+                                let mut years: Vec<i32> =
+                                    all.iter().map(|e| history::year_of(e.at)).collect();
+                                years.sort_unstable_by(|a, b| b.cmp(a));
+                                years.dedup();
+                                (years, all)
+                            }
+                            None => {
+                                let log = history::PlayLog::open();
+                                let years = log.as_ref().map(history::PlayLog::years);
+                                let years = years.unwrap_or_default();
+                                let pick = if year == 0 {
+                                    years.first().copied()
+                                } else {
+                                    Some(year)
+                                };
+                                let entries = match (&log, pick) {
+                                    (Some(l), Some(y)) => l.read_year(y),
+                                    _ => Vec::new(),
+                                };
+                                (years, entries)
+                            }
+                        };
+                        let year = if year == 0 {
+                            years
+                                .first()
+                                .copied()
+                                .unwrap_or_else(|| history::year_of(history::now()))
+                        } else {
+                            year
+                        };
+                        let summary = wrapped::summary(&entries, year);
+                        drop(entries);
+                        let weak = s.window.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                let fx = ui_state::with(|st| st.on_wrapped(&w, &summary, &years));
+                                s.run(fx);
+                            }
+                        });
+                    });
                 }
             }
         }
@@ -552,6 +666,11 @@ fn apply_auth(w: &AppWindow, s: &Senders, event: Event) {
 }
 
 fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
+    apply_player_event(w, s, event);
+    mini::sync(w);
+}
+
+fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
     // While a Connect device plays, the deck shows that device, not the paused local player.
     let remote = s.remote.lock().ok().is_some_and(|r| r.is_some());
     if remote && matches!(event, PlayerEvent::State { .. } | PlayerEvent::Track(_)) {
@@ -563,6 +682,7 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             w.set_play_view(ui_state::play_view(state));
             w.set_position_ms(i32::try_from(position_ms).unwrap_or(i32::MAX));
             ui_state::with(|st| st.position_changed(w));
+            lyrics_kick(w);
         }
         PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
         PlayerEvent::Track(track) => {
@@ -572,7 +692,7 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
         }
         PlayerEvent::Volume(percent) => {
             os_media::on_volume(percent);
-            w.set_volume_level((i32::from(percent) * 12 + 50) / 100);
+            w.set_volume_level(i32::from(percent));
         }
         PlayerEvent::Error(text) => {
             w.set_notice(text.into());
@@ -586,6 +706,19 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             );
             w.set_notice_is_error(true);
         }
+        PlayerEvent::Spectrum(frame) => {
+            let bars = w.get_spectrum();
+            for (i, v) in frame.iter().enumerate() {
+                let v = f32::from(*v) / 255.0;
+                if bars
+                    .row_data(i)
+                    .is_some_and(|old| (old - v).abs() > f32::EPSILON)
+                {
+                    bars.set_row_data(i, v);
+                }
+            }
+        }
+        PlayerEvent::Effects(status) => w.set_effects_status(status.unwrap_or_default().into()),
         PlayerEvent::Soloist(status) => {
             let (line, detail, retry) = soloist_text(&status);
             w.set_soloist_status(line.into());
@@ -632,8 +765,9 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
                 PlayView::Paused
             });
             w.set_position_ms(i32::try_from(state.progress_ms).unwrap_or(0));
+            ui_state::with(|st| st.position_changed(w));
             if let Some(v) = state.device.volume_percent {
-                w.set_volume_level((i32::from(v) * 12 + 50) / 100);
+                w.set_volume_level(i32::from(v));
             }
             let track = tonearm_player::TrackInfo {
                 uri: state.uri.clone(),
@@ -687,6 +821,14 @@ fn raise(w: &AppWindow) {
     });
 }
 
+fn apply_lastfm(w: &AppWindow, _s: &Senders, event: LastFmEvent) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
+        return;
+    }
+    ui_state::with(|st| st.on_lastfm(w, event));
+}
+
 fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
     // The preview has no session, so real library calls fail; keep its screens clean.
     if std::env::var_os("TONEARM_UI_PREVIEW").is_some()
@@ -701,6 +843,28 @@ fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
     }
     let fx = ui_state::with(|st| st.on_library(w, event));
     s.run(fx);
+    lyrics_kick(w);
+}
+
+thread_local! {
+    static LYRICS_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// Moves the lyrics highlight on and sets a timer for exactly the next word, so an open lyrics
+/// screen costs a redraw per word instead of one per frame.
+fn lyrics_kick(w: &AppWindow) {
+    let next = ui_state::with(|st| st.lyrics_step(w));
+    LYRICS_TIMER.with(|t| match next {
+        Some(delay) => {
+            let weak = w.as_weak();
+            t.start(slint::TimerMode::SingleShot, delay, move || {
+                if let Some(w) = weak.upgrade() {
+                    lyrics_kick(&w);
+                }
+            });
+        }
+        None => t.stop(),
+    });
 }
 
 /// "Доброе утро" … by the local hour.
@@ -764,6 +928,38 @@ fn audio_options(s: &Settings) -> AudioOptions {
     }
 }
 
+fn effects_options(s: &Settings) -> EffectsOptions {
+    let fx = &s.effects;
+    let gains = effects::preset(&fx.eq_preset).map_or_else(
+        || {
+            let mut g = [0i8; 10];
+            for (d, v) in g.iter_mut().zip(&fx.eq_gains) {
+                *d = *v;
+            }
+            g
+        },
+        |p| p.gains,
+    );
+    EffectsOptions {
+        eq: fx.eq.then_some(gains),
+        fade_ms: u32::from(fx.fade_secs) * 1000,
+        visualizer: fx.visualizer,
+    }
+}
+
+/// The equalizer's preset list: the built-in ones, then «Свой» (the user's own bands).
+fn eq_preset_index(id: &str) -> usize {
+    effects::PRESETS
+        .iter()
+        .position(|p| p.id == id)
+        .unwrap_or(effects::PRESETS.len())
+}
+
+fn set_eq_gains(w: &AppWindow, gains: &[i8]) {
+    let model: Vec<i32> = gains.iter().map(|&g| i32::from(g)).collect();
+    w.set_eq_gains(slint::ModelRc::new(slint::VecModel::from(model)));
+}
+
 fn index_of<T: PartialEq>(values: &[T], value: &T, default: usize) -> i32 {
     let i = values.iter().position(|v| v == value).unwrap_or(default);
     i32::try_from(i).unwrap_or(0)
@@ -791,6 +987,7 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_normalisation(i32::from(s.audio.normalisation));
     w.set_set_gapless(i32::from(s.audio.gapless));
     w.set_set_notifications(i32::from(s.ui.notifications));
+    w.set_lyrics_mode(i32::from(s.ui.lyrics_words));
     w.set_set_device(s.audio.device.as_str().into());
     // A hand-edited size that is not one of the steps shows as the nearest larger step.
     let cache = CACHE_SIZES_MB
@@ -800,6 +997,24 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_cache(i32::try_from(cache).unwrap_or(2));
     w.set_set_engine(i32::from(s.player.soloist));
     w.set_set_update_check(i32::from(s.update.check));
+    w.set_effects_supported(effects::supported());
+    let names: Vec<slint::SharedString> = effects::PRESETS
+        .iter()
+        .map(|p| p.name.into())
+        .chain(std::iter::once("Свой".into()))
+        .collect();
+    w.set_eq_preset_names(slint::ModelRc::new(slint::VecModel::from(names)));
+    w.set_set_eq(i32::from(s.effects.eq));
+    let preset = eq_preset_index(&s.effects.eq_preset);
+    w.set_set_eq_preset(i32::try_from(preset).unwrap_or(0));
+    match effects::PRESETS.get(preset) {
+        Some(p) => set_eq_gains(w, &p.gains),
+        None => set_eq_gains(w, &s.effects.eq_gains),
+    }
+    w.set_set_fade(index_of(&FADE_SECS, &s.effects.fade_secs, 0));
+    w.set_set_visualizer(i32::from(s.effects.visualizer));
+    w.set_set_scrobble(i32::from(s.lastfm.scrobble));
+    w.set_smart_collapsed(s.ui.smart_collapsed);
 }
 
 /// The settings page → Settings (keeps what the page does not show, like the Client ID).
@@ -810,10 +1025,26 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.audio.gapless = w.get_set_gapless() != 0;
     s.audio.device = w.get_set_device().to_string();
     s.ui.notifications = w.get_set_notifications() != 0;
+    s.ui.lyrics_words = w.get_lyrics_mode() == 1;
     s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
     s.update.check = w.get_set_update_check() != 0;
+    s.effects.eq = w.get_set_eq() != 0;
+    let preset = usize::try_from(w.get_set_eq_preset()).unwrap_or(0);
+    s.effects.eq_preset = effects::PRESETS
+        .get(preset)
+        .map_or("custom", |p| p.id)
+        .into();
+    s.effects.eq_gains = w
+        .get_eq_gains()
+        .iter()
+        .map(|g| i8::try_from(g.clamp(-12, 12)).unwrap_or(0))
+        .collect();
+    s.effects.fade_secs = FADE_SECS[pick(w.get_set_fade(), FADE_SECS.len())];
+    s.effects.visualizer = w.get_set_visualizer() != 0;
+    s.lastfm.scrobble = w.get_set_scrobble() != 0;
+    s.ui.smart_collapsed = w.get_smart_collapsed();
     s
 }
 
@@ -858,6 +1089,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (lev_tx, lev_rx) = mpsc::channel::<LibraryEvent>(64);
     let (ccmd_tx, ccmd_rx) = mpsc::channel::<ConnectCommand>(16);
     let (cev_tx, cev_rx) = mpsc::channel::<ConnectEvent>(16);
+    let (fcmd_tx, fcmd_rx) = mpsc::channel::<LastFmCommand>(64);
+    let (fev_tx, fev_rx) = mpsc::channel::<LastFmEvent>(16);
     // The core publishes the connected session; player and library pick it up.
     let (session_tx, session_rx) = watch::channel(None);
 
@@ -870,6 +1103,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let window = AppWindow::new()?;
     ui_state::init(&window);
+    ui_state::wrapped_rows(&window);
     show_settings(&window, &settings);
     // TONEARM_THEME=<id> overrides the saved theme (screenshots of every theme).
     let theme = std::env::var("TONEARM_THEME").unwrap_or_else(|_| settings.ui.theme.clone());
@@ -882,6 +1116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth: cmd_tx.clone(),
         player: pcmd_tx,
         connect: ccmd_tx,
+        lastfm: fcmd_tx,
         remote: Arc::new(Mutex::new(None)),
         remote_playing: Arc::new(AtomicBool::new(false)),
         library: lcmd_tx,
@@ -893,6 +1128,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
+    senders.local(PlayerCommand::Effects(effects_options(&settings)));
+    window.set_spectrum(slint::ModelRc::new(slint::VecModel::from(vec![
+        0.0f32;
+        effects::spectrum::BARS
+    ])));
     let updater = updater::Updater::new(
         runtime.handle().clone(),
         window.as_weak(),
@@ -936,6 +1176,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     window.on_soloist_retry(move || s.local(PlayerCommand::SoloistRetry));
     let s = senders.clone();
     window.on_settings_changed(move || s.settings_changed());
+    let s = senders.clone();
+    window.on_eq_preset_picked(move |i| {
+        let Some(w) = s.window.upgrade() else { return };
+        let i = usize::try_from(i).unwrap_or(0);
+        w.set_set_eq_preset(i32::try_from(i).unwrap_or(0));
+        if let Some(p) = effects::PRESETS.get(i) {
+            set_eq_gains(&w, &p.gains);
+        } else if let Ok(saved) = s.settings.lock() {
+            // «Свой»: the bands as they were last set by hand.
+            if saved.effects.eq_preset == "custom" {
+                set_eq_gains(&w, &saved.effects.eq_gains);
+            }
+        }
+        s.settings_changed();
+    });
+    let s = senders.clone();
+    window.on_eq_band_committed(move |band, db| {
+        let Some(w) = s.window.upgrade() else { return };
+        let gains = w.get_eq_gains();
+        if let Ok(band) = usize::try_from(band) {
+            gains.set_row_data(band, db.clamp(-12, 12));
+        }
+        w.set_set_eq_preset(i32::try_from(effects::PRESETS.len()).unwrap_or(0));
+        s.settings_changed();
+    });
     let s = senders.clone();
     window.on_theme_picked(move |id| {
         if let Some(w) = s.window.upgrade() {
@@ -1108,10 +1373,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let s = senders.clone();
+    window.on_lyrics_mode_changed(move || {
+        s.settings_changed();
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.lyrics_mode_changed(&w));
+            s.run(fx);
+            lyrics_kick(&w);
+        }
+    });
+    let s = senders.clone();
     window.on_lyrics_opened(move || {
         if let Some(w) = s.window.upgrade() {
             let fx = ui_state::with(|st| st.lyrics_opened(&w));
             s.run(fx);
+            lyrics_kick(&w);
         }
     });
     let s = senders.clone();
@@ -1153,6 +1428,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             s.run(fx);
         }
     });
+    let s = senders.clone();
+    window.on_smart_new(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.smart_new(&w));
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_edit(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.smart_edit(&w));
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_save(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.smart_save(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_delete(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.smart_delete(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_wrapped_opened(move |i| {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.wrapped_opened(&w, i));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_wrapped_play(move |i| {
+        let fx = ui_state::with(|st| st.wrapped_play(i));
+        s.run(fx);
+    });
+    let s = senders.clone();
+    window.on_lastfm_login(move || s.lastfm_cmd(LastFmCommand::Login));
+    let s = senders.clone();
+    window.on_lastfm_cancel(move || s.lastfm_cmd(LastFmCommand::CancelLogin));
+    let s = senders.clone();
+    window.on_lastfm_logout(move || s.lastfm_cmd(LastFmCommand::Logout));
     let s = senders.clone();
     window.on_history_play(move |i| {
         let fx = ui_state::with(|st| st.history_play(i));
@@ -1259,11 +1578,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let ms = (f64::from(ratio.clamp(0.0, 1.0)) * f64::from(w.get_duration_ms())) as u32;
             s.player(PlayerCommand::Seek { position_ms: ms });
             w.set_position_ms(i32::try_from(ms).unwrap_or(0));
+            ui_state::with(|st| st.position_changed(&w));
+            lyrics_kick(&w);
         }
     });
     let s = senders.clone();
     window.on_volume_changed(move |level| {
-        let percent = u8::try_from(level.clamp(0, 12) * 100 / 12).unwrap_or(100);
+        let percent = u8::try_from(level.clamp(0, 100)).unwrap_or(100);
         s.player(PlayerCommand::SetVolume(percent));
     });
 
@@ -1273,6 +1594,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let weak = window.as_weak();
     // Informational notices ("Добавлено в «Любимые»") go away by themselves; errors stay.
     let mut notice_seen = (slint::SharedString::new(), 0u32);
+    // Back in the window after a while: playlists made or followed elsewhere show up.
+    let mut was_focused = true;
+    let mut library_at = std::time::Instant::now();
     tick.start(
         slint::TimerMode::Repeated,
         Duration::from_secs(1),
@@ -1290,6 +1614,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if w.get_auth_view() == AuthView::Waiting {
                     w.set_waited_secs(w.get_waited_secs() + 1);
                 }
+                let focused = window_focused(&w);
+                if focused
+                    && !was_focused
+                    && w.get_auth_view() == AuthView::LoggedIn
+                    && library_at.elapsed() >= LIBRARY_REFRESH
+                {
+                    library_at = std::time::Instant::now();
+                    tick_senders.run(vec![Effect::Library(LibraryCommand::Refresh)]);
+                }
+                was_focused = focused;
                 if w.get_offline() && w.get_retry_in_secs() > 0 {
                     w.set_retry_in_secs(w.get_retry_in_secs() - 1);
                 }
@@ -1298,10 +1632,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if !w.get_remote_name().is_empty() && playing {
                     let next = (w.get_position_ms() + 1000).min(w.get_duration_ms());
                     w.set_position_ms(next);
+                    ui_state::with(|st| st.position_changed(&w));
                 }
                 ui_state::with(|st| st.watch_theme(&w));
                 let fx = ui_state::with(|st| st.tick(&w, playing));
                 tick_senders.run(fx);
+                // Catches play/pause, opening and closing the lyrics.
+                lyrics_kick(&w);
+                mini::sync(&w);
             }
         },
     );
@@ -1314,6 +1652,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         session_rx.clone(),
     ));
     let connect = runtime.spawn(tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx));
+    let lastfm = runtime.spawn(tonearm_core::lastfm::run(
+        settings.lastfm.clone(),
+        tonearm_core::system_store(),
+        fcmd_rx,
+        fev_tx,
+    ));
+    forward(
+        &runtime,
+        fev_rx,
+        window.as_weak(),
+        senders.clone(),
+        apply_lastfm,
+    );
     forward(
         &runtime,
         cev_rx,
@@ -1398,6 +1749,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
+    window.on_toggle_mini({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::toggle(&w);
+            }
+        }
+    });
+    window.on_mini_sync({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::sync(&w);
+            }
+        }
+    });
+    // Closing the main window quits, even with the mini player still open.
+    window.window().on_close_requested({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::close(&w);
+            }
+            slint::CloseRequestResponse::HideWindow
+        }
+    });
+
     window.run()?;
 
     // Continue where we left off next time: write the history and position now.
@@ -1418,6 +1796,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(wait, player).await;
         let _ = tokio::time::timeout(wait, library).await;
         let _ = tokio::time::timeout(wait, connect).await;
+        let _ = tokio::time::timeout(wait, lastfm).await;
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     if updater.restart_requested() {
@@ -1546,8 +1925,15 @@ fn preview(w: &AppWindow, senders: &Senders) {
             cover_url: Some("preview:deck".into()),
         };
         fx.extend(st.on_track(w, &track));
-        if screen == "stats" || screen == "home" {
+        if screen == "stats" || screen == "home" || screen.starts_with("smart") {
             fx.extend(st.preview_history(w));
+        }
+        if screen == "wrapped" {
+            st.preview_year();
+        }
+        if screen == "smart" {
+            let req = PageRequest::Playlist(smart::uri("on-repeat"));
+            fx.extend(st.open(w, req, true));
         }
         // Feed the OS media controls too, once they are registered (after the event loop starts).
         slint::Timer::single_shot(Duration::from_millis(300), move || {
@@ -1560,10 +1946,24 @@ fn preview(w: &AppWindow, senders: &Senders) {
     if screen == "library" {
         w.set_page(Page::Library);
     }
-    if screen == "settings" {
+    if screen == "effects" {
+        w.set_set_engine(1);
+        w.set_set_eq(1);
+        w.set_set_eq_preset(1);
+        set_eq_gains(w, &effects::PRESETS[1].gains);
+        w.set_set_fade(2);
+        w.set_set_visualizer(1);
+        let bars = [
+            0.9, 0.8, 0.95, 0.7, 0.55, 0.6, 0.45, 0.5, 0.4, 0.35, 0.3, 0.25, 0.2, 0.12,
+        ];
+        w.set_spectrum(slint::ModelRc::new(slint::VecModel::from(bars.to_vec())));
+    }
+    if screen == "settings" || screen == "effects" {
         w.set_page(Page::Settings);
         w.set_username("nightowl".into());
         w.set_cache_used_mb(214);
+        w.set_lastfm_state(3);
+        w.set_lastfm_user("nightowl".into());
         let devices: Vec<slint::SharedString> =
             vec!["Built-in Audio Analog Stereo".into(), "USB DAC".into()];
         w.set_audio_devices(slint::ModelRc::new(slint::VecModel::from(devices)));
@@ -1575,6 +1975,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
             title: t.into(),
             artists: a.into(),
             duration_ms: 200_000,
+            cover_url: None,
         };
         let snap = QueueSnapshot {
             context_name: "Ночные маршруты".into(),
@@ -1635,12 +2036,27 @@ fn preview(w: &AppWindow, senders: &Senders) {
     if screen == "stats" {
         w.set_page(Page::Stats);
     }
-    if screen == "lyrics" {
-        use tonearm_core::library::extras::{LyricLine, Lyrics};
+    if screen == "mini" {
+        // After the sample cover has arrived.
+        let weak = w.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(800), move || {
+            if let Some(w) = weak.upgrade() {
+                mini::toggle(&w);
+            }
+        });
+    }
+    if screen == "wrapped" {
+        w.set_page(Page::Wrapped);
+    }
+    if screen == "smart-editor" {
+        ui_state::with(|st| st.smart_new(w));
+    }
+    if screen.starts_with("lyrics") {
+        use tonearm_core::library::lyrics::{LyricLine, Lyrics, fill_timings};
         let lines = [
             "Город спит, и только мы",
             "Едем вдоль реки",
-            "Огни над рекой",
+            "Огни над рекой горят для нас одних, пока над городом встаёт рассвет",
             "Горят для нас одних",
             "",
             "Тихо шепчет радио",
@@ -1648,17 +2064,30 @@ fn preview(w: &AppWindow, senders: &Senders) {
             "Огни над рекой",
             "Нас ведут до утра",
         ];
+        let mut lines: Vec<LyricLine> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| LyricLine {
+                start_ms: Some(u32::try_from(i).unwrap_or(0) * 4_000 + 76_000),
+                text: (*t).into(),
+                words: Vec::new(),
+            })
+            .collect();
+        // `lyrics-plain`: the same text without times.
+        let synced = screen == "lyrics";
+        if synced {
+            w.set_lyrics_mode(1);
+            fill_timings(&mut lines, 240_000, true);
+        } else {
+            for l in &mut lines {
+                l.start_ms = None;
+            }
+        }
         let lyrics = Lyrics {
-            lines: lines
-                .iter()
-                .enumerate()
-                .map(|(i, t)| LyricLine {
-                    start_ms: Some(u32::try_from(i).unwrap_or(0) * 12_000 + 30_000),
-                    text: (*t).into(),
-                })
-                .collect(),
-            synced: true,
+            lines,
+            synced,
             provider: "LRCLIB".into(),
+            ..Lyrics::default()
         };
         w.set_lyrics_open(true);
         let fx = ui_state::with(|st| {
@@ -1683,6 +2112,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
         });
     }
     w.set_position_ms(84_000);
+    ui_state::with(|st| st.position_changed(w));
     w.set_play_view(PlayView::Playing);
 }
 

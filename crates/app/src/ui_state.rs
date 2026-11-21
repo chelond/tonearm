@@ -6,9 +6,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use slint::{Color, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{
+    Color, ComponentHandle, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
+};
 use tonearm_core::covers::Cover;
-use tonearm_core::library::extras::{LyricLine, current_line};
+use tonearm_core::library::lyrics::{LyricLine, current_line};
 use tonearm_core::library::{
     CollectionKind, LibraryCommand, LibraryEvent, PageHeader, PageRequest, PlaylistSummary,
     SearchKind, SearchResults, Tile, TrackItem, format_duration,
@@ -16,11 +18,14 @@ use tonearm_core::library::{
 use tonearm_player::{PlaybackState, PlayerCommand, QueueItem, QueueSnapshot, TrackInfo};
 
 use crate::history::{self, Context, Entry, QueuedTrack, Resume, Store};
-use crate::themes;
 use crate::{
-    AppWindow, LyricRow, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState, StatRow, Theme,
-    ThemeCard, TileData, TrackData,
+    AppWindow, LyricRow, LyricWord, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState,
+    StatRow, Theme, ThemeCard, TileData, TrackData,
 };
+use crate::{smart, themes};
+
+mod insights;
+pub use insights::wrapped_rows;
 
 /// Requests from the UI state to the async side (covers, playback, navigation).
 pub enum Effect {
@@ -45,6 +50,24 @@ pub enum Effect {
     Save(Box<Store>),
     /// Write only the resume point (cheap; every few seconds while playing).
     SaveResume(Box<Resume>),
+    /// Add a finished play to the permanent play log.
+    LogPlay(Box<Entry>),
+    /// Build a smart playlist off the UI thread; the answer carries `token`.
+    /// `plays`: `None` reads the play log (sample data in the preview).
+    Smart {
+        token: u64,
+        rule: Box<smart::Rule>,
+        liked: Vec<TrackItem>,
+        plays: Option<Vec<Entry>>,
+    },
+    /// Compute the summary of a year (0 = the latest with plays).
+    Wrapped {
+        year: i32,
+        plays: Option<Vec<Entry>>,
+    },
+    LastFm(tonearm_core::lastfm::LastFmCommand),
+    /// Write the smart playlist rules.
+    SaveRules(Vec<smart::Rule>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -57,6 +80,7 @@ pub enum CoverTarget {
     SearchTrack(String),
     Playlist(String),
     History(String),
+    Wrapped(String),
 }
 
 const DEFAULT_PAGE_ACCENT: Color = Color::from_rgb_u8(0x4A, 0x4A, 0x58);
@@ -72,6 +96,7 @@ enum PaletteAction {
     Radio,
     Lyrics,
     Shuffle,
+    Mini,
 }
 
 #[derive(Default)]
@@ -125,9 +150,13 @@ pub struct UiState {
     store: Store,
     /// Last session's track, shown paused until play is pressed.
     resume: Option<Resume>,
-    lyrics: Vec<LyricLine>,
     lyrics_uri: String,
-    lyrics_index: Option<usize>,
+    /// Timed lines of the shown lyrics (empty when not synced).
+    lyrics: Vec<LyricLine>,
+    /// Last reported position and when it came: the song clock between reports.
+    pos_anchor: (u32, Option<std::time::Instant>),
+    /// Lyrics already requested for this track (the answer is on its way).
+    lyrics_asked: String,
     /// The player reported the track only partly; its details are on the way.
     meta_pending: bool,
     /// The theme's accent when it does not follow the cover.
@@ -149,6 +178,45 @@ pub struct UiState {
     palette: Vec<PaletteAction>,
     /// Seconds since the resume state was last written.
     since_save: u32,
+    queue_rows: Rc<VecModel<QueueRow>>,
+    /// Pages seen lately, newest last: shown at once when opened again.
+    page_cache: Vec<CachedPage>,
+    /// The page came from `page_cache`; its fresh tracks are collected here and swapped in
+    /// once complete, only if they differ.
+    refresh: Option<Vec<TrackItem>>,
+    /// Header now on screen, so an identical fresh one does not redraw it.
+    shown_header: Option<PageHeader>,
+    /// Colour taken from the page's cover.
+    page_rgb: Option<[u8; 3]>,
+    smart_rules: Vec<smart::Rule>,
+    smart_rows: Rc<VecModel<PlaylistEntry>>,
+    /// A smart page waits for Liked Songs: their header and tracks are collected here.
+    smart_fetch: Option<insights::SmartFetch>,
+    /// Rule open in the editor (`None`: a new one).
+    smart_editing: Option<String>,
+    /// Tracks of the year summary, in the order shown (for playing them).
+    wrapped_items: Vec<Entry>,
+    wrapped_rows: insights::WrappedRows,
+    /// "Now playing" already sent to Last.fm for this track.
+    np_sent: String,
+    smart_seq: u64,
+    /// Signed in to Last.fm with scrobbling on.
+    pub lastfm_on: bool,
+}
+
+/// Pages kept in memory and tracks across all of them: about a few MB at most.
+const PAGE_CACHE: usize = 12;
+const PAGE_CACHE_TRACKS: usize = 20_000;
+
+/// A loaded page, kept to show it again without waiting for the network.
+struct CachedPage {
+    key: (i32, String),
+    header: Option<PageHeader>,
+    image_url: Option<String>,
+    rgb: Option<[u8; 3]>,
+    tracks: Vec<TrackItem>,
+    tiles: Vec<Tile>,
+    scroll: f32,
 }
 
 /// What the search page shows.
@@ -188,6 +256,8 @@ pub fn init(w: &AppWindow) {
     w.set_search_playlists(ModelRc::from(st.search.playlists.clone()));
     w.set_history_tracks(ModelRc::from(st.history_rows.clone()));
     w.set_stats_tracks(ModelRc::from(st.stat_track_rows.clone()));
+    let mut st = st;
+    st.init_insights(w);
     STATE.with(|s| *s.borrow_mut() = Some(st));
 }
 
@@ -288,6 +358,9 @@ fn kind_code(kind: CollectionKind) -> i32 {
 }
 
 pub fn request_from(kind: i32, uri: String) -> PageRequest {
+    if smart::id_of(&uri).is_some() {
+        return PageRequest::Playlist(uri);
+    }
     match kind {
         0 => PageRequest::Liked,
         2 => PageRequest::Album(uri),
@@ -431,7 +504,116 @@ impl UiState {
     }
 
     /// Navigates to a page; the library loads it and answers with events.
+    /// Keeps the page on screen (and where it is scrolled to) for a later visit.
+    fn remember_page(&mut self, w: &AppWindow) {
+        let Some(cur) = self.current.as_ref() else {
+            return;
+        };
+        let key = request_uri(cur);
+        if smart::id_of(&key.1).is_some() {
+            return; // rebuilt on every visit
+        }
+        let complete = !w.get_page_loading() && w.get_page_error().is_empty();
+        if !complete || self.refresh.is_some() {
+            // Half loaded: keep only the scroll position of an older copy.
+            if let Some(c) = self.page_cache.iter_mut().find(|c| c.key == key) {
+                c.scroll = w.get_coll_scroll();
+            }
+            return;
+        }
+        let page = CachedPage {
+            key,
+            header: self.shown_header.clone(),
+            image_url: self.page_image_url.clone(),
+            rgb: self.page_rgb,
+            tracks: self.tracks.clone(),
+            tiles: self.page_tiles.clone(),
+            scroll: w.get_coll_scroll(),
+        };
+        self.push_cache(page);
+    }
+
+    fn push_cache(&mut self, page: CachedPage) {
+        self.page_cache.retain(|c| c.key != page.key);
+        self.page_cache.push(page);
+        while self.page_cache.len() > PAGE_CACHE
+            || (self.page_cache.len() > 1
+                && self
+                    .page_cache
+                    .iter()
+                    .map(|c| c.tracks.len())
+                    .sum::<usize>()
+                    > PAGE_CACHE_TRACKS)
+        {
+            self.page_cache.remove(0);
+        }
+    }
+
+    /// Puts a cached copy of the page on screen; fresh data replaces it when it differs.
+    fn restore_page(&mut self, w: &AppWindow, key: &(i32, String)) -> Vec<Effect> {
+        let Some(pos) = self.page_cache.iter().position(|c| c.key == *key) else {
+            w.set_coll_scroll(0.0);
+            return Vec::new();
+        };
+        let c = self.page_cache.remove(pos);
+        let mut fx = Vec::new();
+        // The fresh copy gets the next page id; covers already asked go to it.
+        self.page_id = self.min_page_id;
+        if let Some(h) = &c.header {
+            fx.extend(self.set_header(w, h));
+        }
+        self.shown_header = c.header;
+        if let Some(url) = c.image_url.clone()
+            && fx.is_empty()
+        {
+            fx.push(Effect::Cover {
+                url,
+                size: 400,
+                target: CoverTarget::Page(self.page_id),
+            });
+        }
+        self.page_image_url = c.image_url;
+        if let Some(rgb) = c.rgb {
+            Theme::get(w).set_page_accent(self.tint(rgb));
+            self.page_rgb = Some(rgb);
+        }
+        self.tracks = c.tracks;
+        self.rebuild_view(w);
+        fx.extend(self.set_page_tiles(&c.tiles));
+        self.page_tiles = c.tiles;
+        self.finish_tracks(w);
+        w.set_page_loading(false);
+        w.set_coll_scroll(c.scroll);
+        self.refresh = Some(Vec::new());
+        fx
+    }
+
+    fn set_page_tiles(&self, tiles: &[Tile]) -> Vec<Effect> {
+        self.tile_rows
+            .set_vec(tiles.iter().map(tile_data).collect::<Vec<_>>());
+        tiles
+            .iter()
+            .filter_map(|t| {
+                t.image_url.as_ref().map(|u| Effect::Cover {
+                    url: u.clone(),
+                    size: 240,
+                    target: CoverTarget::Search(t.uri.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Labels of a page whose tracks are all in.
+    fn finish_tracks(&self, w: &AppWindow) {
+        let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
+        w.set_page_length_label(format_duration(total).into());
+        w.set_page_tracks_label(self.tracks.len().to_string().into());
+    }
+
     pub fn open(&mut self, w: &AppWindow, req: PageRequest, push_history: bool) -> Vec<Effect> {
+        if w.get_page() == crate::Page::Collection {
+            self.remember_page(w);
+        }
         if push_history && let Some(cur) = self.current.take() {
             self.history.push(cur);
         }
@@ -447,6 +629,9 @@ impl UiState {
         self.sort = 0;
         self.autoplay = false;
         self.page_image_url = None;
+        self.refresh = None;
+        self.shown_header = None;
+        self.page_rgb = None;
         w.set_page_filter("".into());
         w.set_page_sort(0);
         w.set_page_shown(0);
@@ -469,7 +654,15 @@ impl UiState {
             DEFAULT_PAGE_ACCENT
         });
         w.set_page(crate::Page::Collection);
-        vec![Effect::Open(req)]
+        self.smart_fetch = None;
+        w.set_page_smart(false);
+        w.set_page_empty_hint("".into());
+        if let Some(id) = smart::id_of(&self.page_uri).map(str::to_owned) {
+            return self.open_smart(w, &id);
+        }
+        let mut fx = self.restore_page(w, &(kind, self.page_uri.clone()));
+        fx.push(Effect::Open(req));
+        fx
     }
 
     /// The play button on a tile or card: play that collection (opening it to load its tracks).
@@ -479,8 +672,14 @@ impl UiState {
         if self.page_uri == page_uri && !self.tracks.is_empty() {
             return self.play_page(false);
         }
-        let fx = self.open(w, req, true);
-        self.autoplay = true;
+        let mut fx = self.open(w, req, true);
+        if self.tracks.is_empty() {
+            self.autoplay = true;
+        } else {
+            // Shown from memory: play right away.
+            fx.extend(self.play_page(false));
+            self.mark_context(w);
+        }
         fx
     }
 
@@ -632,7 +831,9 @@ impl UiState {
                 manual: i < q.manual,
             })
             .collect();
-        w.set_queue_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        // Updated in place: a new model would drop a drag in progress and scroll to the top.
+        sync_rows(&self.queue_rows, rows);
+        w.set_queue_items(ModelRc::from(self.queue_rows.clone()));
         w.set_queue_context(q.context_name.clone().into());
         w.set_shuffle_on(q.shuffle);
         w.set_repeat_mode(match q.repeat {
@@ -722,12 +923,16 @@ impl UiState {
                 }
             })
             .collect();
-        update_rows(&self.playlist_rows, rows);
+        sync_rows(&self.playlist_rows, rows);
         self.playlists = lists;
         fx
     }
 
     pub fn on_library(&mut self, w: &AppWindow, ev: LibraryEvent) -> Vec<Effect> {
+        let ev = match self.smart_liked(w, ev) {
+            Ok(fx) => return fx,
+            Err(ev) => *ev,
+        };
         let mut fx = Vec::new();
         match ev {
             LibraryEvent::Playlists(lists) => {
@@ -742,10 +947,15 @@ impl UiState {
             LibraryEvent::Home(_) => {}
             LibraryEvent::PageHeader { page_id, header } if page_id >= self.min_page_id => {
                 self.page_id = page_id;
-                fx.extend(self.set_header(w, &header));
+                if self.shown_header.as_ref() != Some(&header) {
+                    fx.extend(self.set_header(w, &header));
+                    self.shown_header = Some(header);
+                }
             }
             LibraryEvent::PageImage { page_id, url }
-                if page_id == self.page_id && page_id >= self.min_page_id =>
+                if page_id == self.page_id
+                    && page_id >= self.min_page_id
+                    && self.page_image_url.as_ref() != Some(&url) =>
             {
                 self.page_image_url = Some(url.clone());
                 fx.push(Effect::Cover {
@@ -753,6 +963,25 @@ impl UiState {
                     size: 400,
                     target: CoverTarget::Page(page_id),
                 });
+            }
+            LibraryEvent::PageTracks {
+                page_id,
+                tracks,
+                done,
+            } if page_id == self.page_id
+                && page_id >= self.min_page_id
+                && self.refresh.is_some() =>
+            {
+                let fresh = self.refresh.get_or_insert_default();
+                fresh.extend(tracks);
+                if done {
+                    let fresh = self.refresh.take().unwrap_or_default();
+                    if fresh != self.tracks {
+                        self.tracks = fresh;
+                        self.rebuild_view(w);
+                        self.finish_tracks(w);
+                    }
+                }
             }
             LibraryEvent::PageTracks {
                 page_id,
@@ -777,9 +1006,7 @@ impl UiState {
                 }
                 if done {
                     w.set_page_loading(false);
-                    let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
-                    w.set_page_length_label(format_duration(total).into());
-                    w.set_page_tracks_label(self.tracks.len().to_string().into());
+                    self.finish_tracks(w);
                     if std::mem::take(&mut self.autoplay) {
                         fx.extend(self.play_page(false));
                         self.mark_context(w);
@@ -789,17 +1016,17 @@ impl UiState {
             LibraryEvent::PageTiles { page_id, tiles }
                 if page_id == self.page_id && page_id >= self.min_page_id =>
             {
-                self.tile_rows
-                    .set_vec(tiles.iter().map(tile_data).collect::<Vec<_>>());
-                fx.extend(tiles.iter().filter_map(|t| {
-                    t.image_url.as_ref().map(|u| Effect::Cover {
-                        url: u.clone(),
-                        size: 240,
-                        target: CoverTarget::Search(t.uri.clone()),
-                    })
-                }));
-                self.page_tiles = tiles;
+                if tiles != self.page_tiles {
+                    fx.extend(self.set_page_tiles(&tiles));
+                    self.page_tiles = tiles;
+                }
                 w.set_page_loading(false);
+            }
+            LibraryEvent::PageError { page_id, .. }
+                if page_id >= self.min_page_id && self.refresh.is_some() =>
+            {
+                // The copy from memory stays; it is only not refreshed.
+                self.refresh = None;
             }
             LibraryEvent::PageError { page_id, message } if page_id >= self.min_page_id => {
                 w.set_page_loading(false);
@@ -864,25 +1091,44 @@ impl UiState {
             }
             LibraryEvent::Lyrics { uri, lyrics } if uri == self.playing_uri => {
                 self.lyrics_uri = uri;
-                self.lyrics_index = None;
                 match lyrics {
+                    Some(l) if l.instrumental => {
+                        w.set_lyrics(ModelRc::default());
+                        w.set_lyrics_status("Инструментальный трек, без слов".into());
+                        w.set_lyrics_provider(l.provider.into());
+                    }
                     Some(l) => {
-                        let rows: Vec<LyricRow> = l
+                        w.set_lyrics(ModelRc::from(Rc::new(VecModel::from(lyric_rows(&l.lines)))));
+                        w.set_lyrics_line(-1);
+                        w.set_lyrics_word(-1);
+                        self.lyrics = if l.synced {
+                            l.lines.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        w.set_lyrics_synced(l.synced);
+                        w.set_lyrics_word_synced(l.word_synced);
+                        let timed_words = l
                             .lines
                             .iter()
-                            .map(|line| LyricRow {
-                                text: line.text.clone().into(),
-                            })
-                            .collect();
-                        w.set_lyrics(ModelRc::from(Rc::new(VecModel::from(rows))));
-                        w.set_lyrics_synced(l.synced);
-                        w.set_lyrics_provider(l.provider.clone().into());
+                            .any(|x| x.words.iter().any(|wd| wd.text != "•"));
+                        let how = if !l.synced {
+                            " · без синхронизации"
+                        } else if l.word_synced {
+                            " · по словам"
+                        } else if timed_words {
+                            " · слова по темпу песни"
+                        } else {
+                            ""
+                        };
+                        w.set_lyrics_provider(format!("{}{how}", l.provider).into());
                         w.set_lyrics_status("".into());
-                        self.lyrics = l.lines;
-                        self.update_lyrics_line(w);
                     }
                     None => {
-                        self.lyrics.clear();
+                        // Asked again when the overlay is reopened: maybe the network is back.
+                        self.lyrics_uri.clear();
+                        self.lyrics_asked.clear();
+                        w.set_lyrics(ModelRc::default());
                         w.set_lyrics_status("Для этого трека текста нет".into());
                         w.set_lyrics_provider("".into());
                     }
@@ -1177,6 +1423,7 @@ impl UiState {
             CoverTarget::Page(id) if *id == self.page_id => {
                 w.set_page_image(to_image(cover));
                 w.set_page_has_image(true);
+                self.page_rgb = Some(cover.accent);
                 Theme::get(w).set_page_accent(self.tint(cover.accent));
             }
             CoverTarget::Search(uri) => {
@@ -1222,6 +1469,7 @@ impl UiState {
                     }
                 }
             }
+            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &to_image(cover)),
             CoverTarget::Deck(uri) if *uri == self.playing_uri => {
                 w.set_track_image(to_image(cover));
                 w.set_track_backdrop(backdrop(cover));
@@ -1370,9 +1618,9 @@ impl UiState {
         let t = &self.playing;
         let complete = t.duration_ms > 0 && !t.artists.is_empty() && t.cover_url.is_some();
         self.meta_pending = still_pending && !complete;
-        if w.get_lyrics_open() {
-            fx.extend(self.lyrics_opened(w));
-        }
+        // Fetched ahead, so the lyrics are there the moment they are opened.
+        fx.extend(self.lyrics_opened(w));
+        fx.extend(self.now_playing());
         fx
     }
 
@@ -1456,14 +1704,15 @@ impl UiState {
             )));
         }
         // Lyrics: reload for the new track if the panel is open, otherwise when it opens.
-        self.lyrics.clear();
         self.lyrics_uri.clear();
+        self.lyrics_asked.clear();
+        self.lyrics.clear();
         w.set_lyrics(ModelRc::default());
-        w.set_lyrics_index(-1);
-        if w.get_lyrics_open() {
-            fx.extend(self.lyrics_opened(w));
-        }
+        w.set_lyrics_line(-1);
+        // Fetched ahead, so the lyrics are there the moment they are opened.
+        fx.extend(self.lyrics_opened(w));
         fx.push(self.save_resume(0));
+        fx.extend(self.now_playing());
         fx
     }
 
@@ -1478,20 +1727,29 @@ impl UiState {
             .iter()
             .chain(&self.search.results.tracks)
             .find(|x| x.uri == t.uri);
-        self.store.add(Entry {
+        let entry = Entry {
             uri: t.uri.clone(),
             title: t.title.clone(),
             artists: t.artists.clone(),
-            artist_uri: known.and_then(|k| k.artist_uri.clone()),
+            artist_uri: known
+                .and_then(|k| k.artist_uri.clone())
+                .or_else(|| self.playing_artist.clone()),
             album: t.album.clone(),
+            album_uri: known
+                .and_then(|k| k.album_uri.clone())
+                .or_else(|| self.playing_album.clone()),
             image_url: t.cover_url.clone(),
             duration_ms: t.duration_ms,
             listened_ms: self.listened_ms,
             at: self.started_at,
             context: self.context.clone(),
-        });
+        };
+        let mut fx = insights::scrobble(&entry);
+        fx.push(Effect::LogPlay(Box::new(entry.clone())));
+        self.store.add(entry);
         self.listened_ms = 0;
-        self.refresh_recent(w)
+        fx.extend(self.refresh_recent(w));
+        fx
     }
 
     /// Called by the 1 s clock while the local player plays.
@@ -1508,25 +1766,39 @@ impl UiState {
                 }
             }
         }
-        self.update_lyrics_line(w);
         fx
     }
 
+    /// The player reported (or the user set) a position.
     pub fn position_changed(&mut self, w: &AppWindow) {
-        self.update_lyrics_line(w);
+        let pos = u32::try_from(w.get_position_ms()).unwrap_or(0);
+        self.pos_anchor = (pos, Some(std::time::Instant::now()));
     }
 
-    fn update_lyrics_line(&mut self, w: &AppWindow) {
-        if self.lyrics.is_empty() || !w.get_lyrics_synced() {
-            return;
+    /// Lights the current lyrics line and word. Returns when the next one is due, `None` when
+    /// nothing will change by itself (closed, paused, unsynced): the screen is redrawn only when
+    /// a word or a line changes, never on a frame clock.
+    pub fn lyrics_step(&mut self, w: &AppWindow) -> Option<std::time::Duration> {
+        if self.lyrics.is_empty() || !w.get_lyrics_open() {
+            return None;
         }
-        // Show a line slightly early: reading lags behind hearing.
-        let pos = u32::try_from(w.get_position_ms() + 250).unwrap_or(0);
-        let idx = current_line(&self.lyrics, pos);
-        if idx != self.lyrics_index {
-            self.lyrics_index = idx;
-            w.set_lyrics_index(idx.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
+        let playing = w.get_play_view() == PlayView::Playing;
+        let (base, at) = self.pos_anchor;
+        let elapsed = at.filter(|_| playing).map_or(0, |t| {
+            u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX)
+        });
+        // A little early: reading lags behind hearing.
+        let pos = base.saturating_add(elapsed).saturating_add(LYRICS_LEAD_MS);
+        let (line, word, next) = lyrics_at(&self.lyrics, pos);
+        let to_i32 = |v: Option<usize>| v.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1);
+        if w.get_lyrics_line() != to_i32(line) {
+            w.set_lyrics_line(to_i32(line));
         }
+        if w.get_lyrics_word() != to_i32(word) {
+            w.set_lyrics_word(to_i32(word));
+        }
+        let next = next?;
+        playing.then(|| std::time::Duration::from_millis(u64::from(next - pos).clamp(15, 2000) + 5))
     }
 
     pub fn lyrics_opened(&mut self, w: &AppWindow) -> Vec<Effect> {
@@ -1542,13 +1814,29 @@ impl UiState {
             // Asked again once the artist and length are known: LRCLIB matches on them.
             return Vec::new();
         }
+        if self.lyrics_asked == self.playing.uri {
+            return Vec::new();
+        }
+        self.lyrics_asked.clone_from(&self.playing.uri);
         w.set_lyrics_provider("".into());
         vec![Effect::Library(LibraryCommand::Lyrics {
             uri: self.playing.uri.clone(),
             title: self.playing.title.clone(),
             artist: self.playing.artists.clone(),
             duration_ms: self.playing.duration_ms,
+            words: w.get_lyrics_mode() == 1,
         })]
+    }
+
+    /// "Строки" / "Слова" switched: the lyrics are fetched again for the new mode.
+    pub fn lyrics_mode_changed(&mut self, w: &AppWindow) -> Vec<Effect> {
+        self.lyrics_uri.clear();
+        self.lyrics_asked.clear();
+        self.lyrics.clear();
+        w.set_lyrics(ModelRc::default());
+        w.set_lyrics_line(-1);
+        w.set_lyrics_word(-1);
+        self.lyrics_opened(w)
     }
 
     /// Snapshot for "continue where you left off"; written off the UI thread.
@@ -1593,7 +1881,22 @@ impl UiState {
             // Nothing played this session: keep last session's state as it was.
             return Some(std::mem::take(&mut self.store));
         }
-        drop(self.finish_listen(w));
+        for fx in self.finish_listen(w) {
+            match fx {
+                Effect::LogPlay(e) => {
+                    if let Some(log) = history::PlayLog::open() {
+                        let _ = log.append(&e);
+                    }
+                }
+                // The Last.fm task is stopping: queue it on disk, it goes out next start.
+                Effect::LastFm(tonearm_core::lastfm::LastFmCommand::Scrobble(s))
+                    if self.lastfm_on =>
+                {
+                    tonearm_core::lastfm::Queue::load(tonearm_core::lastfm::queue_path()).push(s);
+                }
+                _ => {}
+            }
+        }
         match self.save_resume(pos) {
             Effect::Save(s) => Some(*s),
             _ => None,
@@ -1651,6 +1954,7 @@ impl UiState {
                 title: q.title.clone(),
                 artists: q.artists.clone(),
                 duration_ms: q.duration_ms,
+                cover_url: (q.uri == r.uri).then(|| r.cover_url.clone()).flatten(),
             })
             .collect();
         let mut start = r.start;
@@ -1660,23 +1964,20 @@ impl UiState {
                 title: r.title.clone(),
                 artists: r.artists.clone(),
                 duration_ms: r.duration_ms,
+                cover_url: r.cover_url.clone(),
             }];
             start = 0;
         }
         self.context_items.clone_from(&items);
         self.playing_uri.clear();
-        Some(vec![
-            Effect::Player(PlayerCommand::PlayContext {
-                items,
-                start,
-                name: r.context.title.clone(),
-                shuffle: None,
-            }),
-            Effect::Player(PlayerCommand::PlayAt {
-                uri: r.uri,
-                position_ms: r.position_ms,
-            }),
-        ])
+        // One command: the track starts at the saved position, not first from its beginning.
+        Some(vec![Effect::Player(PlayerCommand::PlayContext {
+            items,
+            start,
+            name: r.context.title.clone(),
+            shuffle: None,
+            position_ms: r.position_ms,
+        })])
     }
 
     pub fn stats_opened(&mut self, w: &AppWindow) -> Vec<Effect> {
@@ -1810,6 +2111,7 @@ impl UiState {
             ("search", "Поиск", crate::Page::Search),
             ("library", "Медиатека", crate::Page::Library),
             ("stats", "Статистика", crate::Page::Stats),
+            ("sparkle", "Итоги года", crate::Page::Wrapped),
             ("settings", "Настройки", crate::Page::Settings),
         ];
         let has_track = !self.playing.uri.is_empty();
@@ -1822,6 +2124,16 @@ impl UiState {
                 )
             }),
             has_track.then(|| ("lyrics", "Текст песни".to_owned(), PaletteAction::Lyrics)),
+            Some((
+                "mini",
+                if w.get_mini_open() {
+                    "Закрыть мини-плеер"
+                } else {
+                    "Мини-плеер"
+                }
+                .to_owned(),
+                PaletteAction::Mini,
+            )),
             (!self.tracks.is_empty() && w.get_page() == crate::Page::Collection).then(|| {
                 (
                     "shuffle",
@@ -1854,6 +2166,14 @@ impl UiState {
                     row(5, "heart-fill", "Любимые треки", "Плейлист"),
                     PaletteAction::Open(PageRequest::Liked),
                 );
+            }
+            for r in &self.smart_rules {
+                if matches(&r.name, &q) {
+                    push(
+                        row(1, "sparkle", &r.name, "Умный плейлист"),
+                        PaletteAction::Open(PageRequest::Playlist(smart::uri(&r.id))),
+                    );
+                }
             }
             for p in &self.playlists {
                 if matches(&p.name, &q) {
@@ -1923,6 +2243,16 @@ impl UiState {
                 self.lyrics_opened(w)
             }
             PaletteAction::Shuffle => self.play_page(true),
+            PaletteAction::Mini => {
+                // Opening the window calls back into the UI state: do it after this call.
+                let weak = w.as_weak();
+                slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.invoke_toggle_mini();
+                    }
+                });
+                Vec::new()
+            }
         }
     }
 }
@@ -1942,6 +2272,7 @@ fn queue_item(t: &TrackItem) -> QueueItem {
         title: t.title.clone(),
         artists: t.artists.clone(),
         duration_ms: t.duration_ms,
+        cover_url: t.image_url.clone(),
     }
 }
 
@@ -1974,6 +2305,7 @@ fn context(
         start,
         name: name.to_owned(),
         shuffle,
+        position_ms: 0,
     })]
 }
 
@@ -2244,6 +2576,25 @@ impl<T: Clone + 'static> VecModelExt<T> for VecModel<T> {
     }
 }
 
+/// Replaces a list's rows in place: changed rows are set, extra ones added or removed at the
+/// end, so the list keeps its scroll position and the items under the mouse.
+fn sync_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    use slint::Model as _;
+    let new_len = rows.len();
+    for (i, row) in rows.into_iter().enumerate() {
+        if i < model.row_count() {
+            if model.row_data(i).as_ref() != Some(&row) {
+                model.set_row_data(i, row);
+            }
+        } else {
+            model.push(row);
+        }
+    }
+    while model.row_count() > new_len {
+        model.remove(model.row_count() - 1);
+    }
+}
+
 /// Replaces a list's rows, touching only the ones that changed when the length is the same:
 /// a reset would re-create every tile and replay its entrance animation.
 fn update_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
@@ -2278,8 +2629,104 @@ fn merge_track(track: &mut TrackInfo, from: &TrackItem) {
     }
 }
 
+const LYRICS_LEAD_MS: u32 = 150;
+
+/// The line and word sung at `pos`, and when the next word or line starts.
+fn lyrics_at(lines: &[LyricLine], pos: u32) -> (Option<usize>, Option<usize>, Option<u32>) {
+    let line = current_line(lines, pos);
+    let words = line.map_or(&[][..], |i| lines[i].words.as_slice());
+    let word = words.partition_point(|w| w.start_ms <= pos).checked_sub(1);
+    let next_word = words.iter().map(|w| w.start_ms).find(|&s| s > pos);
+    let next_line = lines[line.map_or(0, |i| i + 1)..]
+        .iter()
+        .filter_map(|l| l.start_ms)
+        .find(|&s| s > pos);
+    let next = match (next_word, next_line) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    (line, word, next)
+}
+
+/// Lyrics lines for the overlay; times in ms of the song (`-1`: not synced).
+fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
+    let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    let starts: Vec<i32> = lines.iter().map(|l| l.start_ms.map_or(-1, ms)).collect();
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let start = starts[i];
+            let next = starts[i + 1..]
+                .iter()
+                .copied()
+                .find(|&s| s > start)
+                .unwrap_or(i32::MAX);
+            let words: Vec<LyricWord> = line
+                .words
+                .iter()
+                .map(|w| LyricWord {
+                    text: w.text.trim().into(),
+                    start: ms(w.start_ms),
+                    end: ms(w.end_ms),
+                })
+                .collect();
+            LyricRow {
+                text: line.text.clone().into(),
+                start,
+                next,
+                words: ModelRc::from(Rc::new(VecModel::from(words))),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_rows_updates_in_place() {
+        use slint::Model as _;
+        let m = slint::VecModel::from(vec![1, 2, 3, 4]);
+        super::sync_rows(&m, vec![2, 3, 4]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), [2, 3, 4]);
+        super::sync_rows(&m, vec![2, 9, 4, 5, 6]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), [2, 9, 4, 5, 6]);
+        super::sync_rows(&m, Vec::new());
+        assert_eq!(m.row_count(), 0);
+    }
+
+    #[test]
+    fn lyrics_position_lights_words() {
+        use tonearm_core::library::lyrics::LyricWord;
+        let word = |s, e| LyricWord {
+            start_ms: s,
+            end_ms: e,
+            text: "x".into(),
+        };
+        let lines = vec![
+            super::LyricLine {
+                start_ms: Some(1000),
+                text: "a b".into(),
+                words: vec![word(1000, 1500), word(1500, 2000)],
+            },
+            super::LyricLine {
+                start_ms: Some(3000),
+                text: "c".into(),
+                words: vec![word(3000, 3500)],
+            },
+        ];
+        assert_eq!(super::lyrics_at(&lines, 500), (None, None, Some(1000)));
+        assert_eq!(
+            super::lyrics_at(&lines, 1200),
+            (Some(0), Some(0), Some(1500))
+        );
+        assert_eq!(
+            super::lyrics_at(&lines, 2500),
+            (Some(0), Some(1), Some(3000))
+        );
+        assert_eq!(super::lyrics_at(&lines, 9000), (Some(1), Some(0), None));
+    }
+
     use super::*;
 
     #[test]

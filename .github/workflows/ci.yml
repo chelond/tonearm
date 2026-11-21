@@ -63,6 +63,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
+      # Last.fm API account built into release binaries (repository secrets; empty = no scrobbling).
+      TONEARM_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+      TONEARM_LASTFM_SECRET: ${{ secrets.LASTFM_API_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

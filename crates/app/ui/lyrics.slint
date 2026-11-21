@@ -1,0 +1,112 @@
+// Synced lyrics: the song's lines follow the playback, the current one in the upper third, its
+// words lighting up as they are sung.
+import { Fonts } from "theme.slint";
+
+// start/end in ms of the song.
+export struct LyricWord { text: string, start: int, end: int }
+// start: -1 for unsynced lyrics; next: when the following line starts.
+export struct LyricRow { text: string, start: int, next: int, words: [LyricWord] }
+
+component Word inherits Rectangle {
+    in property <string> text;
+    // The word's line is the current one.
+    in property <bool> active;
+    // Already sung (or being sung).
+    in property <bool> lit;
+    in property <length> size;
+    width: base.preferred-width;
+    height: base.preferred-height;
+    base := Text {
+        x: 0;
+        y: 0;
+        text: root.text;
+        font-family: Fonts.display;
+        font-weight: 700;
+        font-size: root.size;
+        color: !root.active || root.lit ? #FFFFFF : #FFFFFF59;
+        animate color { duration: 150ms; easing: ease-out; }
+    }
+}
+
+component Line inherits Rectangle {
+    in property <LyricRow> line;
+    in property <bool> active;
+    in property <bool> past;
+    // Index of the word being sung in this line, -1 before the first.
+    in property <int> word;
+    in property <length> size;
+    callback clicked();
+    // Lines further from the current one fade out.
+    opacity: root.active ? 1 : root.past ? 0.38 : 0.5;
+    animate opacity { duration: 400ms; easing: ease-out; }
+    min-height: root.line.words.length == 0 && root.line.text == "" ? 8px : 0px;
+    VerticalLayout {
+        padding-top: 6px;
+        padding-bottom: 6px;
+        // The current line steps in a little (no animation: it would lay the line out each frame).
+        padding-left: root.active ? 10px : 0px;
+        if root.line.words.length > 0: FlexboxLayout {
+            spacing-horizontal: root.size * 0.28;
+            spacing-vertical: 2px;
+            for w[k] in root.line.words: Word {
+                text: w.text;
+                active: root.active;
+                lit: k <= root.word;
+                size: root.size;
+            }
+        }
+        if root.line.words.length == 0 && root.line.text != "": Text {
+            text: root.line.text;
+            font-family: Fonts.display;
+            font-weight: 700;
+            font-size: root.size;
+            color: #FFFFFF;
+            wrap: word-wrap;
+        }
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component LyricsView inherits Rectangle {
+    in property <[LyricRow]> lines;
+    // The current line and word, moved on by the app exactly when they change: nothing here
+    // runs on a frame clock, so the screen stays still between words.
+    in property <int> current-line: -1;
+    in property <int> current-word: -1;
+    in property <length> size: 30px;
+    callback seek-to(int);
+
+    property <length> focus-y: 0;
+    lyr := Flickable {
+        interactive: false;
+        content-height: col.preferred-height + root.height;
+        content-y: min(0px, -(root.focus-y - root.height * 0.36));
+        animate content-y { duration: 550ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+        col := VerticalLayout {
+            width: lyr.width;
+            padding-top: 24px;
+            alignment: start;
+            for l[i] in root.lines: Line {
+                property <bool> current: i == root.current-line;
+                line: l;
+                active: self.current;
+                past: i < root.current-line;
+                word: self.current ? root.current-word : -1;
+                size: root.size;
+                init => {
+                    if self.current { root.focus-y = self.y + self.height / 2; }
+                }
+                changed current => {
+                    if self.current { root.focus-y = self.y + self.height / 2; }
+                }
+                changed y => {
+                    if self.current { root.focus-y = self.y + self.height / 2; }
+                }
+                clicked => { root.seek-to(l.start); }
+            }
+        }
+    }
+}

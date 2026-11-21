@@ -15,7 +15,7 @@ use librespot_protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
 use reqwest::Method;
 
-use super::metadata::{fill_album_covers, image_url, track_item};
+use super::metadata::{fill_album_covers, fill_artist_images, image_url, track_item};
 use super::model::{CollectionKind, PageHeader, PlaylistSummary, SearchResults, Tile, TrackItem};
 
 /// Parallel metadata requests (per-user limit; the official client does far more).
@@ -325,7 +325,7 @@ pub async fn search(session: &Session, query: &str) -> Result<SearchResults, Int
         })
         .collect();
     let mut seen = HashSet::new();
-    let artists: Vec<Tile> = found
+    let mut artists: Vec<Tile> = found
         .iter()
         .flat_map(|t| t.artists.iter())
         .filter(|a| seen.insert(a.id.to_uri().unwrap_or_default()))
@@ -338,6 +338,7 @@ pub async fn search(session: &Session, query: &str) -> Result<SearchResults, Int
             image_url: None,
         })
         .collect();
+    fill_artist_images(session, &mut artists).await;
     Ok(SearchResults {
         tracks: found.iter().map(track_item).collect(),
         albums,

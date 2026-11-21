@@ -33,6 +33,8 @@ pub struct SoloistConfig {
     pub cache_dir: PathBuf,
     /// The Spotify Connect name.
     pub device_name: String,
+    /// PipeWire node to play into (Tonearm's equalizer sink); `None` = the system default.
+    pub pipewire_device: Option<String>,
 }
 
 impl std::fmt::Debug for SoloistConfig {
@@ -174,6 +176,7 @@ async fn supervise(
             data_dir: cfg.root.join("data"),
             cache_dir: cfg.cache_dir.clone(),
             volume,
+            pipewire_device: cfg.pipewire_device.as_deref(),
         };
         let spawned = match process::spawn(&args, cfg.root.join("soloist.log")).await {
             Ok(s) => s,
@@ -570,6 +573,7 @@ mod tests {
             root: PathBuf::new(),
             cache_dir: PathBuf::new(),
             device_name: "Tonearm".into(),
+            pipewire_device: None,
         };
         assert!(!format!("{c:?}").contains("secret-key"));
     }
