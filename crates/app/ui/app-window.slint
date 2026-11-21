@@ -947,6 +947,10 @@ export component AppWindow inherits Window {
     property <length> drag-dy;
     property <bool> playing-now: root.play-view == PlayView.playing;
     in-out property <length> coll-scroll;             // collection list scroll (header collapses)
+    // Kept as state, not a binding on coll-scroll: the header height changes the list's height,
+    // which clamps the scroll, which would change the header again (a binding loop on short
+    // pages such as an artist's). Collapses past 24 px, expands only back at the top.
+    property <bool> coll-compact: false;
 
     callback login();
     callback cancel-login();
@@ -1116,7 +1120,11 @@ export component AppWindow inherits Window {
         if self.page == Page.stats { root.stats-opened(); }
         self.lyrics-open = false;
     }
-    changed active-uri => { self.coll-scroll = 0; }
+    changed active-uri => { self.coll-scroll = 0; self.coll-compact = false; }
+    changed coll-scroll => {
+        if self.coll-scroll < -24px { self.coll-compact = true; }
+        else if self.coll-scroll >= 0 { self.coll-compact = false; }
+    }
     changed palette-open => {
         if !self.palette-open { keys.focus(); }
     }
@@ -1704,7 +1712,7 @@ export component AppWindow inherits Window {
                     if root.page == Page.collection: PageIn {
                         coll := VerticalLayout {
                             // header: collapses while the list scrolls
-                            property <bool> compact: root.coll-scroll < -24px;
+                            property <bool> compact: root.coll-compact;
                             Rectangle {
                                 height: coll.compact ? 96px : 252px;
                                 animate height { duration: Theme.normal; easing: ease-out; }
