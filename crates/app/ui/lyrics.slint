@@ -1,6 +1,5 @@
 // Synced lyrics: the song's lines follow the playback, the current one in the upper third, its
-// words filling in as they are sung. Only the current line reads the clock, so the rest of the
-// screen is not redrawn while it plays.
+// words lighting up as they are sung.
 import { Fonts } from "theme.slint";
 
 // start/end in ms of the song.
@@ -9,48 +8,23 @@ export struct LyricWord { text: string, start: int, end: int }
 export struct LyricRow { text: string, start: int, next: int, words: [LyricWord] }
 
 component Word inherits Rectangle {
-    in property <LyricWord> word;
+    in property <string> text;
+    // The word's line is the current one.
     in property <bool> active;
-    in property <int> now;
+    // Already sung (or being sung).
+    in property <bool> lit;
     in property <length> size;
-    // 0 → 1 while the word is sung.
-    property <float> fill: root.active
-        ? max(0, min(1, (root.now - root.word.start) / max(1, root.word.end - root.word.start)))
-        : 0;
-    // The word being sung rises a little.
-    property <bool> singing: root.fill > 0 && root.fill < 1;
     width: base.preferred-width;
     height: base.preferred-height;
-    lift := Rectangle {
-        y: root.singing ? -3px : 0px;
-        animate y { duration: 220ms; easing: ease-out; }
-        base := Text {
-            x: 0;
-            y: 0;
-            text: root.word.text;
-            font-family: Fonts.display;
-            font-weight: 700;
-            font-size: root.size;
-            color: root.active ? #FFFFFF59 : #FFFFFF;
-            animate color { duration: 350ms; }
-        }
-        if root.active: Rectangle {
-            x: 0;
-            y: 0;
-            width: base.width * root.fill;
-            height: base.height;
-            clip: true;
-            Text {
-                x: 0;
-                y: 0;
-                width: base.width;
-                text: root.word.text;
-                font-family: Fonts.display;
-                font-weight: 700;
-                font-size: root.size;
-                color: #FFFFFF;
-            }
-        }
+    base := Text {
+        x: 0;
+        y: 0;
+        text: root.text;
+        font-family: Fonts.display;
+        font-weight: 700;
+        font-size: root.size;
+        color: !root.active || root.lit ? #FFFFFF : #FFFFFF59;
+        animate color { duration: 150ms; easing: ease-out; }
     }
 }
 
@@ -58,26 +32,26 @@ component Line inherits Rectangle {
     in property <LyricRow> line;
     in property <bool> active;
     in property <bool> past;
-    in property <int> now;
+    // Index of the word being sung in this line, -1 before the first.
+    in property <int> word;
     in property <length> size;
     callback clicked();
     // Lines further from the current one fade out.
     opacity: root.active ? 1 : root.past ? 0.38 : 0.5;
-    animate opacity { duration: 450ms; easing: ease-out; }
+    animate opacity { duration: 400ms; easing: ease-out; }
     min-height: root.line.words.length == 0 && root.line.text == "" ? 8px : 0px;
     VerticalLayout {
         padding-top: 6px;
         padding-bottom: 6px;
-        // The current line steps in a little.
+        // The current line steps in a little (no animation: it would lay the line out each frame).
         padding-left: root.active ? 10px : 0px;
-        animate padding-left { duration: 500ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
         if root.line.words.length > 0: FlexboxLayout {
             spacing-horizontal: root.size * 0.28;
             spacing-vertical: 2px;
-            for w in root.line.words: Word {
-                word: w;
+            for w[k] in root.line.words: Word {
+                text: w.text;
                 active: root.active;
-                now: root.now;
+                lit: k <= root.word;
                 size: root.size;
             }
         }
@@ -98,55 +72,29 @@ component Line inherits Rectangle {
 
 export component LyricsView inherits Rectangle {
     in property <[LyricRow]> lines;
-    in property <int> position-ms;
-    in property <bool> playing;
+    // The current line and word, moved on by the app exactly when they change: nothing here
+    // runs on a frame clock, so the screen stays still between words.
+    in property <int> current-line: -1;
+    in property <int> current-word: -1;
     in property <length> size: 30px;
     callback seek-to(int);
-
-    // The song's clock, run on between the player's position reports (a few a second) from the
-    // time that really passed: a busy frame delays a step, it does not slow the song down.
-    property <int> now: root.position-ms;
-    property <int> base-pos: root.position-ms;
-    property <duration> base-tick;
-    // A line shows a little early: reading lags behind hearing.
-    property <int> lead: 150;
-    function anchor(ms: int) {
-        root.base-pos = ms;
-        root.base-tick = animation-tick();
-        root.now = ms;
-    }
-    init => { root.anchor(root.position-ms); }
-    changed position-ms => {
-        // Small corrections backwards are skipped so the fill never jerks back.
-        if root.position-ms > root.now || root.position-ms < root.now - 400 {
-            root.anchor(root.position-ms);
-        }
-    }
-    changed playing => { root.anchor(root.now); }
-    Timer {
-        interval: 33ms;
-        running: root.playing;
-        triggered => {
-            root.now = root.base-pos + round((animation-tick() - root.base-tick) / 1ms);
-        }
-    }
 
     property <length> focus-y: 0;
     lyr := Flickable {
         interactive: false;
         content-height: col.preferred-height + root.height;
         content-y: min(0px, -(root.focus-y - root.height * 0.36));
-        animate content-y { duration: 700ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+        animate content-y { duration: 550ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
         col := VerticalLayout {
             width: lyr.width;
             padding-top: 24px;
             alignment: start;
             for l[i] in root.lines: Line {
-                property <bool> current: root.now + root.lead >= l.start && root.now + root.lead < l.next;
+                property <bool> current: i == root.current-line;
                 line: l;
                 active: self.current;
-                past: root.now + root.lead >= l.next;
-                now: root.now;
+                past: i < root.current-line;
+                word: self.current ? root.current-word : -1;
                 size: root.size;
                 init => {
                     if self.current { root.focus-y = self.y + self.height / 2; }

@@ -895,6 +895,8 @@ export component AppWindow inherits Window {
     in property <[LyricRow]> lyrics;
     in property <bool> lyrics-synced;
     in property <bool> lyrics-word-synced;            // the source timed each word
+    in property <int> lyrics-line: -1;                // synced: the line and word being sung
+    in property <int> lyrics-word: -1;
     in property <string> lyrics-status;               // "" shown, else "Загружаем…" / "Текста нет"
     in property <string> lyrics-provider;
     // quick jump (Ctrl+K)
@@ -2324,8 +2326,8 @@ export component AppWindow inherits Window {
                             if root.lyrics-status == "" && root.lyrics-synced: LyricsView {
                                 vertical-stretch: 1;
                                 lines: root.lyrics;
-                                position-ms: root.position-ms;
-                                playing: root.play-view == PlayView.playing;
+                                current-line: root.lyrics-line;
+                                current-word: root.lyrics-word;
                                 seek-to(ms) => {
                                     if root.duration-ms > 0 { root.seek(ms / root.duration-ms); }
                                 }

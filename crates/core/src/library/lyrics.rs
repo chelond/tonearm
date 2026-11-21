@@ -462,8 +462,8 @@ fn lrc_time(s: &str) -> Option<u32> {
 }
 
 /// Gives every synced line word timings: closes open-ended real ones and spreads the line's
-/// time over its words by length for the rest. Breaks between verses (empty lines) become one
-/// "• • •" word that fills over the break.
+/// time over its words by length for the rest. Breaks between verses (empty lines) become
+/// "• • •", the dots lighting up one by one over the break.
 pub fn estimate_words(lines: &mut [LyricLine], duration_ms: u32) {
     let starts: Vec<Option<u32>> = lines.iter().map(|l| l.start_ms).collect();
     for (i, line) in lines.iter_mut().enumerate() {
@@ -489,11 +489,15 @@ pub fn estimate_words(lines: &mut [LyricLine], duration_ms: u32) {
         }
         if line.text.is_empty() {
             if gap >= 3000 {
-                line.words.push(LyricWord {
-                    start_ms: start,
-                    end_ms: next.saturating_sub(300).max(start + 1),
-                    text: "• • •".into(),
-                });
+                let end = next.saturating_sub(300).max(start + 3);
+                let step = (end - start) / 3;
+                for k in 0..3 {
+                    line.words.push(LyricWord {
+                        start_ms: start + step * k,
+                        end_ms: if k == 2 { end } else { start + step * (k + 1) },
+                        text: "•".into(),
+                    });
+                }
             }
             continue;
         }
@@ -590,8 +594,9 @@ mod tests {
             "not stretched over the break"
         );
         assert!(w.windows(2).all(|p| p[0].end_ms <= p[1].start_ms));
-        assert_eq!(l[1].words[0].text, "• • •");
-        assert_eq!(l[1].words[0].end_ms, 39_700);
+        assert_eq!(l[1].words.len(), 3);
+        assert_eq!(l[1].words[0].text, "•");
+        assert_eq!(l[1].words[2].end_ms, 39_700);
         assert!(l[2].words[0].end_ms <= 45_000);
     }
 

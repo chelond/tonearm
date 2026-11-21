@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use slint::{Color, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use tonearm_core::covers::Cover;
-use tonearm_core::library::lyrics::LyricLine;
+use tonearm_core::library::lyrics::{LyricLine, current_line};
 use tonearm_core::library::{
     CollectionKind, LibraryCommand, LibraryEvent, PageHeader, PageRequest, PlaylistSummary,
     SearchKind, SearchResults, Tile, TrackItem, format_duration,
@@ -126,6 +126,10 @@ pub struct UiState {
     /// Last session's track, shown paused until play is pressed.
     resume: Option<Resume>,
     lyrics_uri: String,
+    /// Timed lines of the shown lyrics (empty when not synced).
+    lyrics: Vec<LyricLine>,
+    /// Last reported position and when it came: the song clock between reports.
+    pos_anchor: (u32, Option<std::time::Instant>),
     /// Lyrics already requested for this track (the answer is on its way).
     lyrics_asked: String,
     /// The player reported the track only partly; its details are on the way.
@@ -872,6 +876,13 @@ impl UiState {
                     }
                     Some(l) => {
                         w.set_lyrics(ModelRc::from(Rc::new(VecModel::from(lyric_rows(&l.lines)))));
+                        w.set_lyrics_line(-1);
+                        w.set_lyrics_word(-1);
+                        self.lyrics = if l.synced {
+                            l.lines.clone()
+                        } else {
+                            Vec::new()
+                        };
                         w.set_lyrics_synced(l.synced);
                         w.set_lyrics_word_synced(l.word_synced);
                         w.set_lyrics_provider(l.provider.into());
@@ -1456,7 +1467,9 @@ impl UiState {
         // Lyrics: reload for the new track if the panel is open, otherwise when it opens.
         self.lyrics_uri.clear();
         self.lyrics_asked.clear();
+        self.lyrics.clear();
         w.set_lyrics(ModelRc::default());
+        w.set_lyrics_line(-1);
         // Fetched ahead, so the lyrics are there the moment they are opened.
         fx.extend(self.lyrics_opened(w));
         fx.push(self.save_resume(0));
@@ -1505,6 +1518,38 @@ impl UiState {
             }
         }
         fx
+    }
+
+    /// The player reported (or the user set) a position.
+    pub fn position_changed(&mut self, w: &AppWindow) {
+        let pos = u32::try_from(w.get_position_ms()).unwrap_or(0);
+        self.pos_anchor = (pos, Some(std::time::Instant::now()));
+    }
+
+    /// Lights the current lyrics line and word. Returns when the next one is due, `None` when
+    /// nothing will change by itself (closed, paused, unsynced): the screen is redrawn only when
+    /// a word or a line changes, never on a frame clock.
+    pub fn lyrics_step(&mut self, w: &AppWindow) -> Option<std::time::Duration> {
+        if self.lyrics.is_empty() || !w.get_lyrics_open() {
+            return None;
+        }
+        let playing = w.get_play_view() == PlayView::Playing;
+        let (base, at) = self.pos_anchor;
+        let elapsed = at.filter(|_| playing).map_or(0, |t| {
+            u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX)
+        });
+        // A little early: reading lags behind hearing.
+        let pos = base.saturating_add(elapsed).saturating_add(LYRICS_LEAD_MS);
+        let (line, word, next) = lyrics_at(&self.lyrics, pos);
+        let to_i32 = |v: Option<usize>| v.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1);
+        if w.get_lyrics_line() != to_i32(line) {
+            w.set_lyrics_line(to_i32(line));
+        }
+        if w.get_lyrics_word() != to_i32(word) {
+            w.set_lyrics_word(to_i32(word));
+        }
+        let next = next?;
+        playing.then(|| std::time::Duration::from_millis(u64::from(next - pos).clamp(15, 2000) + 5))
     }
 
     pub fn lyrics_opened(&mut self, w: &AppWindow) -> Vec<Effect> {
@@ -2260,6 +2305,25 @@ fn merge_track(track: &mut TrackInfo, from: &TrackItem) {
     }
 }
 
+const LYRICS_LEAD_MS: u32 = 150;
+
+/// The line and word sung at `pos`, and when the next word or line starts.
+fn lyrics_at(lines: &[LyricLine], pos: u32) -> (Option<usize>, Option<usize>, Option<u32>) {
+    let line = current_line(lines, pos);
+    let words = line.map_or(&[][..], |i| lines[i].words.as_slice());
+    let word = words.partition_point(|w| w.start_ms <= pos).checked_sub(1);
+    let next_word = words.iter().map(|w| w.start_ms).find(|&s| s > pos);
+    let next_line = lines[line.map_or(0, |i| i + 1)..]
+        .iter()
+        .filter_map(|l| l.start_ms)
+        .find(|&s| s > pos);
+    let next = match (next_word, next_line) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    (line, word, next)
+}
+
 /// Lyrics lines for the overlay; times in ms of the song (`-1`: not synced).
 fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
     let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
@@ -2295,6 +2359,38 @@ fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lyrics_position_lights_words() {
+        use tonearm_core::library::lyrics::LyricWord;
+        let word = |s, e| LyricWord {
+            start_ms: s,
+            end_ms: e,
+            text: "x".into(),
+        };
+        let lines = vec![
+            super::LyricLine {
+                start_ms: Some(1000),
+                text: "a b".into(),
+                words: vec![word(1000, 1500), word(1500, 2000)],
+            },
+            super::LyricLine {
+                start_ms: Some(3000),
+                text: "c".into(),
+                words: vec![word(3000, 3500)],
+            },
+        ];
+        assert_eq!(super::lyrics_at(&lines, 500), (None, None, Some(1000)));
+        assert_eq!(
+            super::lyrics_at(&lines, 1200),
+            (Some(0), Some(0), Some(1500))
+        );
+        assert_eq!(
+            super::lyrics_at(&lines, 2500),
+            (Some(0), Some(1), Some(3000))
+        );
+        assert_eq!(super::lyrics_at(&lines, 9000), (Some(1), Some(0), None));
+    }
+
     use super::*;
 
     #[test]

@@ -562,6 +562,8 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             os_media::on_state(state, position_ms);
             w.set_play_view(ui_state::play_view(state));
             w.set_position_ms(i32::try_from(position_ms).unwrap_or(i32::MAX));
+            ui_state::with(|st| st.position_changed(w));
+            lyrics_kick(w);
         }
         PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
         PlayerEvent::Track(track) => {
@@ -631,6 +633,7 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
                 PlayView::Paused
             });
             w.set_position_ms(i32::try_from(state.progress_ms).unwrap_or(0));
+            ui_state::with(|st| st.position_changed(w));
             if let Some(v) = state.device.volume_percent {
                 w.set_volume_level((i32::from(v) * 12 + 50) / 100);
             }
@@ -700,6 +703,28 @@ fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
     }
     let fx = ui_state::with(|st| st.on_library(w, event));
     s.run(fx);
+    lyrics_kick(w);
+}
+
+thread_local! {
+    static LYRICS_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// Moves the lyrics highlight on and sets a timer for exactly the next word, so an open lyrics
+/// screen costs a redraw per word instead of one per frame.
+fn lyrics_kick(w: &AppWindow) {
+    let next = ui_state::with(|st| st.lyrics_step(w));
+    LYRICS_TIMER.with(|t| match next {
+        Some(delay) => {
+            let weak = w.as_weak();
+            t.start(slint::TimerMode::SingleShot, delay, move || {
+                if let Some(w) = weak.upgrade() {
+                    lyrics_kick(&w);
+                }
+            });
+        }
+        None => t.stop(),
+    });
 }
 
 /// "Доброе утро" … by the local hour.
@@ -1111,6 +1136,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(w) = s.window.upgrade() {
             let fx = ui_state::with(|st| st.lyrics_opened(&w));
             s.run(fx);
+            lyrics_kick(&w);
         }
     });
     let s = senders.clone();
@@ -1258,6 +1284,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let ms = (f64::from(ratio.clamp(0.0, 1.0)) * f64::from(w.get_duration_ms())) as u32;
             s.player(PlayerCommand::Seek { position_ms: ms });
             w.set_position_ms(i32::try_from(ms).unwrap_or(0));
+            ui_state::with(|st| st.position_changed(&w));
+            lyrics_kick(&w);
         }
     });
     let s = senders.clone();
@@ -1297,10 +1325,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if !w.get_remote_name().is_empty() && playing {
                     let next = (w.get_position_ms() + 1000).min(w.get_duration_ms());
                     w.set_position_ms(next);
+                    ui_state::with(|st| st.position_changed(&w));
                 }
                 ui_state::with(|st| st.watch_theme(&w));
                 let fx = ui_state::with(|st| st.tick(&w, playing));
                 tick_senders.run(fx);
+                // Catches play/pause, opening and closing the lyrics.
+                lyrics_kick(&w);
             }
         },
     );
@@ -1686,6 +1717,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
         });
     }
     w.set_position_ms(84_000);
+    ui_state::with(|st| st.position_changed(w));
     w.set_play_view(PlayView::Playing);
 }
 
