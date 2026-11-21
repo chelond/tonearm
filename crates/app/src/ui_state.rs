@@ -487,7 +487,11 @@ impl UiState {
         });
         while self.page_cache.len() > PAGE_CACHE
             || (self.page_cache.len() > 1
-                && self.page_cache.iter().map(|c| c.tracks.len()).sum::<usize>()
+                && self
+                    .page_cache
+                    .iter()
+                    .map(|c| c.tracks.len())
+                    .sum::<usize>()
                     > PAGE_CACHE_TRACKS)
         {
             self.page_cache.remove(0);

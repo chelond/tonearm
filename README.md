@@ -201,6 +201,9 @@ Tonearm проверяет GitHub Releases при запуске и раз в с
 3. Сборки Soloist живут 90 дней, Tonearm сам скачивает новую, когда текущей больше 60 дней.
 
 С Soloist настройки качества, нормализации и аудиовыхода не действуют: они только для встроенного плеера.
+Зато на Linux с PipeWire с Soloist работают эквалайзер, плавный переход и визуализатор (Настройки → Эффекты):
+Tonearm запускает `pipewire -c` со своим устройством «Tonearm» (filter-chain) и направляет Soloist в него.
+На Windows Soloist играет прямо в системное устройство, туда встроиться нельзя.
 Журнал Soloist: `soloist/soloist.log` в папке данных Tonearm.
 </details>
 
@@ -254,7 +257,7 @@ docs/          дизайн и заметки о решениях
 
 Интерфейс можно смотреть без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран:
 `home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `lyrics`, `lyrics-plain`, `mini`, `palette`, `stats`, `menu`,
-`devices`, `settings`, `login`, `waiting`, `offline`, `update`, `update-downloading`, `update-failed`.
+`devices`, `settings`, `effects`, `login`, `waiting`, `offline`, `update`, `update-downloading`, `update-failed`.
 
 Рендерер по умолчанию программный (так меньше памяти). OpenGL можно попробовать через
 `SLINT_BACKEND=winit-femtovg tonearm`.

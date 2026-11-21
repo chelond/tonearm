@@ -12,13 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use slint::Model;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
-use tonearm_core::config::{BITRATES, CACHE_SIZES_MB, Settings};
+use tonearm_core::config::{BITRATES, CACHE_SIZES_MB, FADE_SECS, Settings};
 use tonearm_core::connect::{ConnectCommand, ConnectEvent, RemoteAction};
 use tonearm_core::covers::CoverCache;
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
+use tonearm_player::effects::{self, EffectsOptions};
 use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
 use ui_state::{CoverTarget, Effect, UiState};
 
@@ -124,6 +126,7 @@ fn soloist_config(api_key: String) -> Option<SoloistConfig> {
         root,
         cache_dir,
         device_name: tonearm_player::soloist::DEVICE_NAME.into(),
+        pipewire_device: None,
     })
 }
 
@@ -205,6 +208,9 @@ impl Senders {
         }
         if new.audio != current.audio {
             self.local(PlayerCommand::Configure(audio_options(&new)));
+        }
+        if new.effects != current.effects {
+            self.local(PlayerCommand::Effects(effects_options(&new)));
         }
         if new.player != current.player {
             if new.player.soloist {
@@ -600,6 +606,19 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             );
             w.set_notice_is_error(true);
         }
+        PlayerEvent::Spectrum(frame) => {
+            let bars = w.get_spectrum();
+            for (i, v) in frame.iter().enumerate() {
+                let v = f32::from(*v) / 255.0;
+                if bars
+                    .row_data(i)
+                    .is_some_and(|old| (old - v).abs() > f32::EPSILON)
+                {
+                    bars.set_row_data(i, v);
+                }
+            }
+        }
+        PlayerEvent::Effects(status) => w.set_effects_status(status.unwrap_or_default().into()),
         PlayerEvent::Soloist(status) => {
             let (line, detail, retry) = soloist_text(&status);
             w.set_soloist_status(line.into());
@@ -801,6 +820,38 @@ fn audio_options(s: &Settings) -> AudioOptions {
     }
 }
 
+fn effects_options(s: &Settings) -> EffectsOptions {
+    let fx = &s.effects;
+    let gains = effects::preset(&fx.eq_preset).map_or_else(
+        || {
+            let mut g = [0i8; 10];
+            for (d, v) in g.iter_mut().zip(&fx.eq_gains) {
+                *d = *v;
+            }
+            g
+        },
+        |p| p.gains,
+    );
+    EffectsOptions {
+        eq: fx.eq.then_some(gains),
+        fade_ms: u32::from(fx.fade_secs) * 1000,
+        visualizer: fx.visualizer,
+    }
+}
+
+/// The equalizer's preset list: the built-in ones, then «Свой» (the user's own bands).
+fn eq_preset_index(id: &str) -> usize {
+    effects::PRESETS
+        .iter()
+        .position(|p| p.id == id)
+        .unwrap_or(effects::PRESETS.len())
+}
+
+fn set_eq_gains(w: &AppWindow, gains: &[i8]) {
+    let model: Vec<i32> = gains.iter().map(|&g| i32::from(g)).collect();
+    w.set_eq_gains(slint::ModelRc::new(slint::VecModel::from(model)));
+}
+
 fn index_of<T: PartialEq>(values: &[T], value: &T, default: usize) -> i32 {
     let i = values.iter().position(|v| v == value).unwrap_or(default);
     i32::try_from(i).unwrap_or(0)
@@ -838,6 +889,22 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_cache(i32::try_from(cache).unwrap_or(2));
     w.set_set_engine(i32::from(s.player.soloist));
     w.set_set_update_check(i32::from(s.update.check));
+    w.set_effects_supported(effects::supported());
+    let names: Vec<slint::SharedString> = effects::PRESETS
+        .iter()
+        .map(|p| p.name.into())
+        .chain(std::iter::once("Свой".into()))
+        .collect();
+    w.set_eq_preset_names(slint::ModelRc::new(slint::VecModel::from(names)));
+    w.set_set_eq(i32::from(s.effects.eq));
+    let preset = eq_preset_index(&s.effects.eq_preset);
+    w.set_set_eq_preset(i32::try_from(preset).unwrap_or(0));
+    match effects::PRESETS.get(preset) {
+        Some(p) => set_eq_gains(w, &p.gains),
+        None => set_eq_gains(w, &s.effects.eq_gains),
+    }
+    w.set_set_fade(index_of(&FADE_SECS, &s.effects.fade_secs, 0));
+    w.set_set_visualizer(i32::from(s.effects.visualizer));
 }
 
 /// The settings page → Settings (keeps what the page does not show, like the Client ID).
@@ -853,6 +920,19 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
     s.update.check = w.get_set_update_check() != 0;
+    s.effects.eq = w.get_set_eq() != 0;
+    let preset = usize::try_from(w.get_set_eq_preset()).unwrap_or(0);
+    s.effects.eq_preset = effects::PRESETS
+        .get(preset)
+        .map_or("custom", |p| p.id)
+        .into();
+    s.effects.eq_gains = w
+        .get_eq_gains()
+        .iter()
+        .map(|g| i8::try_from(g.clamp(-12, 12)).unwrap_or(0))
+        .collect();
+    s.effects.fade_secs = FADE_SECS[pick(w.get_set_fade(), FADE_SECS.len())];
+    s.effects.visualizer = w.get_set_visualizer() != 0;
     s
 }
 
@@ -932,6 +1012,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
+    senders.local(PlayerCommand::Effects(effects_options(&settings)));
+    window.set_spectrum(slint::ModelRc::new(slint::VecModel::from(vec![
+        0.0f32;
+        effects::spectrum::BARS
+    ])));
     let updater = updater::Updater::new(
         runtime.handle().clone(),
         window.as_weak(),
@@ -975,6 +1060,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     window.on_soloist_retry(move || s.local(PlayerCommand::SoloistRetry));
     let s = senders.clone();
     window.on_settings_changed(move || s.settings_changed());
+    let s = senders.clone();
+    window.on_eq_preset_picked(move |i| {
+        let Some(w) = s.window.upgrade() else { return };
+        let i = usize::try_from(i).unwrap_or(0);
+        w.set_set_eq_preset(i32::try_from(i).unwrap_or(0));
+        if let Some(p) = effects::PRESETS.get(i) {
+            set_eq_gains(&w, &p.gains);
+        } else if let Ok(saved) = s.settings.lock() {
+            // «Свой»: the bands as they were last set by hand.
+            if saved.effects.eq_preset == "custom" {
+                set_eq_gains(&w, &saved.effects.eq_gains);
+            }
+        }
+        s.settings_changed();
+    });
+    let s = senders.clone();
+    window.on_eq_band_committed(move |band, db| {
+        let Some(w) = s.window.upgrade() else { return };
+        let gains = w.get_eq_gains();
+        if let Ok(band) = usize::try_from(band) {
+            gains.set_row_data(band, db.clamp(-12, 12));
+        }
+        w.set_set_eq_preset(i32::try_from(effects::PRESETS.len()).unwrap_or(0));
+        s.settings_changed();
+    });
     let s = senders.clone();
     window.on_theme_picked(move |id| {
         if let Some(w) = s.window.upgrade() {
@@ -1655,7 +1765,19 @@ fn preview(w: &AppWindow, senders: &Senders) {
     if screen == "library" {
         w.set_page(Page::Library);
     }
-    if screen == "settings" {
+    if screen == "effects" {
+        w.set_set_engine(1);
+        w.set_set_eq(1);
+        w.set_set_eq_preset(1);
+        set_eq_gains(w, &effects::PRESETS[1].gains);
+        w.set_set_fade(2);
+        w.set_set_visualizer(1);
+        let bars = [
+            0.9, 0.8, 0.95, 0.7, 0.55, 0.6, 0.45, 0.5, 0.4, 0.35, 0.3, 0.25, 0.2, 0.12,
+        ];
+        w.set_spectrum(slint::ModelRc::new(slint::VecModel::from(bars.to_vec())));
+    }
+    if screen == "settings" || screen == "effects" {
         w.set_page(Page::Settings);
         w.set_username("nightowl".into());
         w.set_cache_used_mb(214);

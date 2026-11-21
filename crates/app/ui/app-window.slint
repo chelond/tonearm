@@ -608,6 +608,79 @@ component SettingRow inherits Rectangle {
     }
 }
 
+// One equalizer band: a vertical slider, −12…+12 dB, filled from the centre line.
+component EqBand inherits Rectangle {
+    in property <int> gain;
+    in property <string> label;
+    callback committed(int);
+    property <bool> dragging: false;
+    property <int> drag-gain;
+    property <int> shown: self.dragging ? self.drag-gain : self.gain;
+    property <length> track-top: 26px;
+    property <length> track-h: 112px;
+    property <length> mid: self.track-top + self.track-h / 2;
+    property <length> knob-y: self.track-top + self.track-h * (12 - self.shown) / 24;
+    pure function gain-at(y: length) -> int {
+        return max(-12, min(12, round(12 - (y - root.track-top) / root.track-h * 24)));
+    }
+    width: 40px;
+    height: 164px;
+    Text {
+        y: 0;
+        width: parent.width;
+        height: 18px;
+        horizontal-alignment: center;
+        text: (root.shown > 0 ? "+" : "") + root.shown;
+        font-family: Fonts.mono;
+        font-size: 11px;
+        color: root.shown == 0 ? Theme.text-3 : Theme.text-1;
+    }
+    Rectangle { x: (parent.width - 4px) / 2; y: root.track-top; width: 4px; height: root.track-h; border-radius: 2px; background: Theme.line-2; }
+    Rectangle { x: (parent.width - 14px) / 2; y: root.mid; width: 14px; height: 1px; background: Theme.text-3; }
+    Rectangle {
+        x: (parent.width - 4px) / 2;
+        y: min(root.knob-y, root.mid);
+        width: 4px;
+        height: abs(root.knob-y - root.mid);
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.knob-y - self.height / 2;
+        width: touch.has-hover || root.dragging ? 16px : 12px;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Theme.text-1;
+        animate width { duration: Theme.fast; }
+    }
+    Text {
+        y: parent.height - 18px;
+        width: parent.width;
+        height: 18px;
+        horizontal-alignment: center;
+        text: root.label;
+        font-size: 11px;
+        color: Theme.text-3;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                root.dragging = true;
+                root.drag-gain = root.gain-at(self.mouse-y);
+            }
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.up && root.dragging {
+                root.dragging = false;
+                if root.drag-gain != root.gain { root.committed(root.drag-gain); }
+            }
+        }
+        moved => {
+            if root.dragging { root.drag-gain = root.gain-at(self.mouse-y); }
+        }
+    }
+}
+
 component MenuItem inherits Rectangle {
     in property <string> text;
     in property <string> icon;
@@ -953,6 +1026,18 @@ export component AppWindow inherits Window {
     in-out property <int> set-bitrate: 2;             // 96 | 160 | 320
     in-out property <int> set-normalisation;
     in-out property <int> set-gapless: 1;
+    // Equalizer, fades, visualizer (Linux + PipeWire, Soloist only)
+    in property <bool> effects-supported;
+    in property <string> effects-status;
+    in-out property <int> set-eq;
+    in-out property <int> set-eq-preset;             // index into eq-preset-names; last = своя
+    in property <[string]> eq-preset-names;
+    in property <[int]> eq-gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    in-out property <int> set-fade;                  // off | 2 | 4 | 6 | 8 s
+    in-out property <int> set-visualizer;
+    in property <[float]> spectrum;                  // 0..1 per bar
+    callback eq-preset-picked(int);
+    callback eq-band-committed(int /* band */, int /* dB */);
     in-out property <int> set-notifications: 1;
     // Themes: built-in and from the themes folder.
     in property <[ThemeCard]> themes;
@@ -2175,6 +2260,75 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+                                    if root.effects-supported: SettingsGroup {
+                                        title: "Эффекты";
+                                        SettingRow {
+                                            title: "Эквалайзер";
+                                            hint: root.effects-status != "" ? root.effects-status
+                                                : root.set-engine == 0 ? "Работает только с Soloist"
+                                                : "10 полос через PipeWire. При первом включении Soloist перезапустится";
+                                            last: root.set-eq == 0;
+                                            if root.set-eq == 1: Rectangle {
+                                                width: min(220px, preset-text.preferred-width + 52px);
+                                                height: 38px;
+                                                border-radius: 19px;
+                                                background: preset-touch.has-hover ? Theme.line-2 : Theme.hover;
+                                                HorizontalLayout {
+                                                    padding-left: 14px;
+                                                    padding-right: 12px;
+                                                    spacing: 8px;
+                                                    preset-text := Text {
+                                                        text: root.eq-preset-names.length > root.set-eq-preset ? root.eq-preset-names[root.set-eq-preset] : "";
+                                                        font-size: 13px;
+                                                        color: Theme.text-1;
+                                                        vertical-alignment: center;
+                                                        horizontal-stretch: 1;
+                                                    }
+                                                    VerticalLayout { alignment: center; Icon { name: "down"; size: 14px; } }
+                                                }
+                                                preset-touch := TouchArea { mouse-cursor: pointer; clicked => { preset-menu.show(); } }
+                                                preset-menu := PopupWindow {
+                                                    y: parent.height + 4px;
+                                                    x: parent.width - 200px;
+                                                    width: 200px;
+                                                    MenuPanel {
+                                                        for name[i] in root.eq-preset-names: MenuItem {
+                                                            text: name;
+                                                            clicked => { root.eq-preset-picked(i); }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-eq; changed => { root.settings-changed(); } } }
+                                        }
+                                        if root.set-eq == 1: Rectangle {
+                                            height: 196px;
+                                            Rectangle { x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: Theme.line; }
+                                            HorizontalLayout {
+                                                padding-left: 20px;
+                                                padding-right: 20px;
+                                                padding-top: 12px;
+                                                padding-bottom: 20px;
+                                                alignment: space-between;
+                                                for g[i] in root.eq-gains: EqBand {
+                                                    gain: g;
+                                                    label: ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"][i];
+                                                    committed(db) => { root.eq-band-committed(i, db); }
+                                                }
+                                            }
+                                        }
+                                        SettingRow {
+                                            title: "Плавный переход";
+                                            hint: "Конец трека затихает, следующий нарастает. Наложить два трека Soloist не даёт";
+                                            Segmented { items: ["Выкл", "2 с", "4 с", "6 с", "8 с"]; current <=> root.set-fade; changed => { root.settings-changed(); } }
+                                        }
+                                        SettingRow {
+                                            title: "Визуализатор";
+                                            hint: "Полоски под обложкой. Выключенный ничего не тратит";
+                                            last: true;
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-visualizer; changed => { root.settings-changed(); } } }
+                                        }
+                                    }
                                     SettingsGroup {
                                         title: "Оформление";
                                         Rectangle {
@@ -2566,6 +2720,19 @@ export component AppWindow inherits Window {
                                 loaded: root.track-has-image;
                                 placeholder-icon: "play";
                                 TouchArea { mouse-cursor: pointer; clicked => { root.toggle-lyrics(); } }
+                            }
+                            if root.set-visualizer == 1 && root.effects-supported && root.play-view == PlayView.playing: Rectangle {
+                                y: parent.height - 14px;
+                                height: 11px;
+                                for v[i] in root.spectrum: Rectangle {
+                                    x: i * 4px;
+                                    width: 3px;
+                                    height: max(1px, parent.height * v);
+                                    y: parent.height - self.height;
+                                    border-radius: 1px;
+                                    background: Theme.accent;
+                                    opacity: 0.85;
+                                }
                             }
                         }
                         Rectangle {

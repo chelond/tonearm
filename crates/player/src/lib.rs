@@ -1,10 +1,12 @@
 //! Player layer: playback on top of librespot, play queue with shuffle/repeat, volume, seek, events.
 
+pub mod effects;
 pub mod queue;
 mod service;
 pub mod soloist;
 pub mod uri;
 
+pub use effects::EffectsOptions;
 pub use queue::{QueueItem, QueueSnapshot};
 pub use service::run;
 pub use soloist::{SoloistConfig, SoloistStatus};
@@ -62,6 +64,8 @@ pub enum PlayerCommand {
     Soloist(Option<SoloistConfig>),
     /// Try Soloist again after a failure, or sign it in again.
     SoloistRetry,
+    /// Equalizer, fades and visualizer (Linux + PipeWire + Soloist; see [`effects`]).
+    Effects(EffectsOptions),
 }
 
 /// Audio settings the player needs (mirrors the `[audio]` section of config.toml).
@@ -135,6 +139,10 @@ pub enum PlayerEvent {
     /// issue #1649, mostly newer accounts): offer Soloist.
     AudioKeyRefused,
     Soloist(SoloistStatus),
+    /// Bars for the visualizer, ~31 a second while it runs; all zeros when it stops.
+    Spectrum(effects::spectrum::Frame),
+    /// `None`: the equalizer and fades work. `Some`: why they do not (shown in Settings).
+    Effects(Option<String>),
 }
 
 /// Repeat mode of the play queue.

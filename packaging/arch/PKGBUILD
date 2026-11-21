@@ -12,7 +12,8 @@ license=('MIT')
 depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'libx11' 'libxcursor' 'libxi' 'libxrandr' 'alsa-lib')
 optdepends=('gnome-keyring: keep the login in Secret Service instead of the encrypted file'
-            'playerctl: control playback from the command line over MPRIS')
+            'playerctl: control playback from the command line over MPRIS'
+            'pipewire: equalizer, fades between tracks and visualizer with Soloist')
 makedepends=('cargo')
 options=('!lto' '!debug')
 source=()

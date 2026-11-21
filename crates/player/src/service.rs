@@ -14,6 +14,7 @@ use librespot_playback::mixer::{self, Mixer, MixerConfig};
 use librespot_playback::player::{Player, PlayerEvent as LsEvent};
 use tokio::sync::{mpsc, watch};
 
+use crate::effects::EffectsOptions;
 use crate::queue::{Queue, QueueItem};
 use crate::soloist::{self, SoloistStatus};
 use crate::{
@@ -94,6 +95,26 @@ struct Service {
     volume: u8,
     sessions: watch::Receiver<Option<Session>>,
     solo: Solo,
+    fx: Fx,
+}
+
+/// Equalizer, fades and visualizer state (see [`crate::effects`]). Only Soloist plays through
+/// Tonearm's PipeWire sink; with the built-in player these stay idle.
+#[derive(Default)]
+struct Fx {
+    options: EffectsOptions,
+    /// The Soloist config as the app sent it; `pipewire_device` is filled in here.
+    base: Option<soloist::SoloistConfig>,
+    #[cfg(target_os = "linux")]
+    sink: Option<crate::effects::pipewire::Sink>,
+    #[cfg(target_os = "linux")]
+    capture: Option<crate::effects::spectrum::Capture>,
+    /// The sink could not start; not tried again until the settings change.
+    failed: bool,
+    /// The track whose end is fading out now.
+    out_uri: Option<String>,
+    /// The output gain is (going) down.
+    down: bool,
 }
 
 /// Soloist as the engine (see [`soloist`]). While `handle` is set every playback command goes
@@ -166,6 +187,7 @@ pub async fn run(
         volume: DEFAULT_VOLUME_PERCENT,
         sessions: solo_sessions,
         solo: Solo::default(),
+        fx: Fx::default(),
     };
     let mut tick = tokio::time::interval(POSITION_INTERVAL);
     svc.set_volume(DEFAULT_VOLUME_PERCENT).await;
@@ -227,6 +249,7 @@ impl Service {
         self.state = state;
         self.position_ms = position_ms;
         self.emit(PlayerEvent::State { state, position_ms }).await;
+        self.fx_visualizer().await;
     }
 
     async fn on_session(&mut self, session: Option<Session>) {
@@ -432,7 +455,11 @@ impl Service {
                 }
             }
             PlayerCommand::SetVolume(percent) => self.set_volume(percent).await,
-            PlayerCommand::Soloist(config) => self.configure_soloist(config).await,
+            PlayerCommand::Soloist(config) => {
+                self.fx.base.clone_from(&config);
+                self.configure_soloist(config).await;
+            }
+            PlayerCommand::Effects(options) => self.set_effects(options).await,
             PlayerCommand::SoloistRetry => {
                 if let Some(h) = &self.solo.handle {
                     h.pair();
@@ -598,6 +625,16 @@ impl Service {
     }
 
     async fn configure_soloist(&mut self, config: Option<soloist::SoloistConfig>) {
+        let config = match config {
+            Some(mut cfg) => {
+                cfg.pipewire_device = self.fx_sink(&cfg.root).await;
+                Some(cfg)
+            }
+            None => {
+                self.fx_stop();
+                None
+            }
+        };
         if self.solo.handle.as_ref().map(|h| &h.config) == config.as_ref() {
             return;
         }
@@ -654,6 +691,8 @@ impl Service {
     /// Pause, shown at once: the position stops where it is now.
     async fn solo_pause(&mut self) {
         self.solo_send(json!({"command": "pause"}));
+        // Nothing sounds while paused: put the gain back now, the end fades again on resume.
+        self.fx_fade_up(0);
         let pos = self.solo_now();
         self.solo.anchor = None;
         self.solo.expect = Some((PlaybackState::Paused, Instant::now()));
@@ -726,6 +765,7 @@ impl Service {
                 self.solo_advance().await;
                 return;
             }
+            self.fx_fade_tick(now, duration);
             self.set_state(PlaybackState::Playing, now).await;
         }
     }
@@ -925,5 +965,159 @@ fn track_info(item: &AudioItem) -> TrackInfo {
         duration_ms: item.duration_ms,
         // Covers come largest-last in practice; the bar needs a small one, so take the first.
         cover_url: item.covers.first().map(|c| c.url.clone()),
+    }
+}
+
+/// How long the next track takes to come up after a faded end.
+const FADE_IN_MAX_MS: u32 = 2000;
+
+impl Service {
+    async fn set_effects(&mut self, options: EffectsOptions) {
+        if options == self.fx.options {
+            return;
+        }
+        let was_needed = self.fx.options.needs_sink();
+        self.fx.options = options;
+        if self.fx.options.needs_sink() && !was_needed {
+            self.fx.failed = false;
+        }
+        if self.fx.options.fade_ms == 0 {
+            self.fx_fade_up(150);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(sink) = &self.fx.sink {
+            sink.set_eq(self.fx.options.eq);
+        }
+        // Soloist plays into the default output: restart it into Tonearm's sink.
+        let routed = self
+            .solo
+            .handle
+            .as_ref()
+            .is_some_and(|h| h.config.pipewire_device.is_some());
+        if self.fx.options.needs_sink() && !routed && self.fx.base.is_some() {
+            let base = self.fx.base.clone();
+            self.configure_soloist(base).await;
+        }
+        self.fx_visualizer().await;
+    }
+
+    /// Starts Tonearm's sink if the settings need it and returns its node for Soloist.
+    #[cfg(target_os = "linux")]
+    async fn fx_sink(&mut self, dir: &std::path::Path) -> Option<String> {
+        if let Some(sink) = &mut self.fx.sink
+            && !sink.alive()
+        {
+            tracing::warn!("tonearm sink stopped, starting it again");
+            self.fx.sink = None;
+        }
+        if self.fx.sink.is_none() && self.fx.options.needs_sink() && !self.fx.failed {
+            match crate::effects::pipewire::Sink::start(dir, self.fx.options.eq).await {
+                Ok(sink) => {
+                    self.fx.sink = Some(sink);
+                    self.emit(PlayerEvent::Effects(None)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no pipewire sink: equalizer and fades are off");
+                    self.fx.failed = true;
+                    self.emit(PlayerEvent::Effects(Some(
+                        "Не получилось: нужен PipeWire (pipewire и pw-cli)".into(),
+                    )))
+                    .await;
+                }
+            }
+        }
+        self.fx
+            .sink
+            .is_some()
+            .then(|| crate::effects::pipewire::NODE.to_owned())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_async)]
+    async fn fx_sink(&mut self, _dir: &std::path::Path) -> Option<String> {
+        None
+    }
+
+    fn fx_stop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.fx.capture = None;
+            self.fx.sink = None;
+        }
+        self.fx.out_uri = None;
+        self.fx.down = false;
+    }
+
+    /// The fade gain lives in the sink; without one there is nothing to fade.
+    fn fx_fade(&self, to: f32, ms: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(sink) = &self.fx.sink {
+            sink.fade(to, ms);
+            return true;
+        }
+        let _ = (to, ms);
+        false
+    }
+
+    fn fx_fade_up(&mut self, ms: u32) {
+        if self.fx.down {
+            self.fx_fade(1.0, ms);
+            self.fx.down = false;
+            self.fx.out_uri = None;
+        }
+    }
+
+    /// On every position tick while Soloist plays: fade out the last seconds of the track and
+    /// bring the gain back up once the next one (or the same one, after a seek) plays.
+    fn fx_fade_tick(&mut self, now: u32, duration: u32) {
+        let fade = self.fx.options.fade_ms;
+        let uri = self.solo.playing_uri.clone();
+        let left = duration.saturating_sub(now + SOLO_END_EARLY_MS);
+        if self.fx.down {
+            let same = self.fx.out_uri.is_some() && self.fx.out_uri == uri;
+            if !same {
+                self.fx_fade_up(fade.min(FADE_IN_MAX_MS));
+            } else if left > fade + 1000 {
+                self.fx_fade_up(150);
+            }
+            return;
+        }
+        // Short tracks (and unknown lengths) are left alone.
+        if fade > 0
+            && duration > fade * 3
+            && left <= fade
+            && uri.is_some()
+            && self.fx_fade(0.0, left)
+        {
+            self.fx.down = true;
+            self.fx.out_uri = uri;
+        }
+    }
+
+    /// Runs the visualizer's capture while it is on and Soloist plays into the sink.
+    async fn fx_visualizer(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let want = self.fx.options.visualizer
+                && self.fx.sink.is_some()
+                && self.solo.handle.is_some()
+                && self.state == PlaybackState::Playing;
+            if want && self.fx.capture.is_none() {
+                let events = self.events.clone();
+                match crate::effects::spectrum::Capture::start(
+                    crate::effects::pipewire::NODE,
+                    move |frame| {
+                        // A busy UI drops frames instead of queueing them.
+                        let _ = events.try_send(PlayerEvent::Spectrum(frame));
+                    },
+                ) {
+                    Ok(c) => self.fx.capture = Some(c),
+                    Err(e) => tracing::warn!(error = %e, "cannot start pw-record"),
+                }
+            } else if !want && self.fx.capture.take().is_some() {
+                self.emit(PlayerEvent::Spectrum([0; crate::effects::spectrum::BARS]))
+                    .await;
+            }
+        }
     }
 }
