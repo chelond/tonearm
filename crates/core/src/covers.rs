@@ -138,6 +138,7 @@ impl CoverCache {
         }
         // Mosaics are put together here from the four covers: one host fewer to depend on.
         if let Some(ids) = mosaic_ids(&url) {
+            let ids: Vec<String> = ids.iter().map(|id| sized_id(id, size / 2)).collect();
             let parts = futures_util::future::join_all(ids.iter().map(|id| self.image(id))).await;
             let parts: Vec<Vec<u8>> = parts.into_iter().collect::<Result<_, _>>()?;
             return tokio::task::spawn_blocking(move || compose(&url, &parts, size))
@@ -145,7 +146,7 @@ impl CoverCache {
                 .map_err(|_| CoverError::Decode)?;
         }
         let bytes = match image_id(&url) {
-            Some(id) => self.image(&id).await?,
+            Some(id) => self.image(&sized_id(&id, size)).await?,
             None => self.fetch_cached(&url, std::slice::from_ref(&url)).await?,
         };
         tokio::task::spawn_blocking(move || decode(&url, &bytes, size))
@@ -262,6 +263,29 @@ fn image_id(url: &str) -> Option<String> {
         .strip_prefix("/image/")?;
     let id = id.split(['?', '#']).next()?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())).then(|| id.to_owned())
+}
+
+/// Album cover ids name their rendition (`…1e02…` 300 px, `…b273…` 640 px, `…4851…` 64 px):
+/// pick the one that matches the size it is shown at, so HiDPI screens get sharp covers and
+/// row thumbnails do not download big pictures.
+fn sized_id(id: &str, size: u32) -> String {
+    const PREFIX: &str = "ab67616d0000";
+    const RENDITIONS: [(&str, u32); 3] = [("4851", 64), ("1e02", 300), ("b273", 640)];
+    let Some(rest) = id.strip_prefix(PREFIX) else {
+        return id.to_owned();
+    };
+    let (Some(code), Some(tail)) = (rest.get(..4), rest.get(4..)) else {
+        return id.to_owned();
+    };
+    if !RENDITIONS.iter().any(|(c, _)| *c == code) {
+        return id.to_owned();
+    }
+    let want = RENDITIONS
+        .iter()
+        .find(|(_, px)| *px >= size)
+        .unwrap_or(&RENDITIONS[2])
+        .0;
+    format!("{PREFIX}{want}{tail}")
 }
 
 /// `https://mosaic.scdn.co/<size>/<id><id><id><id>` → the four 40-character image ids.
@@ -460,6 +484,20 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn album_cover_rendition_follows_size() {
+        let tail = "2c5b24ecfa39523a75c993c4";
+        let id = format!("ab67616d00001e02{tail}");
+        assert_eq!(sized_id(&id, 600), format!("ab67616d0000b273{tail}"));
+        assert_eq!(sized_id(&id, 200), id);
+        assert_eq!(sized_id(&id, 48), format!("ab67616d00004851{tail}"));
+        assert_eq!(sized_id(&id, 2000), format!("ab67616d0000b273{tail}"));
+        assert_eq!(
+            sized_id("ab6761610000e5eb1234", 600),
+            "ab6761610000e5eb1234"
+        );
+    }
+
     #[test]
     fn image_ids_and_mosaics_are_recognised() {
         let id = "ab67616d0000b2732c5b24ecfa39523a75c993c4";

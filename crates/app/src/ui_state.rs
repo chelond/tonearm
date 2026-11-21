@@ -194,6 +194,20 @@ pub fn with<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
 }
 
 pub fn to_image(cover: &Cover) -> Image {
+    // Covers are opaque: RGB takes a quarter less memory than RGBA.
+    if cover.color.chunks_exact(4).all(|p| p[3] == 255) {
+        let rgb: Vec<u8> = cover
+            .color
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let buf = SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+            &rgb,
+            cover.width,
+            cover.height,
+        );
+        return Image::from_rgb8(buf);
+    }
     let buf =
         SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&cover.color, cover.width, cover.height);
     Image::from_rgba8(buf)
