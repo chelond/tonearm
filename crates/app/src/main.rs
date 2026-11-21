@@ -662,6 +662,10 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
         }
         ConnectEvent::Error(text) => {
             w.set_devices_loading(false);
+            // The preview has no session, so every Connect call fails; keep its screens clean.
+            if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
+                return;
+            }
             w.set_notice(text.into());
             w.set_notice_is_error(true);
         }
@@ -684,6 +688,17 @@ fn raise(w: &AppWindow) {
 }
 
 fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
+    // The preview has no session, so real library calls fail; keep its screens clean.
+    if std::env::var_os("TONEARM_UI_PREVIEW").is_some()
+        && matches!(
+            event,
+            LibraryEvent::PageError { .. }
+                | LibraryEvent::SearchError { .. }
+                | LibraryEvent::Error(_)
+        )
+    {
+        return;
+    }
     let fx = ui_state::with(|st| st.on_library(w, event));
     s.run(fx);
 }
@@ -1421,7 +1436,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
         _ => AuthView::LoggedIn,
     });
     w.set_waited_secs(42);
-    w.set_username("ЕГОР".into());
+    w.set_username("LISTENER".into());
     if screen.starts_with("update") {
         w.set_update_known(true);
         w.set_update_version("0.2.0".into());
@@ -1448,7 +1463,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
     .map(|(i, n)| PlaylistSummary {
         uri: format!("spotify:playlist:{i}"),
         name: (*n).into(),
-        owner: "Егор".into(),
+        owner: "Аня".into(),
         track_count: 40 + u32::try_from(i).unwrap_or(0) * 17,
         image_url: Some(format!("preview:p{i}")),
     })
@@ -1484,7 +1499,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
                         kind: CollectionKind::Playlist,
                         uri: "spotify:playlist:0".into(),
                         title: "Ночные маршруты".into(),
-                        byline: "Егор".into(),
+                        byline: "Аня".into(),
                         byline_uri: None,
                         year: None,
                         total_tracks: Some(7),
@@ -1773,7 +1788,7 @@ fn preview_search(w: &AppWindow, senders: &Senders, screen: &str) {
             .collect(),
         playlists: ["Ночные поездки", "Ночной джаз", "Ночь и дождь"]
             .iter()
-            .map(|t| tile(CollectionKind::Playlist, t, "Егор"))
+            .map(|t| tile(CollectionKind::Playlist, t, "Аня"))
             .collect(),
         more: [true, true, false, false],
     };
