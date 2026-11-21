@@ -22,6 +22,9 @@ use ui_state::{CoverTarget, Effect, UiState};
 
 slint::include_modules!();
 
+/// How long an informational notice stays up.
+const NOTICE_SECS: u32 = 5;
+
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -1234,11 +1237,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tick_senders = senders.clone();
     let tick = slint::Timer::default();
     let weak = window.as_weak();
+    // Informational notices ("Добавлено в «Любимые»") go away by themselves; errors stay.
+    let mut notice_seen = (slint::SharedString::new(), 0u32);
     tick.start(
         slint::TimerMode::Repeated,
         Duration::from_secs(1),
         move || {
             if let Some(w) = weak.upgrade() {
+                let notice = w.get_notice();
+                if notice.is_empty() || w.get_notice_is_error() || notice != notice_seen.0 {
+                    notice_seen = (notice, 0);
+                } else {
+                    notice_seen.1 += 1;
+                    if notice_seen.1 >= NOTICE_SECS {
+                        w.set_notice("".into());
+                    }
+                }
                 if w.get_auth_view() == AuthView::Waiting {
                     w.set_waited_secs(w.get_waited_secs() + 1);
                 }
@@ -1432,7 +1446,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
             fx.extend(st.on_library(
                 w,
                 LibraryEvent::PageHeader {
-                    page_id: 0,
+                    page_id: 1,
                     header: PageHeader {
                         kind: CollectionKind::Playlist,
                         uri: "spotify:playlist:0".into(),
@@ -1469,7 +1483,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
             fx.extend(st.on_library(
                 w,
                 LibraryEvent::PageTracks {
-                    page_id: 0,
+                    page_id: 1,
                     tracks,
                     done: true,
                 },
