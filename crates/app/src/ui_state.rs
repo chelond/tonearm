@@ -6,7 +6,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use slint::{Color, ComponentHandle, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{
+    Color, ComponentHandle, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel,
+};
 use tonearm_core::covers::Cover;
 use tonearm_core::library::lyrics::{LyricLine, current_line};
 use tonearm_core::library::{
@@ -2037,7 +2039,12 @@ impl UiState {
             has_track.then(|| ("lyrics", "Текст песни".to_owned(), PaletteAction::Lyrics)),
             Some((
                 "mini",
-                if w.get_mini_open() { "Закрыть мини-плеер" } else { "Мини-плеер" }.to_owned(),
+                if w.get_mini_open() {
+                    "Закрыть мини-плеер"
+                } else {
+                    "Мини-плеер"
+                }
+                .to_owned(),
                 PaletteAction::Mini,
             )),
             (!self.tracks.is_empty() && w.get_page() == crate::Page::Collection).then(|| {
