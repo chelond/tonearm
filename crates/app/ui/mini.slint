@@ -1,0 +1,140 @@
+// Mini player: a small window that stays above the others (cover, track, transport, progress).
+// Presentation only; Rust copies the main window's player state in and routes the buttons back.
+import { Theme, Fonts, Icon, IconButton, PlayButton, Slider, Cover } from "theme.slint";
+
+global MiniFmt {
+    pure public function clock(ms: int) -> string {
+        let total = floor(max(0, ms) / 1000);
+        let m = floor(total / 60);
+        let s = Math.mod(total, 60);
+        return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+}
+
+export component MiniPlayer inherits Window {
+    in property <string> track-title;
+    in property <string> track-artists;
+    in property <image> track-image;
+    in property <bool> track-has-image;
+    in property <image> track-backdrop;
+    in property <bool> playing;
+    in property <int> position-ms;
+    in property <int> duration-ms;
+    callback toggle-play();
+    callback next();
+    callback prev();
+    callback seek(float);
+    // Back to the big window (closes this one).
+    callback expand();
+    callback close-mini();
+    // Pointer pressed on the background: let the window manager move the window.
+    callback drag();
+
+    title: "Tonearm — мини-плеер";
+    icon: @image-url("../../../assets/icon-256.png");
+    no-frame: true;
+    always-on-top: true;
+    width: 380px;
+    height: 104px;
+    background: Theme.surface;
+    default-font-family: Fonts.text;
+
+    if root.track-has-image: Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.track-backdrop;
+        image-fit: cover;
+        image-rendering: smooth;
+        opacity: 0.5;
+    }
+    Rectangle { background: @linear-gradient(90deg, #000000A0 0%, #00000050 100%); }
+    // No title bar: the whole background moves the window; a double click opens the big one.
+    TouchArea {
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                root.drag();
+            }
+        }
+        double-clicked => { root.expand(); }
+    }
+    Rectangle { border-width: 1px; border-color: Theme.line-2; }
+
+    keys := FocusScope {
+        init => { self.focus(); }
+        key-pressed(e) => {
+            if e.text == " " { root.toggle-play(); return accept; }
+            if e.text == Key.RightArrow { root.next(); return accept; }
+            if e.text == Key.LeftArrow { root.prev(); return accept; }
+            if e.text == Key.Escape || (e.modifiers.control && (e.text == "m" || e.text == "M" || e.text == "ь" || e.text == "Ь")) {
+                root.expand();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    HorizontalLayout {
+        padding: 12px;
+        padding-right: 8px;
+        spacing: 12px;
+        Cover {
+            width: 80px;
+            height: 80px;
+            source: root.track-image;
+            loaded: root.track-has-image;
+            placeholder-icon: "play";
+        }
+        VerticalLayout {
+            spacing: 0px;
+            HorizontalLayout {
+                spacing: 2px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: root.track-title != "" ? root.track-title : "Ничего не играет";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: root.track-title == "" ? Theme.text-3 : Theme.text-1;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.track-artists;
+                        font-size: 12px;
+                        color: Theme.text-2;
+                        overflow: elide;
+                    }
+                }
+                IconButton { width: 28px; height: 28px; icon: "expand"; icon-size: 15px; clicked => { root.expand(); } }
+                IconButton { width: 28px; height: 28px; icon: "close"; icon-size: 15px; clicked => { root.close-mini(); } }
+            }
+            HorizontalLayout {
+                alignment: start;
+                spacing: 6px;
+                IconButton { y: (parent.height - self.height) / 2; icon: "prev"; icon-size: 16px; clicked => { root.prev(); } }
+                PlayButton {
+                    size: 34px;
+                    fill: Theme.text-1;
+                    ink: Theme.bg;
+                    playing: root.playing;
+                    clicked => { root.toggle-play(); }
+                }
+                IconButton { y: (parent.height - self.height) / 2; icon: "next"; icon-size: 16px; clicked => { root.next(); } }
+                Rectangle { horizontal-stretch: 1; }
+                Text {
+                    text: root.duration-ms > 0 ? MiniFmt.clock(root.position-ms) + " / " + MiniFmt.clock(root.duration-ms) : "";
+                    font-family: Fonts.mono;
+                    font-size: 10px;
+                    color: Theme.text-3;
+                    vertical-alignment: center;
+                }
+            }
+            Slider {
+                height: 14px;
+                smooth: root.playing;
+                value: root.duration-ms > 0 ? root.position-ms / root.duration-ms : 0;
+                committed(v) => { root.seek(v); }
+            }
+        }
+    }
+}

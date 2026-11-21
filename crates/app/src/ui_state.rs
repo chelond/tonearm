@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use slint::{Color, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{Color, ComponentHandle, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use tonearm_core::covers::Cover;
 use tonearm_core::library::lyrics::{LyricLine, current_line};
 use tonearm_core::library::{
@@ -72,6 +72,7 @@ enum PaletteAction {
     Radio,
     Lyrics,
     Shuffle,
+    Mini,
 }
 
 #[derive(Default)]
@@ -2030,6 +2031,11 @@ impl UiState {
                 )
             }),
             has_track.then(|| ("lyrics", "Текст песни".to_owned(), PaletteAction::Lyrics)),
+            Some((
+                "mini",
+                if w.get_mini_open() { "Закрыть мини-плеер" } else { "Мини-плеер" }.to_owned(),
+                PaletteAction::Mini,
+            )),
             (!self.tracks.is_empty() && w.get_page() == crate::Page::Collection).then(|| {
                 (
                     "shuffle",
@@ -2131,6 +2137,16 @@ impl UiState {
                 self.lyrics_opened(w)
             }
             PaletteAction::Shuffle => self.play_page(true),
+            PaletteAction::Mini => {
+                // Opening the window calls back into the UI state: do it after this call.
+                let weak = w.as_weak();
+                slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.invoke_toggle_mini();
+                    }
+                });
+                Vec::new()
+            }
         }
     }
 }

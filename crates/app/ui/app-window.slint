@@ -3,8 +3,9 @@
 // are overlays.
 import { ListView, ScrollView } from "std-widgets.slint";
 import { LyricsView, LyricRow, LyricWord } from "lyrics.slint";
+import { MiniPlayer } from "mini.slint";
 import { Theme, Fonts, Layout, Caption, Heading, Icon, IconButton, PlayButton, Button, ButtonKind, Segmented, Toggle, Slider, Cover, Equalizer, TrackRow, RowState } from "theme.slint";
-export { RowState, Theme, LyricRow, LyricWord }
+export { RowState, Theme, LyricRow, LyricWord, MiniPlayer }
 
 export enum AuthView { checking, logged-out, waiting, connecting, reconnecting, logged-in }
 export enum PlayView { stopped, loading, playing, paused }
@@ -911,6 +912,11 @@ export component AppWindow inherits Window {
     in property <int> duration-ms;
     in-out property <int> volume-level: 70;
     in property <bool> resume-pending;                // last session's track, not loaded yet
+    // Mini player window (Ctrl+M): Rust opens it and copies the player state over.
+    in property <bool> mini-open;
+    callback toggle-mini();
+    callback mini-sync();
+    property <color> accent-now: Theme.accent;
     // queue
     in-out property <bool> queue-open;
     in property <[QueueRow]> queue-items;
@@ -1159,6 +1165,10 @@ export component AppWindow inherits Window {
         if self.coll-scroll < -24px { self.coll-compact = true; }
         else if self.coll-scroll >= 0 { self.coll-compact = false; }
     }
+    changed track-image => { if root.mini-open { root.mini-sync(); } }
+    changed track-title => { if root.mini-open { root.mini-sync(); } }
+    changed play-view => { if root.mini-open { root.mini-sync(); } }
+    changed accent-now => { if root.mini-open { root.mini-sync(); } }
     changed palette-open => {
         if !self.palette-open { keys.focus(); }
     }
@@ -1173,6 +1183,10 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if e.text == " " { root.toggle-play(); return accept; }
+            if e.modifiers.control && (e.text == "m" || e.text == "M" || e.text == "ь" || e.text == "Ь") {
+                root.toggle-mini();
+                return accept;
+            }
             if e.text == "q" || e.text == "Q" || e.text == "й" || e.text == "Й" {
                 root.queue-open = !root.queue-open;
                 return accept;
@@ -2521,7 +2535,7 @@ export component AppWindow inherits Window {
                     spacing: 16px;
                     // now playing: a new track slides in (cover grows back, title rises)
                     now := HorizontalLayout {
-                        width: 300px;
+                        width: 320px;
                         spacing: 14px;
                         property <bool> swap: false;
                         property <duration> settle: self.swap ? 0ms : 460ms;
@@ -2653,9 +2667,10 @@ export component AppWindow inherits Window {
                     }
                     // right side
                     HorizontalLayout {
-                        width: 300px;
+                        width: 320px;
                         alignment: end;
                         spacing: 4px;
+                        IconButton { y: (parent.height - self.height) / 2; icon: "mini"; active: root.mini-open; tooltip: "Мини-плеер (Ctrl+M)"; clicked => { root.toggle-mini(); } }
                         IconButton { y: (parent.height - self.height) / 2; icon: "lyrics"; active: root.lyrics-open; clicked => { root.toggle-lyrics(); } }
                         IconButton { y: (parent.height - self.height) / 2; icon: "queue"; active: root.queue-open; clicked => { root.queue-open = !root.queue-open; } }
                         IconButton {

@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod history;
+mod mini;
 mod os_media;
 mod themes;
 mod ui_state;
@@ -559,6 +560,11 @@ fn apply_auth(w: &AppWindow, s: &Senders, event: Event) {
 }
 
 fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
+    apply_player_event(w, s, event);
+    mini::sync(w);
+}
+
+fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
     // While a Connect device plays, the deck shows that device, not the paused local player.
     let remote = s.remote.lock().ok().is_some_and(|r| r.is_some());
     if remote && matches!(event, PlayerEvent::State { .. } | PlayerEvent::Track(_)) {
@@ -1363,6 +1369,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tick_senders.run(fx);
                 // Catches play/pause, opening and closing the lyrics.
                 lyrics_kick(&w);
+                mini::sync(&w);
             }
         },
     );
@@ -1458,6 +1465,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     );
+
+    window.on_toggle_mini({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::toggle(&w);
+            }
+        }
+    });
+    window.on_mini_sync({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::sync(&w);
+            }
+        }
+    });
+    // Closing the main window quits, even with the mini player still open.
+    window.window().on_close_requested({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                mini::close(&w);
+            }
+            slint::CloseRequestResponse::HideWindow
+        }
+    });
 
     window.run()?;
 
@@ -1696,6 +1730,15 @@ fn preview(w: &AppWindow, senders: &Senders) {
     }
     if screen == "stats" {
         w.set_page(Page::Stats);
+    }
+    if screen == "mini" {
+        // After the sample cover has arrived.
+        let weak = w.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(800), move || {
+            if let Some(w) = weak.upgrade() {
+                mini::toggle(&w);
+            }
+        });
     }
     if screen.starts_with("lyrics") {
         use tonearm_core::library::lyrics::{LyricLine, Lyrics, fill_timings};

@@ -131,9 +131,25 @@ cargo build --release
 | <kbd>/</kbd> или <kbd>Ctrl</kbd>+<kbd>F</kbd> | поиск |
 | <kbd>Q</kbd> | очередь |
 | <kbd>L</kbd> | текст песни |
+| <kbd>Ctrl</kbd>+<kbd>M</kbd> | мини-плеер (в нём <kbd>Esc</kbd> возвращает большое окно) |
 | <kbd>Esc</kbd> | закрыть текст, назад со страницы плейлиста |
 
 Клавиши работают, когда курсор не в поле ввода. Имя для MPRIS: `org.mpris.MediaPlayer2.tonearm`.
+
+### Мини-плеер
+
+Маленькое окно с обложкой, треком и кнопками, поверх остальных окон. Открывается кнопкой справа на
+панели плеера, <kbd>Ctrl</kbd>+<kbd>M</kbd> или через <kbd>Ctrl</kbd>+<kbd>K</kbd>. Окно двигается за фон,
+двойной клик или <kbd>Esc</kbd> возвращают большое окно.
+
+«Поверх остальных» зависит от системы:
+
+- **Windows, X11**: работает само.
+- **Hyprland**: Tonearm сам делает окно плавающим и закрепляет его (`pin`) на всех рабочих столах.
+- **Другие Wayland-композиторы** (KDE, GNOME, Sway): в Wayland нет способа попросить «поверх всех»,
+  включите это в самом композиторе. KDE: Alt+F3 → «Дополнительно» → «Поверх других окон»
+  (или правило окна по заголовку `Tonearm — мини-плеер`). GNOME: Alt+Пробел → «Поверх всех окон».
+  Sway: `for_window [title="Tonearm — мини-плеер"] floating enable, sticky enable`.
 
 ### Где хранится вход
 
@@ -237,7 +253,7 @@ docs/          дизайн и заметки о решениях
 ```
 
 Интерфейс можно смотреть без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран:
-`home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `lyrics`, `lyrics-plain`, `palette`, `stats`, `menu`,
+`home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `lyrics`, `lyrics-plain`, `mini`, `palette`, `stats`, `menu`,
 `devices`, `settings`, `login`, `waiting`, `offline`, `update`, `update-downloading`, `update-failed`.
 
 Рендерер по умолчанию программный (так меньше памяти). OpenGL можно попробовать через
