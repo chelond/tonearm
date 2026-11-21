@@ -17,43 +17,15 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+  checks:
+    name: checks
+    uses: ./.github/workflows/checks.yml
 
-  # Checks: clippy + tests (tests also cover the debug build).
-  build:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      # RUSTFLAGS overrides .cargo/config.toml, so the static CRT flag is repeated here for Windows.
-      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+  test:
+    name: tests
+    uses: ./.github/workflows/tests.yml
 
-  # Release binaries, in parallel with the checks so the exe is ready sooner.
+  # Build and package in parallel with tests; release waits for both.
   package:
     name: package (${{ matrix.os }})
     strategy:
@@ -99,6 +71,7 @@ jobs:
           name: tonearm-${{ runner.os }}
           path: dist/*
 
+  # Compile in the target distribution environment on every CI run.
   arch:
     name: build (archlinux container)
     runs-on: ubuntu-latest
@@ -107,7 +80,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: pacman -Syu --noconfirm --needed rust fontconfig libxkbcommon libxkbcommon-x11 wayland alsa-lib
       - run: cargo build --workspace --locked
-      - run: cargo test --workspace --locked
 
   # pacman package for the in-app updater on Arch (pkexec pacman -U). Tags only.
   arch-package:
@@ -138,7 +110,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, build, package, arch, arch-package]
+    needs: [checks, test, package, arch, arch-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
