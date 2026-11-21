@@ -14,7 +14,7 @@ depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommo
 optdepends=('gnome-keyring: keep the login in Secret Service instead of the encrypted file'
             'playerctl: control playback from the command line over MPRIS')
 makedepends=('cargo')
-options=('!lto')
+options=('!lto' '!debug')
 source=()
 
 _srcroot() { realpath "$startdir/../.."; }

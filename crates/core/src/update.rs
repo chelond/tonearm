@@ -187,7 +187,10 @@ fn wanted_asset(name: &str, kind: InstallKind) -> bool {
     match (std::env::consts::OS, kind) {
         ("windows", _) => name == format!("tonearm-windows-{arch}.exe"),
         ("linux", InstallKind::Pacman) => {
-            name.starts_with("tonearm-") && name.ends_with(&format!("-{arch}.pkg.tar.zst"))
+            // makepkg may also split off an empty tonearm-debug package: never pick that one.
+            name.starts_with("tonearm-")
+                && !name.starts_with("tonearm-debug-")
+                && name.ends_with(&format!("-{arch}.pkg.tar.zst"))
         }
         ("linux", InstallKind::Binary) => name == format!("tonearm-linux-{arch}"),
         _ => false,
@@ -482,9 +485,13 @@ mod tests {
             format!("tonearm-linux-{arch}")
         };
         let pkg = format!("tonearm-0.2.0-1-{arch}.pkg.tar.zst");
+        // The empty debug split package comes first and must be skipped.
+        let debug = format!("tonearm-debug-0.2.0-1-{arch}.pkg.tar.zst");
         let names = [
             bin.clone(),
             format!("{bin}.sig"),
+            debug.clone(),
+            format!("{debug}.sig"),
             pkg.clone(),
             format!("{pkg}.sig"),
         ];
