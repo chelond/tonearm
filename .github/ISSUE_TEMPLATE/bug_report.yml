@@ -1,0 +1,52 @@
+name: Ошибка
+description: Что-то не работает или работает не так
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что вы сделали, что ожидали и что получилось.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить
+      placeholder: |
+        1. Открыть …
+        2. Нажать …
+  - type: input
+    id: version
+    attributes:
+      label: Версия Tonearm
+      description: Настройки → Обновления
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: ОС
+      options:
+        - Arch Linux (Wayland)
+        - Arch Linux (X11)
+        - Другой Linux
+        - Windows 11
+        - Windows 10
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Плеер
+      options:
+        - Встроенный (librespot)
+        - Soloist
+        - Не знаю
+  - type: textarea
+    id: log
+    attributes:
+      label: Журнал
+      description: Запуск с RUST_LOG=debug. Windows — %LOCALAPPDATA%\tonearm\data\tonearm.log. Уберите имя пользователя и всё, похожее на токены.
+      render: text
