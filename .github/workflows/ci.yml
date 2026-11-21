@@ -83,12 +83,16 @@ jobs:
           tar -czf dist/tonearm-linux-x86_64.tar.gz -C target/release tonearm \
             -C "$GITHUB_WORKSPACE/packaging/arch" tonearm.desktop \
             -C "$GITHUB_WORKSPACE/assets" icon.svg
+          # The bare binary is what the in-app updater downloads.
+          cp target/release/tonearm dist/tonearm-linux-x86_64
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path target/release/tonearm.exe, README.md -DestinationPath dist/tonearm-windows-x86_64.zip
+          # The bare exe is what the in-app updater downloads.
+          Copy-Item target/release/tonearm.exe dist/tonearm-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: tonearm-${{ runner.os }}
@@ -104,17 +108,72 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
 
+  # pacman package for the in-app updater on Arch (pkexec pacman -U). Tags only.
+  arch-package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: package (archlinux)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          pacman -Syu --noconfirm --needed rust gcc-libs glibc fontconfig freetype2 libxkbcommon \
+            libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr alsa-lib
+      - name: makepkg
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          sed -i "s/^pkgver=.*/pkgver=${ver}/; s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
+          # makepkg refuses to run as root.
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          cd packaging/arch
+          su builder -c "makepkg --nocheck --noconfirm"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp tonearm-*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tonearm-arch
+          path: dist/*
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, build, package, arch]
+    needs: [fmt, build, package, arch, arch-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the version in Cargo.toml
+        run: |
+          want="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${GITHUB_REF_NAME#v}" != "$want" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but Cargo.toml says ${want}; the app would offer itself as an update forever"
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # Detached ed25519 signatures (64 raw bytes) for the in-app updater; the public key is
+      # in crates/core/src/update.rs. Without the secret there is no release: unsigned files
+      # would never be installed by the app anyway.
+      - name: Sign release files
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::secret UPDATE_SIGNING_KEY is not set (Settings → Secrets and variables → Actions)"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/update-key.pem"
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          for f in dist/*; do
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$f" -out "$f.sig"
+            test "$(stat -c %s "$f.sig")" = 64
+          done
+          rm -f "$key"
+          ls -l dist
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
