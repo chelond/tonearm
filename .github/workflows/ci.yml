@@ -82,7 +82,8 @@ jobs:
           mkdir -p dist
           tar -czf dist/tonearm-linux-x86_64.tar.gz -C target/release tonearm \
             -C "$GITHUB_WORKSPACE/packaging/arch" tonearm.desktop \
-            -C "$GITHUB_WORKSPACE/assets" icon.svg
+            -C "$GITHUB_WORKSPACE/assets" icon.svg \
+            -C "$GITHUB_WORKSPACE" LICENSE
           # The bare binary is what the in-app updater downloads.
           cp target/release/tonearm dist/tonearm-linux-x86_64
       - name: Package (Windows)
@@ -90,7 +91,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/release/tonearm.exe, README.md -DestinationPath dist/tonearm-windows-x86_64.zip
+          Compress-Archive -Path target/release/tonearm.exe, README.md, LICENSE -DestinationPath dist/tonearm-windows-x86_64.zip
           # The bare exe is what the in-app updater downloads.
           Copy-Item target/release/tonearm.exe dist/tonearm-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
@@ -174,6 +175,32 @@ jobs:
           done
           rm -f "$key"
           ls -l dist
+      # Release notes: the section of CHANGELOG.md for this version.
+      - name: Release notes
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            /^## \[/ { if (on) exit; if (index($0, "## [" v "]") == 1) { on = 1; next } }
+            /^\[[^]]+\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::CHANGELOG.md has no section for ${ver}"
+            exit 1
+          fi
+          cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
+
+          ### Установка
+
+          - **Windows**: `tonearm-windows-x86_64.zip` или просто `tonearm-windows-x86_64.exe`.
+          - **Arch Linux**: `sudo pacman -U tonearm-*.pkg.tar.zst`.
+          - **Другой Linux**: `tonearm-linux-x86_64.tar.gz`.
+
+          Файлы `.sig` — подписи для встроенного обновления, скачивать их не нужно.
+          NOTES
+          cat "$RUNNER_TEMP/notes.md"
       - uses: softprops/action-gh-release@v2
         with:
+          name: Tonearm ${{ github.ref_name }}
+          body_path: ${{ runner.temp }}/notes.md
           files: dist/*
