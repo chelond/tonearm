@@ -10,6 +10,7 @@ pub mod covers;
 pub mod file_store;
 pub mod library;
 pub mod secret;
+pub mod update;
 
 use std::sync::Arc;
 

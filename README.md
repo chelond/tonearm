@@ -88,7 +88,7 @@ librespot выдаёт многоразовые учётные данные, о�
 (на большинстве десктопов уже стоит). Если аудиоустройства нет, приложение не падает: покажет сообщение,
 а после подключения наушников достаточно снова нажать «Играть». Качество потока: 320 кбит/с.
 
-Для проверки интерфейса без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран: `home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `menu`, `devices`, `settings`, `login`, `waiting`, `offline`.
+Для проверки интерфейса без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран: `home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `menu`, `devices`, `settings`, `login`, `waiting`, `offline`, `update`, `update-downloading`, `update-failed`.
 
 ## Плеер Spotify Soloist
 
@@ -138,6 +138,22 @@ Soloist закрывается вместе с Tonearm. Его журнал: `so
 
 Медиаклавиши клавиатуры, виджет плеера GNOME/KDE и `playerctl` работают через MPRIS (имя `org.mpris.MediaPlayer2.tonearm`),
 на Windows — через системную панель мультимедиа (SMTC). Уведомление о новом треке показывается, только когда окно не в фокусе.
+
+## Обновления
+
+Tonearm сам проверяет GitHub Releases при запуске и раз в сутки (выключается в настройках). Когда вышла новая версия, в боковой панели появляется карточка «Новая версия» с кнопкой «Обновить»: программа скачивает файл, проверяет подпись, ставит его и перезапускается.
+
+- **Windows и портативный бинарник на Linux**: новый файл кладётся рядом со старым и подменяет его. Если папка без прав на запись (например, Program Files), обновление сообщит об этом.
+- **Arch (пакет из PKGBUILD)**: скачивается готовый `.pkg.tar.zst` из релиза и ставится через `pkexec pacman -U`, система один раз спросит пароль. Нужен polkit (`pkexec`).
+
+Каждый файл релиза подписан ключом ed25519 (`<файл>.sig`), открытый ключ встроен в программу. Файл без верной подписи не установится, откуда бы он ни пришёл. Свой сервер-зеркало можно указать в `config.toml` (`[update] feed_url`), он должен отдавать JSON в формате GitHub `releases/latest`.
+
+### Как выпустить версию
+
+1. Поднять `version` в `Cargo.toml` (и `pkgver` в `packaging/arch/PKGBUILD`), закоммитить.
+2. Поставить тег `vX.Y.Z` и запушить его. CI соберёт exe, бинарник, tar.gz и пакет для pacman, подпишет их и опубликует релиз. Если тег не совпадает с версией в `Cargo.toml`, релиз не выйдет.
+
+Подписывает CI секретом `UPDATE_SIGNING_KEY` (Settings → Secrets and variables → Actions) с приватным ключом в формате PEM. Ключ создаётся один раз: `openssl genpkey -algorithm ed25519 -out key.pem`; открытый ключ для `update.rs`: `openssl pkey -in key.pem -pubout -outform DER | tail -c 32 | od -An -tx1`.
 
 ## Структура
 

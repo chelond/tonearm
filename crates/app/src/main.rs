@@ -5,6 +5,7 @@ mod history;
 mod os_media;
 mod themes;
 mod ui_state;
+mod updater;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -754,6 +755,7 @@ fn show_settings(w: &AppWindow, s: &Settings) {
         .unwrap_or(CACHE_SIZES_MB.len() - 1);
     w.set_set_cache(i32::try_from(cache).unwrap_or(2));
     w.set_set_engine(i32::from(s.player.soloist));
+    w.set_set_update_check(i32::from(s.update.check));
 }
 
 /// The settings page → Settings (keeps what the page does not show, like the Client ID).
@@ -767,6 +769,7 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
+    s.update.check = w.get_set_update_check() != 0;
     s
 }
 
@@ -814,6 +817,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The core publishes the connected session; player and library pick it up.
     let (session_tx, session_rx) = watch::channel(None);
 
+    // Remember where the binary is and drop leftovers of the last update.
+    tonearm_core::update::init();
     let settings = Settings::load();
     tonearm_core::library::use_own_client_id(
         &settings.spotify.client_id,
@@ -844,6 +849,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
+    let updater = updater::Updater::new(
+        runtime.handle().clone(),
+        window.as_weak(),
+        Arc::clone(&senders.settings),
+    );
+    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+        updater.start_schedule();
+    }
+    let u = updater.clone();
+    window.on_update_check(move || u.check());
+    let u = updater.clone();
+    window.on_update_install(move || u.install());
+    let u = updater.clone();
+    window.on_update_open_page(move || u.open_page());
     if settings.player.soloist && std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
         senders.start_soloist();
     }
@@ -1339,6 +1358,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(wait, connect).await;
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
+    if updater.restart_requested() {
+        tonearm_core::update::restart();
+    }
     Ok(())
 }
 
@@ -1353,6 +1375,17 @@ fn preview(w: &AppWindow, senders: &Senders) {
     });
     w.set_waited_secs(42);
     w.set_username("ЕГОР".into());
+    if screen.starts_with("update") {
+        w.set_update_known(true);
+        w.set_update_version("0.2.0".into());
+        w.set_update_progress(0.42);
+        w.set_update_message("Подпись файла не совпала, обновление не установлено".into());
+        w.set_update_state(match screen.as_str() {
+            "update-downloading" => UpdateState::Downloading,
+            "update-failed" => UpdateState::Failed,
+            _ => UpdateState::Available,
+        });
+    }
     if screen == "offline" {
         w.set_offline(true);
         w.set_retry_in_secs(8);
