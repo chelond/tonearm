@@ -8,6 +8,8 @@ export { RowState, Theme }
 export enum AuthView { checking, logged-out, waiting, connecting, reconnecting, logged-in }
 export enum PlayView { stopped, loading, playing, paused }
 export enum Page { home, search, library, settings, collection, stats }
+// idle: nothing known yet; latest: checked, this is the newest; failed: check or install failed.
+export enum UpdateState { idle, checking, latest, available, downloading, installing, failed }
 
 export struct PlaylistEntry { uri: string, name: string, count: int, owner: string, image: image, has-image: bool }
 // kind: 0 liked, 1 playlist, 2 album, 3 artist
@@ -614,6 +616,81 @@ component MenuPanel inherits Rectangle {
     }
 }
 
+// Sidebar card for a new version: one button downloads, verifies, installs and restarts.
+component UpdateCard inherits Rectangle {
+    in property <UpdateState> state;
+    in property <string> version;
+    in property <float> progress;
+    in property <string> message;
+    callback install();
+    callback later();
+    callback details();
+    property <bool> busy: root.state == UpdateState.downloading || root.state == UpdateState.installing;
+    property <bool> shown: false;
+    init => { self.shown = true; }
+    opacity: self.shown ? 1 : 0;
+    animate opacity { duration: Theme.slow; }
+    border-radius: Layout.radius;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: root.state == UpdateState.failed ? Theme.danger : Theme.line;
+    vertical-stretch: 0;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout { alignment: center; Icon { name: "sparkle"; size: 16px; ink: Theme.accent; } }
+            Text {
+                text: root.state == UpdateState.downloading ? "Скачиваю " + root.version
+                    : root.state == UpdateState.installing ? "Устанавливаю " + root.version
+                    : root.state == UpdateState.failed ? "Не обновилось"
+                    : "Новая версия " + root.version;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-1;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            if !root.busy: Rectangle {
+                width: 20px;
+                Text { text: "×"; font-size: 16px; color: close.has-hover ? Theme.text-1 : Theme.text-3; }
+                close := TouchArea { mouse-cursor: pointer; clicked => { root.later(); } }
+            }
+        }
+        if root.state == UpdateState.failed: Text {
+            text: root.message;
+            font-size: 12px;
+            color: Theme.text-3;
+            wrap: word-wrap;
+        }
+        if root.busy: Rectangle {
+            height: 4px;
+            border-radius: 2px;
+            background: Theme.line;
+            clip: true;
+            Rectangle {
+                x: 0;
+                width: root.state == UpdateState.installing || root.progress < 0 ? parent.width : parent.width * root.progress;
+                animate width { duration: Theme.fast; }
+                border-radius: 2px;
+                background: Theme.accent;
+            }
+        }
+        if !root.busy: HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: root.state == UpdateState.failed ? "Повторить" : "Обновить";
+                kind: ButtonKind.primary;
+                horizontal-stretch: 1;
+                clicked => { root.install(); }
+            }
+            Button { text: "Что нового"; kind: ButtonKind.ghost; clicked => { root.details(); } }
+        }
+    }
+}
+
 component StepLine inherits HorizontalLayout {
     in property <int> status; // 0 todo, 1 active, 2 done
     in property <string> text;
@@ -920,6 +997,19 @@ export component AppWindow inherits Window {
     callback refresh-audio-devices();
     callback pick-device(string /* id, "" = this computer */);
 
+    // Updates (GitHub Releases, signed files).
+    in property <UpdateState> update-state: UpdateState.idle;
+    in property <string> update-version;
+    in property <float> update-progress; // 0..1, < 0 = size unknown
+    in property <string> update-message;
+    // A new version is known (the error state keeps it so "Повторить" works).
+    in property <bool> update-known;
+    in-out property <bool> update-hidden;
+    in-out property <int> set-update-check: 1;
+    callback update-install();
+    callback update-check();
+    callback update-open-page();
+
     function seek-relative(delta-ms: int) {
         if self.duration-ms > 0 {
             self.seek(max(0, min(1, (self.position-ms + delta-ms) / self.duration-ms)));
@@ -1151,6 +1241,15 @@ export component AppWindow inherits Window {
                                 playing: root.context-uri == p.uri;
                                 clicked => { root.open(1, p.uri); }
                             }
+                        }
+                        if root.update-known && !root.update-hidden: UpdateCard {
+                            state: root.update-state;
+                            version: root.update-version;
+                            progress: root.update-progress;
+                            message: root.update-message;
+                            install => { root.update-install(); }
+                            later => { root.update-hidden = true; }
+                            details => { root.update-open-page(); }
                         }
                         Rectangle { height: 1px; background: Theme.line; }
                         HorizontalLayout {
@@ -2089,6 +2188,35 @@ export component AppWindow inherits Window {
                                             last: true;
                                             Segmented { items: ["128", "256", "512", "1024"]; current <=> root.set-cache; changed => { root.settings-changed(); } }
                                             Button { text: "Очистить"; kind: ButtonKind.ghost; clicked => { root.clear-cache(); } }
+                                        }
+                                    }
+                                    SettingsGroup {
+                                        title: "Обновления";
+                                        SettingRow {
+                                            title: "Tonearm " + root.version;
+                                            hint: root.update-state == UpdateState.checking ? "Проверяю…"
+                                                : root.update-state == UpdateState.latest ? "Это последняя версия"
+                                                : root.update-state == UpdateState.available ? "Доступна версия " + root.update-version
+                                                : root.update-state == UpdateState.downloading ? "Скачиваю " + root.update-version + "…"
+                                                : root.update-state == UpdateState.installing ? "Устанавливаю " + root.update-version + "…"
+                                                : root.update-state == UpdateState.failed ? root.update-message
+                                                : "Файлы обновлений подписаны, чужой файл не установится";
+                                            if root.update-known && root.update-state != UpdateState.downloading && root.update-state != UpdateState.installing: Button {
+                                                text: root.update-state == UpdateState.failed ? "Повторить" : "Обновить";
+                                                kind: ButtonKind.primary;
+                                                clicked => { root.update-install(); }
+                                            }
+                                            if !root.update-known: Button {
+                                                text: "Проверить";
+                                                kind: ButtonKind.ghost;
+                                                clicked => { root.update-check(); }
+                                            }
+                                        }
+                                        SettingRow {
+                                            title: "Проверять автоматически";
+                                            hint: "При запуске и раз в сутки";
+                                            last: true;
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-update-check; changed => { root.settings-changed(); } } }
                                         }
                                     }
                                     SettingsGroup {

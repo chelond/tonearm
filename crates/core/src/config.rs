@@ -14,6 +14,7 @@ pub struct Settings {
     pub cache: CacheSettings,
     pub ui: UiSettings,
     pub player: PlayerSettings,
+    pub update: UpdateSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -22,6 +23,25 @@ pub struct PlayerSettings {
     /// Play through Spotify Soloist instead of the built-in librespot player. The Soloist key
     /// itself lives in the keyring (`soloist-api-key`), never here.
     pub soloist: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a new version at startup and once a day.
+    pub check: bool,
+    /// Release feed in GitHub's `releases/latest` JSON shape; empty = GitHub Releases of the
+    /// project. Files are verified against the built-in signing key wherever they come from.
+    pub feed_url: String,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check: true,
+            feed_url: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

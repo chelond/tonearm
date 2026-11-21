@@ -23,3 +23,9 @@ max_size_mb = 512      # covers; the settings page offers 128 | 256 | 512 | 1024
 [ui]
 notifications = true   # notify on track change while the window is in the background
 theme = "graphite"     # graphite, midnight, oled, forest, sakura, synthwave, light, sand, or "file:<name>.toml"
+
+[update]
+check = true           # look for a new version at startup and once a day
+# Release feed in the shape of GitHub's releases/latest JSON; empty = GitHub Releases.
+# Lets you serve updates from your own server. Files must still carry the project's signature.
+feed_url = ""
