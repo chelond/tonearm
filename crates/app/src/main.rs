@@ -562,7 +562,6 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             os_media::on_state(state, position_ms);
             w.set_play_view(ui_state::play_view(state));
             w.set_position_ms(i32::try_from(position_ms).unwrap_or(i32::MAX));
-            ui_state::with(|st| st.position_changed(w));
         }
         PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
         PlayerEvent::Track(track) => {
@@ -1636,11 +1635,11 @@ fn preview(w: &AppWindow, senders: &Senders) {
         w.set_page(Page::Stats);
     }
     if screen == "lyrics" {
-        use tonearm_core::library::extras::{LyricLine, Lyrics};
+        use tonearm_core::library::lyrics::{LyricLine, Lyrics, estimate_words};
         let lines = [
             "Город спит, и только мы",
             "Едем вдоль реки",
-            "Огни над рекой",
+            "Огни над рекой горят для нас одних, пока над городом встаёт рассвет",
             "Горят для нас одних",
             "",
             "Тихо шепчет радио",
@@ -1648,17 +1647,21 @@ fn preview(w: &AppWindow, senders: &Senders) {
             "Огни над рекой",
             "Нас ведут до утра",
         ];
+        let mut lines: Vec<LyricLine> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, t)| LyricLine {
+                start_ms: Some(u32::try_from(i).unwrap_or(0) * 4_000 + 76_000),
+                text: (*t).into(),
+                words: Vec::new(),
+            })
+            .collect();
+        estimate_words(&mut lines, 240_000);
         let lyrics = Lyrics {
-            lines: lines
-                .iter()
-                .enumerate()
-                .map(|(i, t)| LyricLine {
-                    start_ms: Some(u32::try_from(i).unwrap_or(0) * 12_000 + 30_000),
-                    text: (*t).into(),
-                })
-                .collect(),
+            lines,
             synced: true,
             provider: "LRCLIB".into(),
+            ..Lyrics::default()
         };
         w.set_lyrics_open(true);
         let fx = ui_state::with(|st| {

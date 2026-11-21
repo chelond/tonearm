@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use slint::{Color, Global, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use tonearm_core::covers::Cover;
-use tonearm_core::library::extras::{LyricLine, current_line};
+use tonearm_core::library::lyrics::LyricLine;
 use tonearm_core::library::{
     CollectionKind, LibraryCommand, LibraryEvent, PageHeader, PageRequest, PlaylistSummary,
     SearchKind, SearchResults, Tile, TrackItem, format_duration,
@@ -18,8 +18,8 @@ use tonearm_player::{PlaybackState, PlayerCommand, QueueItem, QueueSnapshot, Tra
 use crate::history::{self, Context, Entry, QueuedTrack, Resume, Store};
 use crate::themes;
 use crate::{
-    AppWindow, LyricRow, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState, StatRow, Theme,
-    ThemeCard, TileData, TrackData,
+    AppWindow, LyricRow, LyricWord, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState,
+    StatRow, Theme, ThemeCard, TileData, TrackData,
 };
 
 /// Requests from the UI state to the async side (covers, playback, navigation).
@@ -125,9 +125,9 @@ pub struct UiState {
     store: Store,
     /// Last session's track, shown paused until play is pressed.
     resume: Option<Resume>,
-    lyrics: Vec<LyricLine>,
     lyrics_uri: String,
-    lyrics_index: Option<usize>,
+    /// Lyrics already requested for this track (the answer is on its way).
+    lyrics_asked: String,
     /// The player reported the track only partly; its details are on the way.
     meta_pending: bool,
     /// The theme's accent when it does not follow the cover.
@@ -864,25 +864,24 @@ impl UiState {
             }
             LibraryEvent::Lyrics { uri, lyrics } if uri == self.playing_uri => {
                 self.lyrics_uri = uri;
-                self.lyrics_index = None;
                 match lyrics {
+                    Some(l) if l.instrumental => {
+                        w.set_lyrics(ModelRc::default());
+                        w.set_lyrics_status("Инструментальный трек, без слов".into());
+                        w.set_lyrics_provider(l.provider.into());
+                    }
                     Some(l) => {
-                        let rows: Vec<LyricRow> = l
-                            .lines
-                            .iter()
-                            .map(|line| LyricRow {
-                                text: line.text.clone().into(),
-                            })
-                            .collect();
-                        w.set_lyrics(ModelRc::from(Rc::new(VecModel::from(rows))));
+                        w.set_lyrics(ModelRc::from(Rc::new(VecModel::from(lyric_rows(&l.lines)))));
                         w.set_lyrics_synced(l.synced);
-                        w.set_lyrics_provider(l.provider.clone().into());
+                        w.set_lyrics_word_synced(l.word_synced);
+                        w.set_lyrics_provider(l.provider.into());
                         w.set_lyrics_status("".into());
-                        self.lyrics = l.lines;
-                        self.update_lyrics_line(w);
                     }
                     None => {
-                        self.lyrics.clear();
+                        // Asked again when the overlay is reopened: maybe the network is back.
+                        self.lyrics_uri.clear();
+                        self.lyrics_asked.clear();
+                        w.set_lyrics(ModelRc::default());
                         w.set_lyrics_status("Для этого трека текста нет".into());
                         w.set_lyrics_provider("".into());
                     }
@@ -1370,9 +1369,8 @@ impl UiState {
         let t = &self.playing;
         let complete = t.duration_ms > 0 && !t.artists.is_empty() && t.cover_url.is_some();
         self.meta_pending = still_pending && !complete;
-        if w.get_lyrics_open() {
-            fx.extend(self.lyrics_opened(w));
-        }
+        // Fetched ahead, so the lyrics are there the moment they are opened.
+        fx.extend(self.lyrics_opened(w));
         fx
     }
 
@@ -1456,13 +1454,11 @@ impl UiState {
             )));
         }
         // Lyrics: reload for the new track if the panel is open, otherwise when it opens.
-        self.lyrics.clear();
         self.lyrics_uri.clear();
+        self.lyrics_asked.clear();
         w.set_lyrics(ModelRc::default());
-        w.set_lyrics_index(-1);
-        if w.get_lyrics_open() {
-            fx.extend(self.lyrics_opened(w));
-        }
+        // Fetched ahead, so the lyrics are there the moment they are opened.
+        fx.extend(self.lyrics_opened(w));
         fx.push(self.save_resume(0));
         fx
     }
@@ -1508,25 +1504,7 @@ impl UiState {
                 }
             }
         }
-        self.update_lyrics_line(w);
         fx
-    }
-
-    pub fn position_changed(&mut self, w: &AppWindow) {
-        self.update_lyrics_line(w);
-    }
-
-    fn update_lyrics_line(&mut self, w: &AppWindow) {
-        if self.lyrics.is_empty() || !w.get_lyrics_synced() {
-            return;
-        }
-        // Show a line slightly early: reading lags behind hearing.
-        let pos = u32::try_from(w.get_position_ms() + 250).unwrap_or(0);
-        let idx = current_line(&self.lyrics, pos);
-        if idx != self.lyrics_index {
-            self.lyrics_index = idx;
-            w.set_lyrics_index(idx.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1));
-        }
     }
 
     pub fn lyrics_opened(&mut self, w: &AppWindow) -> Vec<Effect> {
@@ -1542,6 +1520,10 @@ impl UiState {
             // Asked again once the artist and length are known: LRCLIB matches on them.
             return Vec::new();
         }
+        if self.lyrics_asked == self.playing.uri {
+            return Vec::new();
+        }
+        self.lyrics_asked.clone_from(&self.playing.uri);
         w.set_lyrics_provider("".into());
         vec![Effect::Library(LibraryCommand::Lyrics {
             uri: self.playing.uri.clone(),
@@ -2276,6 +2258,39 @@ fn merge_track(track: &mut TrackInfo, from: &TrackItem) {
     if track.cover_url.is_none() {
         track.cover_url.clone_from(&from.image_url);
     }
+}
+
+/// Lyrics lines for the overlay; times in ms of the song (`-1`: not synced).
+fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
+    let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    let starts: Vec<i32> = lines.iter().map(|l| l.start_ms.map_or(-1, ms)).collect();
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let start = starts[i];
+            let next = starts[i + 1..]
+                .iter()
+                .copied()
+                .find(|&s| s > start)
+                .unwrap_or(i32::MAX);
+            let words: Vec<LyricWord> = line
+                .words
+                .iter()
+                .map(|w| LyricWord {
+                    text: w.text.trim().into(),
+                    start: ms(w.start_ms),
+                    end: ms(w.end_ms),
+                })
+                .collect();
+            LyricRow {
+                text: line.text.clone().into(),
+                start,
+                next,
+                words: ModelRc::from(Rc::new(VecModel::from(words))),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 
 pub mod extras;
 mod internal;
+pub mod lyrics;
 mod metadata;
 pub mod model;
 pub mod webapi;
@@ -112,7 +113,7 @@ pub enum LibraryEvent {
     /// `None`: no lyrics anywhere for this track.
     Lyrics {
         uri: String,
-        lyrics: Option<extras::Lyrics>,
+        lyrics: Option<lyrics::Lyrics>,
     },
     Error(String),
 }
@@ -348,7 +349,7 @@ impl Service {
                     artist,
                     duration_ms,
                 } => LibraryEvent::Lyrics {
-                    lyrics: extras::lyrics(&session, &uri, &title, &artist, duration_ms).await,
+                    lyrics: lyrics::lyrics(&session, &uri, &title, &artist, duration_ms).await,
                     uri,
                 },
                 _ => return None,

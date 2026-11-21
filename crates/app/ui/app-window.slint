@@ -2,8 +2,9 @@
 // in Rust. Layout: sidebar · page · (queue) over the player bar; lyrics and the quick-jump palette
 // are overlays.
 import { ListView, ScrollView } from "std-widgets.slint";
+import { LyricsView, LyricRow, LyricWord } from "lyrics.slint";
 import { Theme, Fonts, Layout, Caption, Heading, Icon, IconButton, PlayButton, Button, ButtonKind, Segmented, Toggle, Slider, Cover, Equalizer, TrackRow, RowState } from "theme.slint";
-export { RowState, Theme }
+export { RowState, Theme, LyricRow, LyricWord }
 
 export enum AuthView { checking, logged-out, waiting, connecting, reconnecting, logged-in }
 export enum PlayView { stopped, loading, playing, paused }
@@ -17,7 +18,6 @@ export struct TileData { uri: string, kind: int, title: string, subtitle: string
 export struct TrackData { code: string, title: string, artist: string, album: string, duration: string, state: RowState, image: image, has-image: bool }
 export struct DeviceRow { id: string, name: string, kind: string, active: bool }
 export struct QueueRow { code: string, title: string, artist: string, manual: bool }
-export struct LyricRow { text: string }
 // kind: 0 page, 1 playlist, 2 album, 3 artist, 4 search action, 5 liked, 6 command
 export struct PaletteRow { kind: int, icon: string, title: string, subtitle: string, uri: string }
 export struct ThemeCard { id: string, name: string, bg: color, surface: color, text: color, muted: color, accent: color, custom: bool }
@@ -893,8 +893,8 @@ export component AppWindow inherits Window {
     // lyrics
     in-out property <bool> lyrics-open;
     in property <[LyricRow]> lyrics;
-    in property <int> lyrics-index: -1;
     in property <bool> lyrics-synced;
+    in property <bool> lyrics-word-synced;            // the source timed each word
     in property <string> lyrics-status;               // "" shown, else "Загружаем…" / "Текста нет"
     in property <string> lyrics-provider;
     // quick jump (Ctrl+K)
@@ -2320,28 +2320,14 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            // synced: follows the song, the current line about a third from the top
-                            if root.lyrics-status == "" && root.lyrics-synced: lyr := Flickable {
+                            // synced: follows the song, the current line in the upper third
+                            if root.lyrics-status == "" && root.lyrics-synced: LyricsView {
                                 vertical-stretch: 1;
-                                interactive: false;
-                                property <length> line-h: 52px;
-                                content-height: root.lyrics.length * self.line-h + 400px;
-                                content-y: root.lyrics-index >= 0 ? min(0px, -(root.lyrics-index * self.line-h) + 120px) : 0px;
-                                animate content-y { duration: 450ms; easing: ease-in-out; }
-                                VerticalLayout {
-                                    padding-top: 80px;
-                                    alignment: start;
-                                    for l[i] in root.lyrics: Text {
-                                        height: lyr.line-h;
-                                        text: l.text != "" ? l.text : "♪";
-                                        font-family: Fonts.display;
-                                        font-weight: 700;
-                                        font-size: i == root.lyrics-index ? 34px : 28px;
-                                        animate font-size, color { duration: 300ms; }
-                                        color: i == root.lyrics-index ? #FFFFFF : i < root.lyrics-index ? #FFFFFF70 : #FFFFFF45;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
+                                lines: root.lyrics;
+                                position-ms: root.position-ms;
+                                playing: root.play-view == PlayView.playing;
+                                seek-to(ms) => {
+                                    if root.duration-ms > 0 { root.seek(ms / root.duration-ms); }
                                 }
                             }
                             if root.lyrics-status == "" && !root.lyrics-synced: ScrollView {
@@ -2350,19 +2336,23 @@ export component AppWindow inherits Window {
                                     padding-top: 40px;
                                     padding-bottom: 40px;
                                     alignment: start;
+                                    spacing: 10px;
                                     for l in root.lyrics: Text {
-                                        height: 44px;
+                                        min-height: 16px;
                                         text: l.text;
                                         font-family: Fonts.display;
                                         font-weight: 700;
                                         font-size: 24px;
                                         color: #FFFFFFE0;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                        wrap: word-wrap;
                                     }
                                 }
                             }
-                            if root.lyrics-provider != "": Caption { text: "Текст: " + root.lyrics-provider; color: #FFFFFF70; }
+                            if root.lyrics-provider != "": Caption {
+                                text: "Текст: " + root.lyrics-provider
+                                    + (!root.lyrics-synced ? " · без синхронизации" : root.lyrics-word-synced ? " · по словам" : "");
+                                color: #FFFFFF70;
+                            }
                         }
                     }
 
