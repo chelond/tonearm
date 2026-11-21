@@ -924,7 +924,7 @@ component LoginScreen inherits Rectangle {
                     ? "Страница входа Spotify уже открыта. Как только войдёте, Tonearm подключится сам."
                     : root.view == AuthView.reconnecting ? "Пробуем переподключиться к Spotify, это произойдёт само."
                     : root.view == AuthView.checking ? "Проверяем сохранённый вход."
-                    : "Лёгкий нативный клиент: меньше 100 МБ памяти и мгновенный запуск. Вход через браузер, пароль вводится только на сайте Spotify. Нужен Premium.";
+                    : "Лёгкий нативный клиент для Spotify с низким потреблением ресурсов. Вход через браузер на сайте Spotify. Требуется Premium.";
                 font-size: 16px;
                 color: Theme.text-2;
                 wrap: word-wrap;
@@ -1560,11 +1560,6 @@ export component AppWindow inherits Window {
                                 padding-top: 28px;
                                 padding-bottom: 32px;
                                 spacing: 28px;
-                                VerticalLayout {
-                                    spacing: 4px;
-                                    Text { text: root.greeting; font-family: Fonts.display; font-weight: 700; font-size: 34px; color: Theme.text-1; }
-                                    Caption { text: root.date-label; font-size: 13px; }
-                                }
                                 // quick access: Liked + first playlists, two columns
                                 Rectangle {
                                     property <int> cols: self.width > 900px ? 3 : 2;
@@ -2212,7 +2207,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.stats-tracks.length == 0: Text {
-                                    text: "Пока пусто. Послушайте что-нибудь, и здесь появятся любимые треки и исполнители недели.";
+                                    text: "За эту неделю пока нет прослушиваний. Послушайте музыку, чтобы появилась статистика.";
                                     font-size: 14px;
                                     color: Theme.text-3;
                                     wrap: word-wrap;
@@ -2583,12 +2578,12 @@ export component AppWindow inherits Window {
                                         SettingRow {
                                             title: "Tonearm " + root.version;
                                             hint: root.update-state == UpdateState.checking ? "Проверяю…"
-                                                : root.update-state == UpdateState.latest ? "Это последняя версия"
+                                                : root.update-state == UpdateState.latest ? "Актуальная версия"
                                                 : root.update-state == UpdateState.available ? "Доступна версия " + root.update-version
                                                 : root.update-state == UpdateState.downloading ? "Скачиваю " + root.update-version + "…"
                                                 : root.update-state == UpdateState.installing ? "Устанавливаю " + root.update-version + "…"
                                                 : root.update-state == UpdateState.failed ? root.update-message
-                                                : "Файлы обновлений подписаны, чужой файл не установится";
+                                                : "";
                                             if root.update-known && root.update-state != UpdateState.downloading && root.update-state != UpdateState.installing: Button {
                                                 text: root.update-state == UpdateState.failed ? "Повторить" : "Обновить";
                                                 kind: ButtonKind.primary;
@@ -2611,7 +2606,7 @@ export component AppWindow inherits Window {
                                         title: "Аккаунт";
                                         SettingRow {
                                             title: root.username;
-                                            hint: "Вход хранится в зашифрованном виде, в config.toml его нет";
+                                            hint: "";
                                             last: true;
                                             Button { text: "Выйти"; icon: "logout"; kind: ButtonKind.danger; clicked => { root.logout(); } }
                                         }
@@ -2621,7 +2616,8 @@ export component AppWindow inherits Window {
                                         for k[i] in [
                                             { key: "Пробел", what: "Пауза / продолжить" },
                                             { key: "Ctrl K", what: "Быстрый переход" },
-                                            { key: "← →", what: "Перемотка на 5 секунд, с Ctrl: предыдущий / следующий трек" },
+                                            { key: "← →", what: "Перемотка на 5 секунд" },
+                                            { key: "Ctrl + ← →", what: "Предыдущий / следующий трек" },
                                             { key: "↑ ↓", what: "Громкость" },
                                             { key: "Q", what: "Очередь" },
                                             { key: "L", what: "Текст песни" },
@@ -2831,7 +2827,7 @@ export component AppWindow inherits Window {
                             padding: 20px;
                             vertical-stretch: 1;
                             Text {
-                                text: "Дальше пусто. Правый клик по треку → «В очередь» или «Радио по треку».";
+                                text: "Очередь пуста. Добавьте трек через контекстное меню.";
                                 font-size: 13px;
                                 color: Theme.text-3;
                                 wrap: word-wrap;
