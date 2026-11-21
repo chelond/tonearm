@@ -11,10 +11,33 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub spotify: SpotifySettings,
     pub audio: AudioSettings,
+    pub effects: EffectsSettings,
     pub cache: CacheSettings,
     pub ui: UiSettings,
     pub player: PlayerSettings,
     pub update: UpdateSettings,
+    pub lastfm: LastFmSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastFmSettings {
+    /// Send plays to Last.fm (once signed in; the session key is in the keyring).
+    pub scrobble: bool,
+    /// Own API account from last.fm/api, instead of the one built into release builds.
+    /// Empty = built-in.
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+impl Default for LastFmSettings {
+    fn default() -> Self {
+        Self {
+            scrobble: true,
+            api_key: String::new(),
+            api_secret: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -64,6 +87,36 @@ pub struct AudioSettings {
     pub device: String,
 }
 
+/// Equalizer, fades and visualizer. They work with Soloist on Linux with PipeWire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EffectsSettings {
+    pub eq: bool,
+    /// A preset id (`flat`, `bass`…) or `custom` for `eq_gains`.
+    pub eq_preset: String,
+    /// Ten band gains in dB, −12..=12 (31 Hz … 16 kHz). Kept for `custom`.
+    pub eq_gains: Vec<i8>,
+    /// Fade out the end of a track and fade in the next one, seconds; 0 = off.
+    pub fade_secs: u8,
+    /// Bars under the cover in the player bar.
+    pub visualizer: bool,
+}
+
+impl Default for EffectsSettings {
+    fn default() -> Self {
+        Self {
+            eq: false,
+            eq_preset: "flat".into(),
+            eq_gains: vec![0; EQ_BANDS],
+            fade_secs: 0,
+            visualizer: false,
+        }
+    }
+}
+
+pub const EQ_BANDS: usize = 10;
+pub const FADE_SECS: [u8; 5] = [0, 2, 4, 6, 8];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheSettings {
@@ -78,6 +131,10 @@ pub struct UiSettings {
     /// Colour theme: a built-in id (`graphite`, `light`…) or `file:<name>.toml` from the
     /// themes folder. Unknown ids fall back to the default.
     pub theme: String,
+    /// Lyrics lit word by word (adds NetEase, an unofficial source) instead of line by line.
+    pub lyrics_words: bool,
+    /// The sidebar's smart playlists are folded.
+    pub smart_collapsed: bool,
 }
 
 impl Default for AudioSettings {
@@ -102,6 +159,8 @@ impl Default for UiSettings {
         Self {
             notifications: true,
             theme: "graphite".into(),
+            lyrics_words: false,
+            smart_collapsed: false,
         }
     }
 }
@@ -117,6 +176,15 @@ impl Settings {
             self.audio.bitrate = 320;
         }
         self.cache.max_size_mb = self.cache.max_size_mb.clamp(32, 16_384);
+        let fx = &mut self.effects;
+        fx.eq_gains.resize(EQ_BANDS, 0);
+        for g in &mut fx.eq_gains {
+            *g = (*g).clamp(-12, 12);
+        }
+        fx.fade_secs = fx.fade_secs.min(12);
+        if fx.eq_preset.is_empty() {
+            fx.eq_preset = "flat".into();
+        }
         self
     }
 
@@ -203,6 +271,10 @@ mod tests {
         assert_eq!(s.audio.bitrate, 320);
         assert_eq!(s.cache.max_size_mb, 32);
         assert!(s.audio.gapless, "missing keys default");
+        std::fs::write(&path, "[effects]\neq_gains = [40, -3]\nfade_secs = 99\n").unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.effects.eq_gains, [12, -3, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(s.effects.fade_secs, 12);
         std::fs::write(&path, "not toml [").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
     }

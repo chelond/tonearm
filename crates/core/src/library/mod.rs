@@ -4,6 +4,7 @@
 
 pub mod extras;
 mod internal;
+pub mod lyrics;
 mod metadata;
 pub mod model;
 pub mod webapi;
@@ -55,6 +56,8 @@ pub enum LibraryCommand {
         title: String,
         artist: String,
         duration_ms: u32,
+        /// Word-by-word mode (adds the unofficial NetEase source).
+        words: bool,
     },
 }
 
@@ -112,7 +115,7 @@ pub enum LibraryEvent {
     /// `None`: no lyrics anywhere for this track.
     Lyrics {
         uri: String,
-        lyrics: Option<extras::Lyrics>,
+        lyrics: Option<lyrics::Lyrics>,
     },
     Error(String),
 }
@@ -347,8 +350,10 @@ impl Service {
                     title,
                     artist,
                     duration_ms,
+                    words,
                 } => LibraryEvent::Lyrics {
-                    lyrics: extras::lyrics(&session, &uri, &title, &artist, duration_ms).await,
+                    lyrics: lyrics::lyrics(&session, &uri, &title, &artist, duration_ms, words)
+                        .await,
                     uri,
                 },
                 _ => return None,

@@ -1,0 +1,412 @@
+// Year summary ("Итоги года") and the smart playlist rule editor.
+import { ScrollView } from "std-widgets.slint";
+import { Theme, Fonts, Layout, Caption, Heading, Icon, IconButton, PlayButton, Button, ButtonKind, Segmented, Cover } from "theme.slint";
+
+export struct StatRow { title: string, subtitle: string, value: string, share: float, uri: string, image: image, has-image: bool }
+export struct MonthBar { label: string, value: string, share: float, top: bool }
+export struct WrappedInfo {
+    year: string, empty: bool,
+    hours: string, minutes: string, plays: string, tracks: string, artists: string,
+    days: string, streak: string, top-month: string, time-of-day: string,
+    first-title: string, first-artist: string, first-date: string,
+    top-artist: string, top-artist-minutes: string,
+}
+
+component YearChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    height: 32px;
+    width: tx.preferred-width + 28px;
+    border-radius: 16px;
+    background: root.active ? Theme.text-1 : t.has-hover ? Theme.line-2 : Theme.hover;
+    animate background { duration: Theme.fast; }
+    tx := Text {
+        text: root.text;
+        font-size: 13px;
+        font-weight: root.active ? 600 : 400;
+        color: root.active ? Theme.bg : Theme.text-1;
+    }
+    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// A fact card that rises in after the page opens.
+component FactCard inherits Rectangle {
+    in property <string> value;
+    in property <string> label;
+    in property <int> order;
+    property <bool> shown: false;
+    init => { self.shown = true; }
+    height: 112px;
+    border-radius: Layout.radius;
+    background: Theme.surface;
+    opacity: self.shown ? 1 : 0;
+    animate opacity { duration: 360ms; delay: root.order * 70ms; }
+    VerticalLayout {
+        padding: 20px;
+        padding-top: root.shown ? 20px : 32px;
+        animate padding-top { duration: 420ms; delay: root.order * 70ms; easing: ease-out; }
+        spacing: 6px;
+        alignment: center;
+        Text { text: root.value != "" ? root.value : "—"; font-family: Fonts.display; font-weight: 700; font-size: 26px; color: Theme.text-1; overflow: elide; }
+        Text { text: root.label; font-size: 13px; color: Theme.text-2; wrap: word-wrap; }
+    }
+}
+
+component TopRow inherits Rectangle {
+    in property <StatRow> item;
+    in property <int> place;
+    in property <bool> round;
+    callback clicked();
+    callback double-clicked();
+    height: 60px;
+    border-radius: 8px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        double-clicked => { root.double-clicked(); }
+    }
+    Rectangle {
+        x: 0;
+        width: parent.width * root.item.share;
+        animate width { duration: 700ms; easing: ease-out; }
+        border-radius: 8px;
+        background: Theme.accent.with-alpha(0.10);
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 12px;
+        Text { width: 20px; text: root.place; font-size: 14px; font-weight: 600; color: root.place == 1 ? Theme.accent : Theme.text-3; vertical-alignment: center; }
+        Cover { width: 44px; height: 44px; y: 8px; radius: root.round ? 22px : 6px; round: root.round; source: root.item.image; loaded: root.item.has-image; placeholder-icon: root.round ? "user" : "play"; }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text { text: root.item.title; font-size: 14px; font-weight: 600; color: Theme.text-1; overflow: elide; }
+            if root.item.subtitle != "": Text { text: root.item.subtitle; font-size: 12px; color: Theme.text-2; overflow: elide; }
+        }
+        Text { text: root.item.value; font-size: 13px; color: Theme.text-2; vertical-alignment: center; }
+    }
+}
+
+export component WrappedPage inherits Rectangle {
+    in property <WrappedInfo> info;
+    in property <[string]> years;
+    in property <int> year-index;
+    in property <bool> loading;
+    in property <[MonthBar]> months;
+    in property <[StatRow]> tracks;
+    in property <[StatRow]> artists;
+    in property <[StatRow]> albums;
+    callback pick-year(int);
+    callback play(int /* -1: all */);
+    callback open-artist(string);
+    callback open-album(string);
+
+    ScrollView {
+        VerticalLayout {
+            alignment: start;
+            padding-left: Layout.page-x;
+            padding-right: Layout.page-x;
+            padding-top: 28px;
+            padding-bottom: 32px;
+            spacing: 20px;
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 4px;
+                    Text { text: "Итоги года"; font-family: Fonts.display; font-weight: 700; font-size: 34px; color: Theme.text-1; }
+                    Caption { text: root.loading ? "Считаем…" : "По истории прослушиваний в Tonearm на этом компьютере. Никуда не отправляется."; font-size: 13px; }
+                }
+                for y[i] in root.years: YearChip {
+                    y: (parent.height - self.height) / 2;
+                    text: y;
+                    active: i == root.year-index;
+                    clicked => { root.pick-year(i); }
+                }
+            }
+            if root.info.empty && !root.loading: Rectangle {
+                height: 160px;
+                border-radius: Layout.radius;
+                background: Theme.surface;
+                Text {
+                    width: parent.width - 48px;
+                    text: "За " + root.info.year + " год пока нет прослушиваний. Послушайте музыку, чтобы здесь появились итоги.";
+                    font-size: 15px;
+                    color: Theme.text-2;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                }
+            }
+            if !root.info.empty: hero := Rectangle {
+                property <bool> shown: false;
+                init => { self.shown = true; }
+                height: 280px;
+                border-radius: 18px;
+                clip: true;
+                background: @linear-gradient(125deg, Theme.accent 0%, Theme.accent.darker(0.55) 70%, Theme.accent.darker(0.8) 100%);
+                animate background { duration: Theme.slow; }
+                // soft circles for depth
+                Rectangle { x: parent.width - 260px; y: -120px; width: 420px; height: 420px; border-radius: 210px; background: #FFFFFF12; }
+                Rectangle { x: -80px; y: parent.height - 90px; width: 260px; height: 260px; border-radius: 130px; background: #00000018; }
+                HorizontalLayout {
+                    padding: 36px;
+                    spacing: 32px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 8px;
+                        Text { text: "Ваш " + root.info.year + " в музыке"; font-size: 15px; font-weight: 600; color: Theme.on-accent.with-alpha(0.8); }
+                        Text {
+                            text: root.info.hours != "0" ? root.info.hours + " ч" : root.info.minutes + " мин";
+                            font-family: Fonts.display;
+                            font-weight: 700;
+                            font-size: hero.shown ? 76px : 56px;
+                            animate font-size { duration: 600ms; easing: ease-out; }
+                            color: Theme.on-accent;
+                        }
+                        Text {
+                            text: root.info.plays + " прослушиваний · " + root.info.tracks + " треков · " + root.info.artists + " исполнителей";
+                            font-size: 14px;
+                            color: Theme.on-accent.with-alpha(0.85);
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            padding-top: 12px;
+                            spacing: 12px;
+                            alignment: start;
+                            PlayButton { size: 48px; fill: Theme.on-accent; ink: Theme.accent; clicked => { root.play(-1); } }
+                            Text { text: "Слушать топ года"; font-size: 14px; font-weight: 600; color: Theme.on-accent; vertical-alignment: center; }
+                        }
+                    }
+                    if root.artists.length > 0: VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        width: 200px;
+                        HorizontalLayout {
+                            alignment: center;
+                            Cover {
+                                width: hero.shown ? 150px : 120px;
+                                height: self.width;
+                                animate width { duration: 600ms; easing: ease-out; }
+                                round: true;
+                                source: root.artists[0].image;
+                                loaded: root.artists[0].has-image;
+                                placeholder-icon: "user";
+                                drop-shadow-blur: 30px;
+                                drop-shadow-color: #00000060;
+                            }
+                        }
+                        Text { text: "Исполнитель года"; font-size: 12px; color: Theme.on-accent.with-alpha(0.75); horizontal-alignment: center; }
+                        Text { text: root.info.top-artist; font-size: 20px; font-weight: 700; color: Theme.on-accent; horizontal-alignment: center; overflow: elide; }
+                        Text { text: root.info.top-artist-minutes; font-size: 13px; color: Theme.on-accent.with-alpha(0.8); horizontal-alignment: center; }
+                    }
+                }
+            }
+            if !root.info.empty: HorizontalLayout {
+                spacing: 16px;
+                FactCard { order: 0; value: root.info.days; label: "с музыкой"; }
+                FactCard { order: 1; value: root.info.streak; label: "подряд, самая длинная серия"; }
+                FactCard { order: 2; value: root.info.top-month; label: "самый музыкальный месяц"; }
+                FactCard { order: 3; value: root.info.time-of-day; label: "чаще всего слушаете"; }
+            }
+            if !root.info.empty: Rectangle {
+                border-radius: Layout.radius;
+                background: Theme.surface;
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    Heading { text: "По месяцам"; }
+                    HorizontalLayout {
+                        height: 170px;
+                        spacing: 8px;
+                        for m in root.months: VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: end;
+                            spacing: 6px;
+                            property <bool> shown: false;
+                            init => { self.shown = true; }
+                            Text {
+                                text: m.top ? m.value : " ";
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: Theme.accent;
+                                horizontal-alignment: center;
+                            }
+                            Rectangle {
+                                height: parent.shown ? max(4px, 110px * m.share) : 4px;
+                                animate height { duration: 700ms; easing: ease-out; }
+                                border-radius: 5px;
+                                background: m.top ? Theme.accent : bar-t.has-hover ? Theme.accent.with-alpha(0.6) : Theme.accent.with-alpha(0.32);
+                                animate background { duration: Theme.fast; }
+                                bar-t := TouchArea { }
+                            }
+                            Text {
+                                text: bar-t.has-hover ? m.value : m.label;
+                                font-size: 11px;
+                                color: m.top || bar-t.has-hover ? Theme.text-1 : Theme.text-3;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+            if !root.info.empty: HorizontalLayout {
+                spacing: 24px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 8px;
+                    alignment: start;
+                    Heading { text: "Треки года"; }
+                    for t[i] in root.tracks: TopRow {
+                        item: t;
+                        place: i + 1;
+                        double-clicked => { root.play(i); }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 8px;
+                    alignment: start;
+                    Heading { text: "Исполнители года"; }
+                    for a[i] in root.artists: TopRow {
+                        item: a;
+                        place: i + 1;
+                        round: true;
+                        clicked => { if a.uri != "" { root.open-artist(a.uri); } }
+                    }
+                    Rectangle { height: 12px; }
+                    Heading { text: "Альбомы года"; }
+                    for a[i] in root.albums: TopRow {
+                        item: a;
+                        place: i + 1;
+                        clicked => { if a.uri != "" { root.open-album(a.uri); } }
+                    }
+                }
+            }
+            if !root.info.empty && root.info.first-title != "": Rectangle {
+                height: 72px;
+                border-radius: Layout.radius;
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 14px;
+                    VerticalLayout { alignment: center; Icon { name: "sparkle"; size: 20px; ink: Theme.accent; } }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text { text: "С этого трека начался ваш год · " + root.info.first-date; font-size: 12px; color: Theme.text-3; }
+                        Text { text: root.info.first-title + " · " + root.info.first-artist; font-size: 14px; font-weight: 600; color: Theme.text-1; overflow: elide; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component EditorRow inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 16px;
+    height: 40px;
+    Text { width: 130px; text: root.label; font-size: 13px; color: Theme.text-2; vertical-alignment: center; }
+    HorizontalLayout { horizontal-stretch: 1; alignment: start; VerticalLayout { alignment: center; @children } }
+}
+
+// Modal editor of a smart playlist's rules.
+export component SmartEditor inherits Rectangle {
+    in property <bool> is-new;
+    in-out property <string> name;
+    in-out property <int> source;
+    in-out property <int> played;
+    in-out property <int> days;
+    in-out property <int> min-plays;
+    in-out property <int> order;
+    in-out property <int> limit;
+    callback save();
+    callback delete();
+    callback close();
+    property <bool> shown: false;
+    init => { self.shown = true; name-input.focus(); }
+    background: #00000088;
+    opacity: self.shown ? 1 : 0;
+    animate opacity { duration: 160ms; }
+    TouchArea { clicked => { root.close(); } }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 + (root.shown ? 0 : 16px);
+        animate y { duration: 220ms; easing: ease-out; }
+        width: min(660px, parent.width - 48px);
+        height: col.preferred-height;
+        border-radius: 16px;
+        background: Theme.surface-2;
+        border-width: 1px;
+        border-color: Theme.line-2;
+        drop-shadow-blur: 40px;
+        drop-shadow-color: #000000AA;
+        drop-shadow-offset-y: 12px;
+        TouchArea { }
+        col := VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 12px;
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 10px;
+                    background: @linear-gradient(135deg, #128C7E 0%, #7FE0C4 100%);
+                    Icon { name: "sparkle"; size: 20px; ink: #FFFFFF; }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text { text: root.is-new ? "Новый умный плейлист" : "Правила плейлиста"; font-family: Fonts.display; font-weight: 700; font-size: 20px; color: Theme.text-1; }
+                }
+                IconButton { icon: "close"; clicked => { root.close(); } }
+            }
+            Rectangle {
+                height: 44px;
+                border-radius: 10px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: name-input.has-focus ? Theme.accent : Theme.line;
+                animate border-color { duration: Theme.fast; }
+                name-input := TextInput {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    single-line: true;
+                    font-size: 15px;
+                    color: Theme.text-1;
+                    selection-background-color: Theme.accent;
+                    text <=> root.name;
+                    accepted => { root.save(); }
+                }
+                if root.name == "": Text { x: 14px; height: parent.height; vertical-alignment: center; text: "Название"; font-size: 15px; color: Theme.text-3; }
+            }
+            EditorRow { label: "Откуда треки"; Segmented { items: ["Любимые", "Всё прослушанное"]; current <=> root.source; } }
+            EditorRow { label: "Когда слушал"; Segmented { items: ["Неважно", "Ни разу", "Давно", "Недавно"]; current <=> root.played; } }
+            if root.played == 2 || root.played == 3: EditorRow {
+                label: root.played == 2 ? "Не слушал уже" : "За последние";
+                Segmented { items: ["Неделя", "Месяц", "3 месяца", "Полгода", "Год"]; current <=> root.days; }
+            }
+            if root.played != 1: EditorRow { label: "Прослушиваний"; Segmented { items: ["Любое", "от 2", "от 3", "от 5", "от 10"]; current <=> root.min-plays; } }
+            EditorRow { label: "Порядок"; Segmented { items: ["Частые", "Давние", "Недавние", "Вперемешку", "Как есть"]; current <=> root.order; } }
+            EditorRow { label: "Сколько треков"; Segmented { items: ["25", "50", "100", "250", "Все"]; current <=> root.limit; } }
+            HorizontalLayout {
+                padding-top: 8px;
+                spacing: 10px;
+                if !root.is-new: Button { text: "Удалить"; kind: ButtonKind.danger; clicked => { root.delete(); } }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Отмена"; kind: ButtonKind.ghost; clicked => { root.close(); } }
+                Button { text: root.is-new ? "Создать" : "Сохранить"; kind: ButtonKind.primary; clicked => { root.save(); } }
+            }
+        }
+    }
+}

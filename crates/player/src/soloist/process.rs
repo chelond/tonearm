@@ -22,6 +22,7 @@ pub struct Args<'a> {
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub volume: u8,
+    pub pipewire_device: Option<&'a str>,
 }
 
 /// No console (and no conhost.exe) for Soloist on Windows.
@@ -63,8 +64,11 @@ pub async fn spawn(args: &Args<'_>, log: PathBuf) -> std::io::Result<Spawned> {
             "127.0.0.1:0",
             "--initial-volume",
         ])
-        .arg(args.volume.min(100).to_string())
-        .stdin(Stdio::null())
+        .arg(args.volume.min(100).to_string());
+    if let Some(node) = args.pipewire_device {
+        cmd.arg("--pipewire-device").arg(node);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

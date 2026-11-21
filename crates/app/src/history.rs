@@ -1,7 +1,10 @@
 //! Listening history and the "continue where you left off" state, kept in the data directory
 //! (`~/.local/share/tonearm`, `%LOCALAPPDATA%\tonearm\data`). Nothing leaves the computer.
 //!
-//! The history is capped and written as one small JSON file; stats are computed from it.
+//! Two files: `history.json` holds the latest plays (capped, rewritten when a track ends) for
+//! recents and the weekly stats; `plays/<year>.jsonl` keeps every play for good, one JSON line
+//! each, appended and never rewritten. The yearly files feed the year summary and the smart
+//! playlists, and are plain enough to export (artist, title, album, start time, length).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +37,8 @@ pub struct Entry {
     pub artist_uri: Option<String>,
     #[serde(default)]
     pub album: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_uri: Option<String>,
     #[serde(default)]
     pub image_url: Option<String>,
     pub duration_ms: u32,
@@ -114,6 +119,104 @@ fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
 
 const HISTORY_FILE: &str = "history.json";
 const RESUME_FILE: &str = "resume.json";
+const PLAYS_DIR: &str = "plays";
+
+/// Local calendar year of a unix time.
+#[must_use]
+pub fn year_of(at: u64) -> i32 {
+    use chrono::Datelike;
+    i64::try_from(at)
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map_or(1970, |t| t.with_timezone(&chrono::Local).year())
+}
+
+/// The permanent play log: one `<year>.jsonl` file per year.
+pub struct PlayLog {
+    dir: PathBuf,
+}
+
+impl PlayLog {
+    #[must_use]
+    pub fn open() -> Option<Self> {
+        path(PLAYS_DIR).map(|dir| Self { dir })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn at(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn file(&self, year: i32) -> PathBuf {
+        self.dir.join(format!("{year}.jsonl"))
+    }
+
+    /// Adds one play at the end of its year's file.
+    pub fn append(&self, e: &Entry) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(&self.dir)?;
+        let mut line = serde_json::to_vec(e).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.file(year_of(e.at)))?;
+        f.write_all(&line)
+    }
+
+    /// First start with the log: copy the history kept so far into it, so the year summary
+    /// starts from everything already known.
+    pub fn seed(&self, entries: &[Entry]) {
+        if self.dir.exists() {
+            return;
+        }
+        for e in entries {
+            if let Err(err) = self.append(e) {
+                tracing::warn!(error = %err, "cannot write the play log");
+                return;
+            }
+        }
+        // An empty history still marks the log as started.
+        let _ = std::fs::create_dir_all(&self.dir);
+    }
+
+    /// Years with plays, newest first.
+    #[must_use]
+    pub fn years(&self) -> Vec<i32> {
+        let mut years: Vec<i32> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|d| {
+                let name = d.file_name().into_string().ok()?;
+                name.strip_suffix(".jsonl")?.parse().ok()
+            })
+            .collect();
+        years.sort_unstable_by(|a, b| b.cmp(a));
+        years
+    }
+
+    /// Plays of one year in the order they happened. A damaged line is skipped, not fatal.
+    #[must_use]
+    pub fn read_year(&self, year: i32) -> Vec<Entry> {
+        let Ok(text) = std::fs::read_to_string(self.file(year)) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Every play ever logged, oldest first.
+    #[must_use]
+    pub fn read_all(&self) -> Vec<Entry> {
+        let mut years = self.years();
+        years.reverse();
+        years.into_iter().flat_map(|y| self.read_year(y)).collect()
+    }
+}
 
 #[must_use]
 pub fn now() -> u64 {
@@ -125,10 +228,14 @@ pub fn now() -> u64 {
 impl Store {
     #[must_use]
     pub fn load() -> Self {
-        Self {
+        let store = Self {
             entries: read_json(HISTORY_FILE).unwrap_or_default(),
             resume: read_json(RESUME_FILE),
+        };
+        if let Some(log) = PlayLog::open() {
+            log.seed(&store.entries);
         }
+        store
     }
 
     /// The history (written when a track ends) and the resume point.
@@ -291,6 +398,31 @@ mod tests {
         }
         assert_eq!(s.entries.len(), MAX_ENTRIES);
         assert_eq!(s.entries[0].uri, "5");
+    }
+
+    #[test]
+    fn play_log_appends_by_year_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = PlayLog::at(dir.path().join("plays"));
+        // 2025-06-01 and 2026-06-01 (midday UTC: the same year in any time zone).
+        let (a, b) = (1_748_779_200, 1_780_315_200);
+        log.seed(&[entry("t1", "A", a, "")]);
+        // Seeding happens once only.
+        log.seed(&[entry("x", "A", a, "")]);
+        log.append(&entry("t2", "B", b, "")).unwrap();
+        log.append(&entry("t3", "B", b + 10, "")).unwrap();
+        assert_eq!(log.years(), [2026, 2025]);
+        let y: Vec<String> = log.read_year(2026).into_iter().map(|e| e.uri).collect();
+        assert_eq!(y, ["t2", "t3"]);
+        let all: Vec<String> = log.read_all().into_iter().map(|e| e.uri).collect();
+        assert_eq!(all, ["t1", "t2", "t3"]);
+        // A broken line does not lose the rest.
+        let f = dir.path().join("plays/2026.jsonl");
+        let mut text = std::fs::read_to_string(&f).unwrap();
+        text.push_str("{broken\n");
+        std::fs::write(&f, text).unwrap();
+        log.append(&entry("t4", "B", b + 20, "")).unwrap();
+        assert_eq!(log.read_year(2026).len(), 3);
     }
 
     #[test]

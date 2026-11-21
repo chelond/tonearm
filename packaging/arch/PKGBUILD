@@ -1,7 +1,7 @@
 # Maintainer: chelond
 # Build from a local checkout: cd packaging/arch && makepkg -si
 pkgname=tonearm
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Lightweight native music streaming client (unofficial, requires Premium)"
 arch=('x86_64' 'aarch64')
@@ -12,7 +12,8 @@ license=('MIT')
 depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'libx11' 'libxcursor' 'libxi' 'libxrandr' 'alsa-lib')
 optdepends=('gnome-keyring: keep the login in Secret Service instead of the encrypted file'
-            'playerctl: control playback from the command line over MPRIS')
+            'playerctl: control playback from the command line over MPRIS'
+            'pipewire: equalizer, fades between tracks and visualizer with Soloist')
 makedepends=('cargo')
 options=('!lto' '!debug')
 source=()
@@ -29,6 +30,12 @@ build() {
   cd "$(_srcroot)"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
+  # Last.fm API account for scrobbling: TONEARM_LASTFM_KEY / TONEARM_LASTFM_SECRET from the
+  # environment, or from packaging/arch/lastfm.env (not in git). Without them the build works,
+  # only Last.fm is off.
+  if [[ -f "$startdir/lastfm.env" ]]; then
+    set -a; source "$startdir/lastfm.env"; set +a
+  fi
   cargo build --frozen --release -p tonearm
 }
 

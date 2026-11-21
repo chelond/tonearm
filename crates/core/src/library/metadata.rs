@@ -61,6 +61,46 @@ pub(super) fn track_item(t: &Track) -> TrackItem {
 
 /// Covers for tracks whose metadata came without one: some track records carry no album
 /// pictures, the album record itself does. One request per distinct album.
+/// An artist's picture. Current metadata leaves `portrait` empty and fills `portrait_group`;
+/// older entries have only the biography's portraits.
+pub(super) fn artist_image(a: &Artist) -> Option<String> {
+    image_url(&a.portraits)
+        .or_else(|| image_url(&a.portrait_group))
+        .or_else(|| {
+            a.biographies.iter().find_map(|b| {
+                image_url(&b.portraits).or_else(|| b.portrait_group.iter().find_map(image_url))
+            })
+        })
+}
+
+/// Pictures for artist tiles that have none (search results only know the artist's name).
+pub(super) async fn fill_artist_images(session: &Session, tiles: &mut [Tile]) {
+    let wanted: Vec<String> = tiles
+        .iter()
+        .filter(|t| t.kind == CollectionKind::Artist && t.image_url.is_none())
+        .map(|t| t.uri.clone())
+        .collect();
+    let found: Vec<(String, Option<String>)> = stream::iter(wanted)
+        .map(|uri| async move {
+            let image = match SpotifyUri::from_uri(&uri) {
+                Ok(id) => Artist::get(session, &id)
+                    .await
+                    .ok()
+                    .and_then(|a| artist_image(&a)),
+                Err(_) => None,
+            };
+            (uri, image)
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+    for t in tiles.iter_mut() {
+        if let Some((_, image)) = found.iter().find(|(u, _)| *u == t.uri) {
+            t.image_url.clone_from(image);
+        }
+    }
+}
+
 pub(super) async fn fill_album_covers(session: &Session, items: &mut [TrackItem]) {
     let mut albums: Vec<String> = items
         .iter()
@@ -157,7 +197,7 @@ pub async fn artist(session: &Session, uri: &str) -> Result<ArtistPage, Metadata
             byline_uri: None,
             year: None,
             total_tracks: None,
-            image_url: image_url(&artist.portraits),
+            image_url: artist_image(&artist),
         },
         top_tracks,
         albums: albums.into_iter().map(|(_, t)| t).collect(),

@@ -2,12 +2,15 @@
 // in Rust. Layout: sidebar · page · (queue) over the player bar; lyrics and the quick-jump palette
 // are overlays.
 import { ListView, ScrollView } from "std-widgets.slint";
+import { LyricsView, LyricRow, LyricWord } from "lyrics.slint";
+import { MiniPlayer } from "mini.slint";
+import { WrappedPage, SmartEditor, StatRow, MonthBar, WrappedInfo } from "wrapped.slint";
 import { Theme, Fonts, Layout, Caption, Heading, Icon, IconButton, PlayButton, Button, ButtonKind, Segmented, Toggle, Slider, Cover, Equalizer, TrackRow, RowState } from "theme.slint";
-export { RowState, Theme }
+export { RowState, Theme, LyricRow, LyricWord, MiniPlayer, StatRow, MonthBar, WrappedInfo }
 
 export enum AuthView { checking, logged-out, waiting, connecting, reconnecting, logged-in }
 export enum PlayView { stopped, loading, playing, paused }
-export enum Page { home, search, library, settings, collection, stats }
+export enum Page { home, search, library, settings, collection, stats, wrapped }
 // idle: nothing known yet; latest: checked, this is the newest; failed: check or install failed.
 export enum UpdateState { idle, checking, latest, available, downloading, installing, failed }
 
@@ -17,11 +20,9 @@ export struct TileData { uri: string, kind: int, title: string, subtitle: string
 export struct TrackData { code: string, title: string, artist: string, album: string, duration: string, state: RowState, image: image, has-image: bool }
 export struct DeviceRow { id: string, name: string, kind: string, active: bool }
 export struct QueueRow { code: string, title: string, artist: string, manual: bool }
-export struct LyricRow { text: string }
 // kind: 0 page, 1 playlist, 2 album, 3 artist, 4 search action, 5 liked, 6 command
 export struct PaletteRow { kind: int, icon: string, title: string, subtitle: string, uri: string }
 export struct ThemeCard { id: string, name: string, bg: color, surface: color, text: color, muted: color, accent: color, custom: bool }
-export struct StatRow { title: string, subtitle: string, value: string, share: float, uri: string, image: image, has-image: bool }
 
 export global Fmt {
     // "1:24"
@@ -39,11 +40,12 @@ export global Fmt {
 component PageIn inherits Rectangle {
     property <bool> shown: false;
     init => { self.shown = true; }
-    opacity: self.shown ? 1 : 0;
-    animate opacity { duration: 260ms; easing: ease-out; }
+    // Starts mostly visible and settles quickly: a click shows the page at once.
+    opacity: self.shown ? 1 : 0.4;
+    animate opacity { duration: 140ms; easing: ease-out; }
     Rectangle {
-        y: root.shown ? 0px : 14px;
-        animate y { duration: 320ms; easing: ease-out; }
+        y: root.shown ? 0px : 8px;
+        animate y { duration: 180ms; easing: ease-out; }
         width: root.width;
         height: root.height;
         @children
@@ -78,7 +80,7 @@ component NavItem inherits Rectangle {
     callback clicked();
     height: 40px;
     border-radius: 8px;
-    background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    background: root.active ? Theme.selected : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.fast; }
     // accent mark that grows on the open page
     Rectangle {
@@ -111,7 +113,13 @@ component NavItem inherits Rectangle {
             horizontal-stretch: 1;
         }
     }
-    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        // Navigation acts on press, not on release: one frame sooner and it feels instant.
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Sidebar playlist with a small cover.
@@ -126,7 +134,7 @@ component SidebarRow inherits Rectangle {
     callback clicked();
     height: 52px;
     border-radius: 8px;
-    background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    background: root.active ? Theme.selected : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.fast; }
     HorizontalLayout {
         padding-left: 8px;
@@ -164,7 +172,56 @@ component SidebarRow inherits Rectangle {
             Icon { name: "volume"; size: 14px; ink: Theme.accent; }
         }
     }
-    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        // Navigation acts on press, not on release: one frame sooner and it feels instant.
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
+}
+
+// Compact sidebar row of a smart playlist.
+component SmartRow inherits Rectangle {
+    in property <string> name;
+    in property <bool> active;
+    in property <bool> playing;
+    callback clicked();
+    height: 38px;
+    border-radius: 8px;
+    background: root.active ? Theme.selected : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 10px;
+        spacing: 12px;
+        Rectangle {
+            width: 28px;
+            height: 28px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 6px;
+            background: @linear-gradient(135deg, #128C7E 0%, #7FE0C4 100%);
+            Icon { name: "sparkle"; size: touch.has-hover ? 15px : 13px; animate size { duration: Theme.fast; } ink: #FFFFFF; }
+        }
+        Text {
+            text: root.name;
+            font-size: 13px;
+            color: root.playing ? Theme.accent : Theme.text-1;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.playing: VerticalLayout {
+            alignment: center;
+            Icon { name: "volume"; size: 14px; ink: Theme.accent; }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Card with a cover; hover lifts it and shows a play button.
@@ -178,14 +235,14 @@ component TileView inherits Rectangle {
     property <bool> appeared: false;
     init => { self.appeared = true; }
     opacity: self.appeared ? 1 : 0;
-    animate opacity { duration: 380ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
+    animate opacity { duration: 220ms; delay: min(root.index, 10) * 18ms; easing: ease-out; }
     border-radius: Layout.radius;
-    background: touch.has-hover ? Theme.surface-2 : Theme.surface;
-    animate background { duration: Theme.normal; }
+    background: touch.pressed ? Theme.line-2 : touch.has-hover ? Theme.surface-2 : Theme.surface;
+    animate background { duration: Theme.fast; }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
     VerticalLayout {
         y: root.appeared ? 0px : 18px;
-        animate y { duration: 460ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
+        animate y { duration: 260ms; delay: min(root.index, 10) * 18ms; easing: ease-out; }
         padding: 12px;
         spacing: 10px;
         Rectangle {
@@ -257,12 +314,12 @@ component QuickCard inherits Rectangle {
     property <bool> appeared: false;
     init => { self.appeared = true; }
     opacity: self.appeared ? 1 : 0;
-    animate opacity { duration: 320ms; delay: min(root.index, 8) * 45ms; easing: ease-out; }
+    animate opacity { duration: 200ms; delay: min(root.index, 8) * 18ms; easing: ease-out; }
     height: 60px;
     border-radius: 8px;
     clip: true;
-    background: touch.has-hover ? Theme.line-2 : Theme.hover;
-    animate background { duration: Theme.normal; }
+    background: touch.pressed ? Theme.line-2.darker(0.15) : touch.has-hover ? Theme.line-2 : Theme.hover;
+    animate background { duration: Theme.fast; }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
     HorizontalLayout {
         spacing: 14px;
@@ -299,7 +356,7 @@ component Chip inherits Rectangle {
     height: 32px;
     width: tx.preferred-width + 28px;
     border-radius: 16px;
-    background: root.active ? Theme.text-1 : t.has-hover ? Theme.line-2 : Theme.hover;
+    background: root.active ? Theme.text-1 : t.pressed ? Theme.pressed : t.has-hover ? Theme.line-2 : Theme.hover;
     animate background { duration: Theme.fast; }
     tx := Text {
         text: root.text;
@@ -307,7 +364,12 @@ component Chip inherits Rectangle {
         font-weight: root.active ? 600 : 400;
         color: root.active ? Theme.bg : Theme.text-1;
     }
-    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    t := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Text field with an icon and a clear button.
@@ -318,6 +380,10 @@ component SearchField inherits Rectangle {
     callback edited(string);
     callback accepted(string);
     callback escape();
+    /// Esc in an empty field: give the keyboard back to the shortcuts.
+    callback leave();
+    in property <int> focus-request;
+    changed focus-request => { input.focus(); input.select-all(); }
     public function focus-input() { input.focus(); }
     height: 40px;
     border-radius: self.height / 2;
@@ -337,7 +403,12 @@ component SearchField inherits Rectangle {
             horizontal-stretch: 1;
             FocusScope {
                 key-pressed(e) => {
-                    if e.text == Key.Escape { root.escape(); return accept; }
+                    if e.text == Key.Escape {
+                        if root.text == "" { root.leave(); } else { root.escape(); }
+                        return accept;
+                    }
+                    // Down: leave the field so Space, arrows and Q work on the results.
+                    if e.text == Key.DownArrow { root.leave(); return accept; }
                     reject
                 }
                 input := TextInput {
@@ -580,6 +651,79 @@ component SettingRow inherits Rectangle {
     }
 }
 
+// One equalizer band: a vertical slider, −12…+12 dB, filled from the centre line.
+component EqBand inherits Rectangle {
+    in property <int> gain;
+    in property <string> label;
+    callback committed(int);
+    property <bool> dragging: false;
+    property <int> drag-gain;
+    property <int> shown: self.dragging ? self.drag-gain : self.gain;
+    property <length> track-top: 26px;
+    property <length> track-h: 112px;
+    property <length> mid: self.track-top + self.track-h / 2;
+    property <length> knob-y: self.track-top + self.track-h * (12 - self.shown) / 24;
+    pure function gain-at(y: length) -> int {
+        return max(-12, min(12, round(12 - (y - root.track-top) / root.track-h * 24)));
+    }
+    width: 40px;
+    height: 164px;
+    Text {
+        y: 0;
+        width: parent.width;
+        height: 18px;
+        horizontal-alignment: center;
+        text: (root.shown > 0 ? "+" : "") + root.shown;
+        font-family: Fonts.mono;
+        font-size: 11px;
+        color: root.shown == 0 ? Theme.text-3 : Theme.text-1;
+    }
+    Rectangle { x: (parent.width - 4px) / 2; y: root.track-top; width: 4px; height: root.track-h; border-radius: 2px; background: Theme.line-2; }
+    Rectangle { x: (parent.width - 14px) / 2; y: root.mid; width: 14px; height: 1px; background: Theme.text-3; }
+    Rectangle {
+        x: (parent.width - 4px) / 2;
+        y: min(root.knob-y, root.mid);
+        width: 4px;
+        height: abs(root.knob-y - root.mid);
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.knob-y - self.height / 2;
+        width: touch.has-hover || root.dragging ? 16px : 12px;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Theme.text-1;
+        animate width { duration: Theme.fast; }
+    }
+    Text {
+        y: parent.height - 18px;
+        width: parent.width;
+        height: 18px;
+        horizontal-alignment: center;
+        text: root.label;
+        font-size: 11px;
+        color: Theme.text-3;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                root.dragging = true;
+                root.drag-gain = root.gain-at(self.mouse-y);
+            }
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.up && root.dragging {
+                root.dragging = false;
+                if root.drag-gain != root.gain { root.committed(root.drag-gain); }
+            }
+        }
+        moved => {
+            if root.dragging { root.drag-gain = root.gain-at(self.mouse-y); }
+        }
+    }
+}
+
 component MenuItem inherits Rectangle {
     in property <string> text;
     in property <string> icon;
@@ -780,7 +924,7 @@ component LoginScreen inherits Rectangle {
                     ? "Страница входа Spotify уже открыта. Как только войдёте, Tonearm подключится сам."
                     : root.view == AuthView.reconnecting ? "Пробуем переподключиться к Spotify, это произойдёт само."
                     : root.view == AuthView.checking ? "Проверяем сохранённый вход."
-                    : "Лёгкий нативный клиент: меньше 100 МБ памяти и мгновенный запуск. Вход через браузер, пароль вводится только на сайте Spotify. Нужен Premium.";
+                    : "Лёгкий нативный клиент для Spotify с низким потреблением ресурсов. Вход через браузер на сайте Spotify. Требуется Premium.";
                 font-size: 16px;
                 color: Theme.text-2;
                 wrap: word-wrap;
@@ -882,8 +1026,13 @@ export component AppWindow inherits Window {
     in property <image> track-backdrop;               // tiny copy of the cover; scaled up it is a blur
     in property <int> position-ms;
     in property <int> duration-ms;
-    in-out property <int> volume-level: 8;
+    in-out property <int> volume-level: 70;
     in property <bool> resume-pending;                // last session's track, not loaded yet
+    // Mini player window (Ctrl+M): Rust opens it and copies the player state over.
+    in property <bool> mini-open;
+    callback toggle-mini();
+    callback mini-sync();
+    property <color> accent-now: Theme.accent;
     // queue
     in-out property <bool> queue-open;
     in property <[QueueRow]> queue-items;
@@ -893,8 +1042,11 @@ export component AppWindow inherits Window {
     // lyrics
     in-out property <bool> lyrics-open;
     in property <[LyricRow]> lyrics;
-    in property <int> lyrics-index: -1;
     in property <bool> lyrics-synced;
+    in property <bool> lyrics-word-synced;            // the source timed each word
+    in property <int> lyrics-line: -1;                // synced: the line and word being sung
+    in property <int> lyrics-word: -1;
+    in-out property <int> lyrics-mode: 0;             // 0 by line (official sources), 1 by word
     in property <string> lyrics-status;               // "" shown, else "Загружаем…" / "Текста нет"
     in property <string> lyrics-provider;
     // quick jump (Ctrl+K)
@@ -909,6 +1061,43 @@ export component AppWindow inherits Window {
     in property <[StatRow]> stats-tracks;
     in property <[StatRow]> stats-artists;
     in property <[TrackData]> history-tracks;
+    // smart playlists
+    in property <[PlaylistEntry]> smart-playlists;
+    in-out property <bool> smart-collapsed;
+    in property <bool> page-smart;                    // the open page is a smart playlist
+    in property <string> page-empty-hint;
+    in-out property <bool> smart-editor;
+    in property <bool> ed-new;
+    in-out property <string> ed-name;
+    in-out property <int> ed-source;
+    in-out property <int> ed-played;
+    in-out property <int> ed-days;
+    in-out property <int> ed-min;
+    in-out property <int> ed-order;
+    in-out property <int> ed-limit;
+    callback smart-new();
+    callback smart-edit();
+    callback smart-save();
+    callback smart-delete();
+    // year summary
+    in property <WrappedInfo> wrapped;
+    in property <[string]> wrapped-years;
+    in property <int> wrapped-year-index;
+    in property <bool> wrapped-loading;
+    in property <[MonthBar]> wrapped-months;
+    in property <[StatRow]> wrapped-tracks;
+    in property <[StatRow]> wrapped-artists;
+    in property <[StatRow]> wrapped-albums;
+    callback wrapped-opened(int /* year chip, -1 latest */);
+    callback wrapped-play(int);
+    // Last.fm: 0 no key in this build, 1 signed out, 2 waiting for the browser, 3 signed in
+    in property <int> lastfm-state;
+    in property <string> lastfm-user;
+    in property <int> lastfm-pending;
+    in-out property <int> set-scrobble: 1;
+    callback lastfm-login();
+    callback lastfm-cancel();
+    callback lastfm-logout();
     // Spotify Connect: "" plays here, otherwise the remote device's name
     in property <string> remote-name;
     in property <[DeviceRow]> devices;
@@ -917,6 +1106,18 @@ export component AppWindow inherits Window {
     in-out property <int> set-bitrate: 2;             // 96 | 160 | 320
     in-out property <int> set-normalisation;
     in-out property <int> set-gapless: 1;
+    // Equalizer, fades, visualizer (Linux + PipeWire, Soloist only)
+    in property <bool> effects-supported;
+    in property <string> effects-status;
+    in-out property <int> set-eq;
+    in-out property <int> set-eq-preset;             // index into eq-preset-names; last = своя
+    in property <[string]> eq-preset-names;
+    in property <[int]> eq-gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    in-out property <int> set-fade;                  // off | 2 | 4 | 6 | 8 s
+    in-out property <int> set-visualizer;
+    in property <[float]> spectrum;                  // 0..1 per bar
+    callback eq-preset-picked(int);
+    callback eq-band-committed(int /* band */, int /* dB */);
     in-out property <int> set-notifications: 1;
     // Themes: built-in and from the themes folder.
     in property <[ThemeCard]> themes;
@@ -946,6 +1147,8 @@ export component AppWindow inherits Window {
     property <int> drag-index: -1;
     property <length> drag-dy;
     property <bool> playing-now: root.play-view == PlayView.playing;
+    // Bumped to put the keyboard into the search field.
+    property <int> search-focus;
     in-out property <length> coll-scroll;             // collection list scroll (header collapses)
     // Kept as state, not a binding on coll-scroll: the header height changes the list's height,
     // which clamps the scroll, which would change the header again (a binding loop on short
@@ -987,6 +1190,7 @@ export component AppWindow inherits Window {
     callback row-action(int /* source */, int /* index */, int /* action */);
     callback radio-current();
     callback lyrics-opened();
+    callback lyrics-mode-changed();
     callback palette-opened();
     callback palette-edited(string);
     callback palette-activate(int);
@@ -1118,13 +1322,19 @@ export component AppWindow inherits Window {
         if self.page != Page.search { keys.focus(); }
         if self.page == Page.settings { root.refresh-audio-devices(); }
         if self.page == Page.stats { root.stats-opened(); }
+        if self.page == Page.wrapped { root.wrapped-opened(-1); }
         self.lyrics-open = false;
     }
-    changed active-uri => { self.coll-scroll = 0; self.coll-compact = false; }
+    // The scroll position is set from Rust: 0 for a new page, where it was for one seen before.
+    changed active-uri => { self.coll-compact = self.coll-scroll < -24px; }
     changed coll-scroll => {
         if self.coll-scroll < -24px { self.coll-compact = true; }
         else if self.coll-scroll >= 0 { self.coll-compact = false; }
     }
+    changed track-image => { if root.mini-open { root.mini-sync(); } }
+    changed track-title => { if root.mini-open { root.mini-sync(); } }
+    changed play-view => { if root.mini-open { root.mini-sync(); } }
+    changed accent-now => { if root.mini-open { root.mini-sync(); } }
     changed palette-open => {
         if !self.palette-open { keys.focus(); }
     }
@@ -1139,6 +1349,10 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if e.text == " " { root.toggle-play(); return accept; }
+            if e.modifiers.control && (e.text == "m" || e.text == "M" || e.text == "ь" || e.text == "Ь") {
+                root.toggle-mini();
+                return accept;
+            }
             if e.text == "q" || e.text == "Q" || e.text == "й" || e.text == "Й" {
                 root.queue-open = !root.queue-open;
                 return accept;
@@ -1149,6 +1363,7 @@ export component AppWindow inherits Window {
             }
             if e.text == "/" || (e.modifiers.control && (e.text == "f" || e.text == "а")) {
                 root.page = Page.search;
+                root.search-focus += 1;
                 return accept;
             }
             if e.text == Key.RightArrow {
@@ -1160,7 +1375,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if e.text == Key.UpArrow || e.text == Key.DownArrow {
-                root.volume-level = max(0, min(12, root.volume-level + (e.text == Key.UpArrow ? 1 : -1)));
+                root.volume-level = max(0, min(100, root.volume-level + (e.text == Key.UpArrow ? 5 : -5)));
                 root.volume-changed(root.volume-level);
                 return accept;
             }
@@ -1225,8 +1440,32 @@ export component AppWindow inherits Window {
                         NavItem { icon: "search"; label: "Поиск"; active: root.page == Page.search; clicked => { root.page = Page.search; } }
                         NavItem { icon: "library"; label: "Медиатека"; active: root.page == Page.library || root.page == Page.collection; clicked => { root.page = Page.library; } }
                         NavItem { icon: "stats"; label: "Статистика"; active: root.page == Page.stats; clicked => { root.page = Page.stats; } }
+                        NavItem { icon: "sparkle"; label: "Итоги года"; active: root.page == Page.wrapped; clicked => { root.page = Page.wrapped; } }
                         Rectangle { height: 12px; }
                         Rectangle { height: 1px; background: Theme.line; }
+                        HorizontalLayout {
+                            height: 40px;
+                            padding-left: 8px;
+                            spacing: 6px;
+                            Text { text: "Умные плейлисты"; font-size: 13px; font-weight: 600; color: smart-head.has-hover ? Theme.text-1 : Theme.text-2; vertical-alignment: center; }
+                            VerticalLayout {
+                                alignment: center;
+                                Icon { name: root.smart-collapsed ? "forward" : "down"; size: 14px; ink: Theme.text-3; }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                smart-head := TouchArea { mouse-cursor: pointer; clicked => { root.smart-collapsed = !root.smart-collapsed; root.settings-changed(); } }
+                            }
+                            IconButton { y: 2px; icon: "plus"; icon-size: 16px; tooltip: "Новый умный плейлист"; clicked => { root.smart-new(); } }
+                        }
+                        if !root.smart-collapsed: VerticalLayout {
+                            for p in root.smart-playlists: SmartRow {
+                                name: p.name;
+                                active: root.active-uri == p.uri && root.page == Page.collection;
+                                playing: root.context-uri == p.uri;
+                                clicked => { root.open(1, p.uri); }
+                            }
+                        }
                         HorizontalLayout {
                             height: 40px;
                             padding-left: 8px;
@@ -1321,11 +1560,6 @@ export component AppWindow inherits Window {
                                 padding-top: 28px;
                                 padding-bottom: 32px;
                                 spacing: 28px;
-                                VerticalLayout {
-                                    spacing: 4px;
-                                    Text { text: root.greeting; font-family: Fonts.display; font-weight: 700; font-size: 34px; color: Theme.text-1; }
-                                    Caption { text: root.date-label; font-size: 13px; }
-                                }
                                 // quick access: Liked + first playlists, two columns
                                 Rectangle {
                                     property <int> cols: self.width > 900px ? 3 : 2;
@@ -1466,7 +1700,9 @@ export component AppWindow inherits Window {
                                     init => { self.focus-input(); }
                                     edited(t) => { root.search-edited(t); }
                                     accepted(t) => { root.search-accepted(t); }
+                                    focus-request: root.search-focus;
                                     escape => { root.search-query = ""; root.search-edited(""); }
+                                    leave => { keys.focus(); }
                                 }
                                 if root.search-hint != "": Text {
                                     text: root.search-hint;
@@ -1722,7 +1958,7 @@ export component AppWindow inherits Window {
                                     padding-top: 20px;
                                     padding-bottom: 20px;
                                     spacing: 24px;
-                                    if root.page-kind != 0: Cover {
+                                    if root.page-kind != 0 && !root.page-smart: Cover {
                                         width: self.height;
                                         round: root.page-kind == 3;
                                         radius: 8px;
@@ -1737,12 +1973,20 @@ export component AppWindow inherits Window {
                                         background: @linear-gradient(135deg, #5B3CF0 0%, #C4B5FD 100%);
                                         Icon { name: "heart-fill"; size: parent.height * 0.36; ink: #FFFFFF; }
                                     }
+                                    if root.page-smart: Rectangle {
+                                        width: self.height;
+                                        border-radius: 8px;
+                                        background: @linear-gradient(135deg, #128C7E 0%, #7FE0C4 100%);
+                                        drop-shadow-blur: 30px;
+                                        drop-shadow-color: #00000090;
+                                        Icon { name: "sparkle"; size: parent.height * 0.36; ink: #FFFFFF; }
+                                    }
                                     VerticalLayout {
                                         horizontal-stretch: 1;
                                         alignment: end;
                                         spacing: 8px;
                                         Text {
-                                            text: root.page-kind == 0 ? "Плейлист" : root.page-kind == 2 ? "Альбом" : root.page-kind == 3 ? "Исполнитель" : "Плейлист";
+                                            text: root.page-smart ? "Умный плейлист" : root.page-kind == 0 ? "Плейлист" : root.page-kind == 2 ? "Альбом" : root.page-kind == 3 ? "Исполнитель" : "Плейлист";
                                             font-size: 12px;
                                             font-weight: 600;
                                             color: Theme.text-1;
@@ -1794,6 +2038,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconButton { y: (parent.height - self.height) / 2; width: 44px; height: 44px; icon: "shuffle"; icon-size: 24px; clicked => { root.play-shuffled(); } }
+                                if root.page-smart: Button { y: (parent.height - self.height) / 2; width: self.min-width; text: "Правила"; icon: "settings"; clicked => { root.smart-edit(); } }
                                 if root.page-loading: Rectangle {
                                     width: 90px;
                                     Text { text: "Загружаем…"; font-size: 13px; color: Theme.text-3; }
@@ -1814,6 +2059,7 @@ export component AppWindow inherits Window {
                                     placeholder: "Фильтр";
                                     edited(t) => { root.page-filter-edited(t); }
                                     escape => { root.page-filter = ""; root.page-filter-edited(""); }
+                                    leave => { keys.focus(); }
                                 }
                                 if root.page-kind != 3: Rectangle {
                                     width: sort-row.preferred-width + 24px;
@@ -1858,6 +2104,17 @@ export component AppWindow inherits Window {
                                 text: "Ничего не нашлось по «" + root.page-filter + "»";
                                 font-size: 14px;
                                 color: Theme.text-3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            if root.page-smart && !root.page-loading && root.page-tracks.length == 0 && root.page-empty-hint != "": Text {
+                                height: 120px;
+                                x: Layout.page-x;
+                                width: parent.width - 2 * Layout.page-x;
+                                text: root.page-empty-hint;
+                                font-size: 14px;
+                                color: Theme.text-3;
+                                wrap: word-wrap;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
@@ -1950,7 +2207,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.stats-tracks.length == 0: Text {
-                                    text: "Пока пусто. Послушайте что-нибудь, и здесь появятся любимые треки и исполнители недели.";
+                                    text: "За эту неделю пока нет прослушиваний. Послушайте музыку, чтобы появилась статистика.";
                                     font-size: 14px;
                                     color: Theme.text-3;
                                     wrap: word-wrap;
@@ -2046,6 +2303,23 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    if root.page == Page.wrapped: PageIn {
+                        WrappedPage {
+                            info: root.wrapped;
+                            years: root.wrapped-years;
+                            year-index: root.wrapped-year-index;
+                            loading: root.wrapped-loading;
+                            months: root.wrapped-months;
+                            tracks: root.wrapped-tracks;
+                            artists: root.wrapped-artists;
+                            albums: root.wrapped-albums;
+                            pick-year(i) => { root.wrapped-opened(i); }
+                            play(i) => { root.wrapped-play(i); }
+                            open-artist(u) => { root.open(3, u); }
+                            open-album(u) => { root.open(2, u); }
+                        }
+                    }
+
                     if root.page == Page.settings: PageIn {
                         ScrollView {
                             HorizontalLayout {
@@ -2123,6 +2397,75 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+                                    if root.effects-supported: SettingsGroup {
+                                        title: "Эффекты";
+                                        SettingRow {
+                                            title: "Эквалайзер";
+                                            hint: root.effects-status != "" ? root.effects-status
+                                                : root.set-engine == 0 ? "Работает только с Soloist"
+                                                : "10 полос через PipeWire. При первом включении Soloist перезапустится";
+                                            last: root.set-eq == 0;
+                                            if root.set-eq == 1: Rectangle {
+                                                width: min(220px, preset-text.preferred-width + 52px);
+                                                height: 38px;
+                                                border-radius: 19px;
+                                                background: preset-touch.has-hover ? Theme.line-2 : Theme.hover;
+                                                HorizontalLayout {
+                                                    padding-left: 14px;
+                                                    padding-right: 12px;
+                                                    spacing: 8px;
+                                                    preset-text := Text {
+                                                        text: root.eq-preset-names.length > root.set-eq-preset ? root.eq-preset-names[root.set-eq-preset] : "";
+                                                        font-size: 13px;
+                                                        color: Theme.text-1;
+                                                        vertical-alignment: center;
+                                                        horizontal-stretch: 1;
+                                                    }
+                                                    VerticalLayout { alignment: center; Icon { name: "down"; size: 14px; } }
+                                                }
+                                                preset-touch := TouchArea { mouse-cursor: pointer; clicked => { preset-menu.show(); } }
+                                                preset-menu := PopupWindow {
+                                                    y: parent.height + 4px;
+                                                    x: parent.width - 200px;
+                                                    width: 200px;
+                                                    MenuPanel {
+                                                        for name[i] in root.eq-preset-names: MenuItem {
+                                                            text: name;
+                                                            clicked => { root.eq-preset-picked(i); }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-eq; changed => { root.settings-changed(); } } }
+                                        }
+                                        if root.set-eq == 1: Rectangle {
+                                            height: 196px;
+                                            Rectangle { x: 20px; y: parent.height - 1px; width: parent.width - 40px; height: 1px; background: Theme.line; }
+                                            HorizontalLayout {
+                                                padding-left: 20px;
+                                                padding-right: 20px;
+                                                padding-top: 12px;
+                                                padding-bottom: 20px;
+                                                alignment: space-between;
+                                                for g[i] in root.eq-gains: EqBand {
+                                                    gain: g;
+                                                    label: ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"][i];
+                                                    committed(db) => { root.eq-band-committed(i, db); }
+                                                }
+                                            }
+                                        }
+                                        SettingRow {
+                                            title: "Плавный переход";
+                                            hint: "Конец трека затихает, следующий нарастает. Наложить два трека Soloist не даёт";
+                                            Segmented { items: ["Выкл", "2 с", "4 с", "6 с", "8 с"]; current <=> root.set-fade; changed => { root.settings-changed(); } }
+                                        }
+                                        SettingRow {
+                                            title: "Визуализатор";
+                                            hint: "Полоски под обложкой. Выключенный ничего не тратит";
+                                            last: true;
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-visualizer; changed => { root.settings-changed(); } } }
+                                        }
+                                    }
                                     SettingsGroup {
                                         title: "Оформление";
                                         Rectangle {
@@ -2190,6 +2533,28 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     SettingsGroup {
+                                        title: "Last.fm";
+                                        SettingRow {
+                                            title: root.lastfm-state == 3 ? "Вы вошли как " + root.lastfm-user : "Скробблинг в Last.fm";
+                                            hint: root.lastfm-state == 0 ? "В этой сборке нет ключа Last.fm. Свой можно указать в config.toml, раздел [lastfm]"
+                                                : root.lastfm-state == 1 ? "Всё, что вы слушаете, будет копиться в вашем профиле на last.fm"
+                                                : root.lastfm-state == 2 ? "Подтвердите доступ на странице Last.fm в браузере…"
+                                                : root.lastfm-pending > 0 ? "Ждут отправки: " + root.lastfm-pending + ", уйдут, когда появится связь"
+                                                : "Трек засчитывается после половины или 4 минут";
+                                            last: root.lastfm-state != 3;
+                                            if root.lastfm-state == 1: Button { text: "Войти в Last.fm"; icon: "link"; kind: ButtonKind.primary; clicked => { root.lastfm-login(); } }
+                                            if root.lastfm-state == 2: Button { text: "Отмена"; clicked => { root.lastfm-cancel(); } }
+                                            if root.lastfm-state == 2: Button { text: "Открыть снова"; kind: ButtonKind.ghost; clicked => { root.lastfm-login(); } }
+                                            if root.lastfm-state == 3: Button { text: "Выйти"; icon: "logout"; kind: ButtonKind.ghost; clicked => { root.lastfm-logout(); } }
+                                        }
+                                        if root.lastfm-state == 3: SettingRow {
+                                            title: "Отправлять прослушанное";
+                                            hint: "Можно выключить, не выходя из аккаунта";
+                                            last: true;
+                                            VerticalLayout { alignment: center; Toggle { on <=> root.set-scrobble; changed => { root.settings-changed(); } } }
+                                        }
+                                    }
+                                    SettingsGroup {
                                         title: "Уведомления";
                                         SettingRow {
                                             title: "Уведомление о новом треке";
@@ -2213,12 +2578,12 @@ export component AppWindow inherits Window {
                                         SettingRow {
                                             title: "Tonearm " + root.version;
                                             hint: root.update-state == UpdateState.checking ? "Проверяю…"
-                                                : root.update-state == UpdateState.latest ? "Это последняя версия"
+                                                : root.update-state == UpdateState.latest ? "Актуальная версия"
                                                 : root.update-state == UpdateState.available ? "Доступна версия " + root.update-version
                                                 : root.update-state == UpdateState.downloading ? "Скачиваю " + root.update-version + "…"
                                                 : root.update-state == UpdateState.installing ? "Устанавливаю " + root.update-version + "…"
                                                 : root.update-state == UpdateState.failed ? root.update-message
-                                                : "Файлы обновлений подписаны, чужой файл не установится";
+                                                : "";
                                             if root.update-known && root.update-state != UpdateState.downloading && root.update-state != UpdateState.installing: Button {
                                                 text: root.update-state == UpdateState.failed ? "Повторить" : "Обновить";
                                                 kind: ButtonKind.primary;
@@ -2241,7 +2606,7 @@ export component AppWindow inherits Window {
                                         title: "Аккаунт";
                                         SettingRow {
                                             title: root.username;
-                                            hint: "Вход хранится в зашифрованном виде, в config.toml его нет";
+                                            hint: "";
                                             last: true;
                                             Button { text: "Выйти"; icon: "logout"; kind: ButtonKind.danger; clicked => { root.logout(); } }
                                         }
@@ -2251,7 +2616,8 @@ export component AppWindow inherits Window {
                                         for k[i] in [
                                             { key: "Пробел", what: "Пауза / продолжить" },
                                             { key: "Ctrl K", what: "Быстрый переход" },
-                                            { key: "← →", what: "Перемотка на 5 секунд, с Ctrl: предыдущий / следующий трек" },
+                                            { key: "← →", what: "Перемотка на 5 секунд" },
+                                            { key: "Ctrl + ← →", what: "Предыдущий / следующий трек" },
                                             { key: "↑ ↓", what: "Громкость" },
                                             { key: "Q", what: "Очередь" },
                                             { key: "L", what: "Текст песни" },
@@ -2308,6 +2674,12 @@ export component AppWindow inherits Window {
                                     Text { text: root.track-title; font-size: 16px; font-weight: 600; color: #FFFFFF; overflow: elide; }
                                     Text { text: root.track-artists; font-size: 13px; color: #FFFFFFB0; overflow: elide; }
                                 }
+                                Segmented {
+                                    y: (parent.height - self.height) / 2;
+                                    items: ["Строки", "Слова"];
+                                    current <=> root.lyrics-mode;
+                                    changed => { root.lyrics-mode-changed(); }
+                                }
                                 IconButton { icon: "close"; clicked => { root.lyrics-open = false; } }
                             }
                             if root.lyrics-status != "": Text {
@@ -2320,49 +2692,40 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            // synced: follows the song, the current line about a third from the top
-                            if root.lyrics-status == "" && root.lyrics-synced: lyr := Flickable {
+                            // synced: follows the song, the current line in the upper third
+                            if root.lyrics-status == "" && root.lyrics-synced: LyricsView {
                                 vertical-stretch: 1;
-                                interactive: false;
-                                property <length> line-h: 52px;
-                                content-height: root.lyrics.length * self.line-h + 400px;
-                                content-y: root.lyrics-index >= 0 ? min(0px, -(root.lyrics-index * self.line-h) + 120px) : 0px;
-                                animate content-y { duration: 450ms; easing: ease-in-out; }
-                                VerticalLayout {
-                                    padding-top: 80px;
-                                    alignment: start;
-                                    for l[i] in root.lyrics: Text {
-                                        height: lyr.line-h;
-                                        text: l.text != "" ? l.text : "♪";
-                                        font-family: Fonts.display;
-                                        font-weight: 700;
-                                        font-size: i == root.lyrics-index ? 34px : 28px;
-                                        animate font-size, color { duration: 300ms; }
-                                        color: i == root.lyrics-index ? #FFFFFF : i < root.lyrics-index ? #FFFFFF70 : #FFFFFF45;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
+                                lines: root.lyrics;
+                                current-line: root.lyrics-line;
+                                current-word: root.lyrics-word;
+                                seek-to(ms) => {
+                                    if root.duration-ms > 0 { root.seek(ms / root.duration-ms); }
                                 }
                             }
-                            if root.lyrics-status == "" && !root.lyrics-synced: ScrollView {
+                            // plain text: scrolled by hand; each line takes the height its wrapping needs
+                            if root.lyrics-status == "" && !root.lyrics-synced: plain := Flickable {
                                 vertical-stretch: 1;
-                                VerticalLayout {
+                                content-height: plain-col.preferred-height;
+                                plain-col := VerticalLayout {
+                                    width: plain.width;
                                     padding-top: 40px;
                                     padding-bottom: 40px;
                                     alignment: start;
+                                    spacing: 10px;
                                     for l in root.lyrics: Text {
-                                        height: 44px;
-                                        text: l.text;
+                                        text: l.text != "" ? l.text : " ";
                                         font-family: Fonts.display;
                                         font-weight: 700;
                                         font-size: 24px;
                                         color: #FFFFFFE0;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                        wrap: word-wrap;
                                     }
                                 }
                             }
-                            if root.lyrics-provider != "": Caption { text: "Текст: " + root.lyrics-provider; color: #FFFFFF70; }
+                            if root.lyrics-provider != "": Caption {
+                                text: "Текст: " + root.lyrics-provider;
+                                color: #FFFFFF70;
+                            }
                         }
                     }
 
@@ -2464,7 +2827,7 @@ export component AppWindow inherits Window {
                             padding: 20px;
                             vertical-stretch: 1;
                             Text {
-                                text: "Дальше пусто. Правый клик по треку → «В очередь» или «Радио по треку».";
+                                text: "Очередь пуста. Добавьте трек через контекстное меню.";
                                 font-size: 13px;
                                 color: Theme.text-3;
                                 wrap: word-wrap;
@@ -2486,7 +2849,7 @@ export component AppWindow inherits Window {
                     spacing: 16px;
                     // now playing: a new track slides in (cover grows back, title rises)
                     now := HorizontalLayout {
-                        width: 300px;
+                        width: 320px;
                         spacing: 14px;
                         property <bool> swap: false;
                         property <duration> settle: self.swap ? 0ms : 460ms;
@@ -2517,6 +2880,19 @@ export component AppWindow inherits Window {
                                 loaded: root.track-has-image;
                                 placeholder-icon: "play";
                                 TouchArea { mouse-cursor: pointer; clicked => { root.toggle-lyrics(); } }
+                            }
+                            if root.set-visualizer == 1 && root.effects-supported && root.play-view == PlayView.playing: Rectangle {
+                                y: parent.height - 14px;
+                                height: 11px;
+                                for v[i] in root.spectrum: Rectangle {
+                                    x: i * 4px;
+                                    width: 3px;
+                                    height: max(1px, parent.height * v);
+                                    y: parent.height - self.height;
+                                    border-radius: 1px;
+                                    background: Theme.accent;
+                                    opacity: 0.85;
+                                }
                             }
                         }
                         Rectangle {
@@ -2618,9 +2994,10 @@ export component AppWindow inherits Window {
                     }
                     // right side
                     HorizontalLayout {
-                        width: 300px;
+                        width: 320px;
                         alignment: end;
                         spacing: 4px;
+                        IconButton { y: (parent.height - self.height) / 2; icon: "mini"; active: root.mini-open; tooltip: "Мини-плеер (Ctrl+M)"; clicked => { root.toggle-mini(); } }
                         IconButton { y: (parent.height - self.height) / 2; icon: "lyrics"; active: root.lyrics-open; clicked => { root.toggle-lyrics(); } }
                         IconButton { y: (parent.height - self.height) / 2; icon: "queue"; active: root.queue-open; clicked => { root.queue-open = !root.queue-open; } }
                         IconButton {
@@ -2635,7 +3012,7 @@ export component AppWindow inherits Window {
                         IconButton {
                             y: (parent.height - self.height) / 2;
                             icon: root.volume-level == 0 ? "mute" : "volume";
-                            property <int> before-mute: 8;
+                            property <int> before-mute: 70;
                             clicked => {
                                 if root.volume-level > 0 { self.before-mute = root.volume-level; root.volume-level = 0; } else { root.volume-level = self.before-mute; }
                                 root.volume-changed(root.volume-level);
@@ -2644,12 +3021,18 @@ export component AppWindow inherits Window {
                         Slider {
                             width: 110px;
                             y: (parent.height - self.height) / 2;
-                            value: root.volume-level / 12;
+                            value: root.volume-level / 100;
                             committed(v) => {
-                                root.volume-level = round(v * 12);
+                                root.volume-level = round(v * 100);
                                 root.volume-changed(root.volume-level);
                             }
-                            moving(v) => { root.volume-level = round(v * 12); }
+                            // Live while dragging, so the change is heard at once.
+                            moving(v) => {
+                                if round(v * 100) != root.volume-level {
+                                    root.volume-level = round(v * 100);
+                                    root.volume-changed(root.volume-level);
+                                }
+                            }
                         }
                     }
                 }
@@ -2657,6 +3040,20 @@ export component AppWindow inherits Window {
         }
 
         // ── quick jump palette (Ctrl+K)
+        if root.smart-editor && root.auth-view == AuthView.logged-in: SmartEditor {
+            is-new: root.ed-new;
+            name <=> root.ed-name;
+            source <=> root.ed-source;
+            played <=> root.ed-played;
+            days <=> root.ed-days;
+            min-plays <=> root.ed-min;
+            order <=> root.ed-order;
+            limit <=> root.ed-limit;
+            save => { root.smart-save(); }
+            delete => { root.smart-delete(); }
+            close => { root.smart-editor = false; }
+        }
+
         if root.palette-open && root.auth-view == AuthView.logged-in: Rectangle {
             property <bool> shown: false;
             init => { self.shown = true; pal-input.focus(); }

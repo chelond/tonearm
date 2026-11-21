@@ -16,6 +16,8 @@ pub struct QueueItem {
     pub title: String,
     pub artists: String,
     pub duration_ms: u32,
+    /// Album cover, so the player bar can show it the moment the track is picked.
+    pub cover_url: Option<String>,
 }
 
 /// What the UI shows about the queue.
