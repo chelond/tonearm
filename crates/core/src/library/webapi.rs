@@ -245,7 +245,9 @@ fn convert_track(t: ApiTrack) -> Option<TrackItem> {
         return None;
     }
     let album = t.album.unwrap_or_default();
+    let image_url = pick_image(&album.images, 300);
     Some(TrackItem {
+        image_url,
         playable: !t.is_local
             && t.is_playable.unwrap_or(true)
             && t.uri.starts_with("spotify:track:"),

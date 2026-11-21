@@ -372,6 +372,10 @@ impl Service {
                 self.queue.clear_manual();
                 self.emit_queue().await;
             }
+            PlayerCommand::MoveInQueue { from, to } => {
+                self.queue.move_upcoming(from, to);
+                self.emit_queue().await;
+            }
             PlayerCommand::Enqueue(item) => {
                 self.queue.add(item);
                 self.emit_queue().await;

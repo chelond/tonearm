@@ -1,0 +1,19 @@
+name = "Лес"
+base = "dark"
+accent_from_cover = false
+
+[colors]
+bg = "#0C1210"
+sidebar = "#090E0C"
+surface = "#131C18"
+surface-2 = "#1B2621"
+hover = "#B8F5D10F"
+pressed = "#B8F5D11C"
+selected = "#B8F5D116"
+line = "#B8F5D114"
+line-2 = "#B8F5D12A"
+text-1 = "#EAF5EF"
+text-2 = "#A2B8AC"
+text-3 = "#6A8075"
+accent = "#4ADE80"
+on-accent = "#06120B"
