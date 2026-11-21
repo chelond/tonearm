@@ -276,9 +276,7 @@ impl UiState {
         if empty {
             let rule = self.smart_rules.iter().find(|r| r.id == id);
             let hint = match rule.map(|r| (r.source, r.played)) {
-                Some((Source::Liked, Played::Never)) => {
-                    "Вы уже слушали все любимые треки."
-                }
+                Some((Source::Liked, Played::Never)) => "Вы уже слушали все любимые треки.",
                 Some((Source::Liked, Played::NotFor)) => {
                     "История Tonearm ведётся с первого запуска. Плейлист заполнится, когда накопятся прослушивания."
                 }
