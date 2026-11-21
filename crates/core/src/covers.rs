@@ -4,6 +4,7 @@
 //! colour picked from the picture) tints the UI around the playing track and the open page.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use image::imageops::FilterType;
@@ -121,7 +122,9 @@ impl CoverCache {
             dir,
             max_bytes: std::sync::atomic::AtomicU64::new(max_bytes),
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
+                // A blocked host hangs on connect: give up quickly and try the next mirror.
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
         }
@@ -133,22 +136,44 @@ impl CoverCache {
         if !allowed(&url) {
             return Err(CoverError::Network(format!("недопустимый адрес {url}")));
         }
-        // One retry: covers load in bursts and a single timeout should not leave a hole.
-        let bytes = match self.bytes(&url).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(%e, "cover retry");
-                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                self.bytes(&url).await?
-            }
+        // Mosaics are put together here from the four covers: one host fewer to depend on.
+        if let Some(ids) = mosaic_ids(&url) {
+            let ids: Vec<String> = ids.iter().map(|id| sized_id(id, size / 2)).collect();
+            let parts = futures_util::future::join_all(ids.iter().map(|id| self.image(id))).await;
+            let parts: Vec<Vec<u8>> = parts.into_iter().collect::<Result<_, _>>()?;
+            return tokio::task::spawn_blocking(move || compose(&url, &parts, size))
+                .await
+                .map_err(|_| CoverError::Decode)?;
+        }
+        let bytes = match image_id(&url) {
+            Some(id) => self.image(&sized_id(&id, size)).await?,
+            None => self.fetch_cached(&url, std::slice::from_ref(&url)).await?,
         };
         tokio::task::spawn_blocking(move || decode(&url, &bytes, size))
             .await
             .map_err(|_| CoverError::Decode)?
     }
 
-    async fn bytes(&self, url: &str) -> Result<Vec<u8>, CoverError> {
-        let path = self.dir.as_ref().map(|d| d.join(file_name(url)));
+    /// An image by its id, from whichever of Spotify's image hosts answers (some networks
+    /// block `i.scdn.co` but not the others). The host that worked last is tried first.
+    async fn image(&self, id: &str) -> Result<Vec<u8>, CoverError> {
+        let first = PREFERRED_HOST.load(Ordering::Relaxed) % IMAGE_HOSTS.len();
+        let urls: Vec<String> = (0..IMAGE_HOSTS.len())
+            .map(|i| {
+                format!(
+                    "https://{}/image/{id}",
+                    IMAGE_HOSTS[(first + i) % IMAGE_HOSTS.len()]
+                )
+            })
+            .collect();
+        // Cached under one name whatever host served it.
+        let key = format!("https://i.scdn.co/image/{id}");
+        self.fetch_cached(&key, &urls).await
+    }
+
+    /// From the disk cache under `key`, else the first of `urls` that answers.
+    async fn fetch_cached(&self, key: &str, urls: &[String]) -> Result<Vec<u8>, CoverError> {
+        let path = self.dir.as_ref().map(|d| d.join(file_name(key)));
         if let Some(p) = &path
             && let Ok(data) = tokio::fs::read(p).await
         {
@@ -156,18 +181,40 @@ impl CoverCache {
             let _ = filetime_touch(p);
             return Ok(data);
         }
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| CoverError::Network(e.to_string()))?;
-        let data = resp
-            .bytes()
-            .await
-            .map_err(|e| CoverError::Network(e.to_string()))?
-            .to_vec();
+        let mut last = String::new();
+        let mut data = None;
+        // Every host once, then once more: a blocked host costs one short timeout, and the
+        // next requests start from the host that answered.
+        'passes: for pass in 0..2 {
+            if pass == 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            for url in urls {
+                let host = IMAGE_HOSTS.iter().position(|h| host_of(url) == *h);
+                match self.fetch(url).await {
+                    Ok(d) => {
+                        if let Some(i) = host {
+                            PREFERRED_HOST.store(i, Ordering::Relaxed);
+                        }
+                        data = Some(d);
+                        break 'passes;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%e, %url, pass, "cover fetch failed");
+                        if let Some(i) = host {
+                            let _ = PREFERRED_HOST.compare_exchange(
+                                i,
+                                (i + 1) % IMAGE_HOSTS.len(),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        last = format!("{url}: {e}");
+                    }
+                }
+            }
+        }
+        let data = data.ok_or(CoverError::Network(last))?;
         if let Some(p) = path
             && tokio::fs::write(&p, &data).await.is_ok()
             && let Some(dir) = self.dir.clone()
@@ -177,6 +224,110 @@ impl CoverCache {
         }
         Ok(data)
     }
+
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| e.to_string())?;
+        Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+    }
+}
+
+/// Hosts that serve `/image/<id>` for the same ids.
+const IMAGE_HOSTS: [&str; 3] = [
+    "i.scdn.co",
+    "image-cdn-ak.spotifycdn.com",
+    "image-cdn-fa.spotifycdn.com",
+];
+static PREFERRED_HOST: AtomicUsize = AtomicUsize::new(0);
+
+fn host_of(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+}
+
+/// The id of an image on one of the [`IMAGE_HOSTS`].
+fn image_id(url: &str) -> Option<String> {
+    let host = host_of(url);
+    if !IMAGE_HOSTS.contains(&host) {
+        return None;
+    }
+    let id = url
+        .strip_prefix("https://")?
+        .strip_prefix(host)?
+        .strip_prefix("/image/")?;
+    let id = id.split(['?', '#']).next()?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())).then(|| id.to_owned())
+}
+
+/// Album cover ids name their rendition (`…1e02…` 300 px, `…b273…` 640 px, `…4851…` 64 px):
+/// pick the one that matches the size it is shown at, so HiDPI screens get sharp covers and
+/// row thumbnails do not download big pictures.
+fn sized_id(id: &str, size: u32) -> String {
+    const PREFIX: &str = "ab67616d0000";
+    const RENDITIONS: [(&str, u32); 3] = [("4851", 64), ("1e02", 300), ("b273", 640)];
+    let Some(rest) = id.strip_prefix(PREFIX) else {
+        return id.to_owned();
+    };
+    let (Some(code), Some(tail)) = (rest.get(..4), rest.get(4..)) else {
+        return id.to_owned();
+    };
+    if !RENDITIONS.iter().any(|(c, _)| *c == code) {
+        return id.to_owned();
+    }
+    let want = RENDITIONS
+        .iter()
+        .find(|(_, px)| *px >= size)
+        .unwrap_or(&RENDITIONS[2])
+        .0;
+    format!("{PREFIX}{want}{tail}")
+}
+
+/// `https://mosaic.scdn.co/<size>/<id><id><id><id>` → the four 40-character image ids.
+fn mosaic_ids(url: &str) -> Option<Vec<String>> {
+    let rest = url.strip_prefix("https://mosaic.scdn.co/")?;
+    let ids = rest.split_once('/')?.1.split(['?', '#']).next()?;
+    if ids.len() != 160 || !ids.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        (0..4)
+            .map(|i| ids[i * 40..(i + 1) * 40].to_owned())
+            .collect(),
+    )
+}
+
+/// Four covers in a 2×2 square, like Spotify's playlist mosaics.
+fn compose(url: &str, parts: &[Vec<u8>], size: u32) -> Result<Cover, CoverError> {
+    let half = (size / 2).max(1);
+    let mut out = image::RgbaImage::new(half * 2, half * 2);
+    for (i, bytes) in parts.iter().enumerate().take(4) {
+        let img = image::load_from_memory(bytes).map_err(|_| CoverError::Decode)?;
+        let tile = img
+            .resize_to_fill(half, half, FilterType::Triangle)
+            .to_rgba8();
+        let i = u32::try_from(i).unwrap_or(0);
+        image::imageops::replace(
+            &mut out,
+            &tile,
+            i64::from(i % 2 * half),
+            i64::from(i / 2 * half),
+        );
+    }
+    let (width, height) = out.dimensions();
+    let accent = accent(out.as_raw());
+    Ok(Cover {
+        url: url.to_owned(),
+        width,
+        height,
+        color: out.into_raw(),
+        accent,
+    })
 }
 
 fn filetime_touch(path: &Path) -> std::io::Result<()> {
@@ -333,6 +484,60 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn album_cover_rendition_follows_size() {
+        let tail = "2c5b24ecfa39523a75c993c4";
+        let id = format!("ab67616d00001e02{tail}");
+        assert_eq!(sized_id(&id, 600), format!("ab67616d0000b273{tail}"));
+        assert_eq!(sized_id(&id, 200), id);
+        assert_eq!(sized_id(&id, 48), format!("ab67616d00004851{tail}"));
+        assert_eq!(sized_id(&id, 2000), format!("ab67616d0000b273{tail}"));
+        assert_eq!(
+            sized_id("ab6761610000e5eb1234", 600),
+            "ab6761610000e5eb1234"
+        );
+    }
+
+    #[test]
+    fn image_ids_and_mosaics_are_recognised() {
+        let id = "ab67616d0000b2732c5b24ecfa39523a75c993c4";
+        assert_eq!(
+            image_id(&format!("https://i.scdn.co/image/{id}")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            image_id(&format!("https://image-cdn-ak.spotifycdn.com/image/{id}")).as_deref(),
+            Some(id)
+        );
+        assert_eq!(image_id("https://daylist.spotifycdn.com/x.jpg"), None);
+        let m = format!("https://mosaic.scdn.co/640/{}", id.repeat(4));
+        assert_eq!(mosaic_ids(&m).unwrap(), vec![id.to_owned(); 4]);
+        assert!(mosaic_ids("https://mosaic.scdn.co/640/abc").is_none());
+    }
+
+    #[test]
+    fn mosaic_is_composed_from_four_pictures() {
+        let png = |c: [u8; 4]| {
+            let img = image::RgbaImage::from_pixel(8, 8, image::Rgba(c));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let parts = vec![
+            png([255, 0, 0, 255]),
+            png([0, 255, 0, 255]),
+            png([0, 0, 255, 255]),
+            png([255, 255, 0, 255]),
+        ];
+        let c = compose("m", &parts, 20).unwrap();
+        assert_eq!((c.width, c.height), (20, 20));
+        let px = |x: usize, y: usize| &c.color[(y * 20 + x) * 4..(y * 20 + x) * 4 + 3];
+        assert_eq!(px(2, 2), [255, 0, 0]);
+        assert_eq!(px(17, 2), [0, 255, 0]);
+        assert_eq!(px(2, 17), [0, 0, 255]);
+        assert_eq!(px(17, 17), [255, 255, 0]);
+    }
+
     use super::*;
 
     fn png(w: u32, h: u32) -> Vec<u8> {

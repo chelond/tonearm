@@ -328,9 +328,16 @@ impl Service {
         };
         let task = async move {
             let ev = match cmd {
-                LibraryCommand::TrackMeta(uri) => {
-                    LibraryEvent::TrackMeta(extras::track_meta(&session, &uri).await?)
-                }
+                // Always answer, even empty: the UI holds lyrics and links until it hears back.
+                LibraryCommand::TrackMeta(uri) => LibraryEvent::TrackMeta(
+                    extras::track_meta(&session, &uri).await.unwrap_or_else(|| {
+                        tracing::info!(%uri, "track details not available");
+                        TrackItem {
+                            uri,
+                            ..TrackItem::default()
+                        }
+                    }),
+                ),
                 LibraryCommand::Radio { uri, title } => match extras::radio(&session, &uri).await {
                     Ok(tracks) => LibraryEvent::Radio { title, tracks },
                     Err(e) => LibraryEvent::Error(format!("Радио не запустилось: {e}")),

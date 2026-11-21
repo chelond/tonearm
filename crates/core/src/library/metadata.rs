@@ -59,6 +59,46 @@ pub(super) fn track_item(t: &Track) -> TrackItem {
     }
 }
 
+/// Covers for tracks whose metadata came without one: some track records carry no album
+/// pictures, the album record itself does. One request per distinct album.
+pub(super) async fn fill_album_covers(session: &Session, items: &mut [TrackItem]) {
+    let mut albums: Vec<String> = items
+        .iter()
+        .filter(|t| t.image_url.is_none())
+        .filter_map(|t| t.album_uri.clone())
+        .collect();
+    albums.sort();
+    albums.dedup();
+    if albums.is_empty() {
+        return;
+    }
+    let found: Vec<(String, Option<String>)> = stream::iter(albums)
+        .map(|uri| async move {
+            let cover = match SpotifyUri::from_uri(&uri) {
+                Ok(id) => Album::get(session, &id)
+                    .await
+                    .ok()
+                    .and_then(|a| image_url_small(&a.covers)),
+                Err(_) => None,
+            };
+            (uri, cover)
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+    let missing = found.iter().filter(|(_, c)| c.is_none()).count();
+    tracing::info!(
+        albums = found.len(),
+        missing,
+        "album covers looked up for tracks without one"
+    );
+    for t in items.iter_mut().filter(|t| t.image_url.is_none()) {
+        if let Some((_, Some(c))) = found.iter().find(|(u, _)| Some(u) == t.album_uri.as_ref()) {
+            t.image_url = Some(c.clone());
+        }
+    }
+}
+
 pub struct ArtistPage {
     pub header: PageHeader,
     pub top_tracks: Vec<TrackItem>,

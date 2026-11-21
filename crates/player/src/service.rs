@@ -117,6 +117,8 @@ struct Solo {
 
 /// After this long a missing confirmation of `play` no longer holds events back.
 const AWAIT_LIMIT: Duration = Duration::from_secs(8);
+/// The next track is started this long before Soloist's end, before it can loop the track.
+const SOLO_END_EARLY_MS: u32 = 250;
 
 /// Runs until the command channel closes. Sessions come from the core via `sessions`.
 pub async fn run(
@@ -318,6 +320,10 @@ impl Service {
             PlayerCommand::Prev => {
                 if self.position_ms > RESTART_THRESHOLD_MS && self.solo.handle.is_some() {
                     self.solo_send(json!({"command": "seek", "position_ms": 0}));
+                    self.position_ms = 0;
+                    if self.state == PlaybackState::Playing {
+                        self.solo.anchor = Some((0, Instant::now()));
+                    }
                 } else if self.position_ms > RESTART_THRESHOLD_MS
                     && let Some(p) = &self.player
                 {
@@ -408,7 +414,10 @@ impl Service {
             },
             PlayerCommand::Seek { position_ms } if self.solo.handle.is_some() => {
                 self.solo_send(json!({"command": "seek", "position_ms": position_ms}));
-                self.solo.anchor = Some((position_ms, Instant::now()));
+                self.position_ms = position_ms;
+                if self.state == PlaybackState::Playing {
+                    self.solo.anchor = Some((position_ms, Instant::now()));
+                }
             }
             PlayerCommand::Seek { position_ms } => {
                 if let Some(p) = &self.player {
@@ -614,8 +623,34 @@ impl Service {
         if let Some((ms, at)) = self.solo.anchor {
             let now =
                 ms.saturating_add(u32::try_from(at.elapsed().as_millis()).unwrap_or(u32::MAX));
+            // Soloist plays a single URI and, at its end, starts it again (or goes idle without
+            // saying so): move on with Tonearm's queue right at the end instead.
+            let duration = self.solo_duration();
+            if duration > 0 && now + SOLO_END_EARLY_MS >= duration && !self.solo_waiting() {
+                tracing::info!(now, duration, "soloist track ended, next from the queue");
+                self.solo_advance().await;
+                return;
+            }
             self.set_state(PlaybackState::Playing, now).await;
         }
+    }
+
+    /// Length of the track Soloist plays, as last reported (0 when unknown).
+    fn solo_duration(&self) -> u32 {
+        match (&self.solo.shown, &self.solo.playing_uri) {
+            (Some(t), Some(uri)) if t.uri == *uri => t.duration_ms,
+            _ => 0,
+        }
+    }
+
+    /// The position jumped from the end of the track back to its start without a seek of ours:
+    /// Soloist looped the track.
+    fn solo_wrapped(&self, ms: u32) -> bool {
+        let duration = self.solo_duration();
+        duration > 0
+            && self.state == PlaybackState::Playing
+            && self.position_ms + 5_000 >= duration
+            && ms < 3_000
     }
 
     /// `true` while an answer to our `play` is still due: older reports are about the old track.
@@ -741,7 +776,10 @@ impl Service {
             soloist::Event::Track(track) => self.solo_track(track).await,
             soloist::Event::Playing(status) => self.solo_status(&status, None).await,
             soloist::Event::Position(ms) => {
-                if !self.solo_waiting() {
+                if !self.solo_waiting() && self.solo_wrapped(ms) {
+                    tracing::info!(ms, "soloist looped the track, next from the queue");
+                    self.solo_advance().await;
+                } else if !self.solo_waiting() {
                     if self.state == PlaybackState::Playing {
                         self.solo.anchor = Some((ms, Instant::now()));
                     }
