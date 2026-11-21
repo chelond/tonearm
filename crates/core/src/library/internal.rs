@@ -15,7 +15,7 @@ use librespot_protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
 use reqwest::Method;
 
-use super::metadata::{image_url, track_item};
+use super::metadata::{fill_album_covers, image_url, track_item};
 use super::model::{CollectionKind, PageHeader, PlaylistSummary, SearchResults, Tile, TrackItem};
 
 /// Parallel metadata requests (per-user limit; the official client does far more).
@@ -209,17 +209,11 @@ pub async fn fallback_cover(session: &Session, playlist_uri: &str) -> Option<Str
 
 /// Mosaic (or single cover) from the albums of the first tracks in `uris`.
 pub async fn mosaic_for(session: &Session, uris: &[String]) -> Option<String> {
-    let ids: Vec<SpotifyUri> = uris
-        .iter()
-        .take(12)
-        .filter_map(|u| SpotifyUri::from_uri(u).ok())
-        .collect();
-    let tracks = futures_util::future::join_all(ids.iter().map(|id| Track::get(session, id))).await;
+    let first: Vec<String> = uris.iter().take(12).cloned().collect();
+    let items = tracks(session, &first).await;
     let mut covers: Vec<String> = Vec::new();
-    for t in tracks.into_iter().flatten() {
-        if let Some(url) = image_url(&t.album.covers)
-            && !covers.contains(&url)
-        {
+    for url in items.into_iter().filter_map(|t| t.image_url) {
+        if !covers.contains(&url) {
             covers.push(url);
             if covers.len() == 4 {
                 break;
@@ -252,15 +246,17 @@ pub async fn liked_uris(session: &Session) -> Result<Vec<String>, InternalError>
 
 /// Track metadata for `uris`, in order; tracks that fail to load are skipped.
 pub async fn tracks(session: &Session, uris: &[String]) -> Vec<TrackItem> {
-    stream::iter(uris.iter().cloned())
+    let mut items = stream::iter(uris.iter().cloned())
         .map(|uri| async move {
             let id = SpotifyUri::from_uri(&uri).ok()?;
             Track::get(session, &id).await.ok()
         })
         .buffered(CONCURRENCY)
         .filter_map(|t| async move { t.as_ref().map(track_item) })
-        .collect()
-        .await
+        .collect::<Vec<_>>()
+        .await;
+    fill_album_covers(session, &mut items).await;
+    items
 }
 
 /// Album header and its tracks.

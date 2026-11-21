@@ -9,7 +9,7 @@ use librespot_core::{Session, SpotifyId, SpotifyUri};
 use librespot_metadata::{Metadata, Track};
 
 use super::internal;
-use super::metadata::track_item;
+use super::metadata::{fill_album_covers, track_item};
 use super::model::TrackItem;
 
 /// Tracks in a radio queue (the seed comes first).
@@ -36,6 +36,7 @@ pub async fn track_meta(session: &Session, uri: &str) -> Option<TrackItem> {
     let t = Track::get(session, &id).await.ok()?;
     let mut item = track_item(&t);
     item.uri = uri.to_owned();
+    fill_album_covers(session, std::slice::from_mut(&mut item)).await;
     Some(item)
 }
 
