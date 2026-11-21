@@ -1,0 +1,19 @@
+name = "Полночь"
+base = "dark"
+accent_from_cover = true
+
+[colors]
+bg = "#0B1020"
+sidebar = "#080C18"
+surface = "#121A2E"
+surface-2 = "#1A2440"
+hover = "#9DB4FF14"
+pressed = "#9DB4FF22"
+selected = "#9DB4FF1C"
+line = "#9DB4FF17"
+line-2 = "#9DB4FF30"
+text-1 = "#EEF2FF"
+text-2 = "#A3AEC9"
+text-3 = "#6B7799"
+accent = "#7C9CFF"
+on-accent = "#0B1020"

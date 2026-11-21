@@ -17,6 +17,8 @@ pub struct TrackItem {
     /// Disc and track number for album sleeves (A1, B3…).
     pub disc_number: u32,
     pub track_number: u32,
+    /// Album cover (about 300 px), for row thumbnails and the player bar.
+    pub image_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

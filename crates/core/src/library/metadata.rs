@@ -16,10 +16,19 @@ const CONCURRENCY: usize = 8;
 #[error("не удалось загрузить данные артиста: {0}")]
 pub struct MetadataError(String);
 
-fn image_url(images: &Images) -> Option<String> {
+pub(super) fn image_url(images: &Images) -> Option<String> {
     images
         .iter()
         .max_by_key(|i| i.width)
+        .and_then(|i| i.id.to_base16().ok())
+        .map(|hex| format!("https://i.scdn.co/image/{hex}"))
+}
+
+/// Cover closest to 300 px wide (the 300 px rendition is what rows and the player bar need).
+pub(super) fn image_url_small(images: &Images) -> Option<String> {
+    images
+        .iter()
+        .min_by_key(|i| (i.width - 300).abs())
         .and_then(|i| i.id.to_base16().ok())
         .map(|hex| format!("https://i.scdn.co/image/{hex}"))
 }
@@ -28,7 +37,7 @@ fn uri_string(uri: &SpotifyUri) -> String {
     uri.to_uri().unwrap_or_default()
 }
 
-fn track_item(t: &Track) -> TrackItem {
+pub(super) fn track_item(t: &Track) -> TrackItem {
     TrackItem {
         uri: uri_string(&t.id),
         title: t.name.clone(),
@@ -46,6 +55,7 @@ fn track_item(t: &Track) -> TrackItem {
         playable: true,
         disc_number: u32::try_from(t.disc_number).unwrap_or(0),
         track_number: u32::try_from(t.number).unwrap_or(0),
+        image_url: image_url_small(&t.album.covers),
     }
 }
 

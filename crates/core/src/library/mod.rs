@@ -2,24 +2,27 @@
 //!
 //! Runs next to the auth backend and gets the session through the same `watch` channel as the player.
 
+pub mod extras;
+mod internal;
 mod metadata;
 pub mod model;
 pub mod webapi;
+mod webtoken;
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use librespot_core::Session;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub use model::*;
 use webapi::{ApiError, Http, HttpResponse, Method, TrackPage, WebApi};
+pub use webtoken::{WEBAPI_REFRESH_KEY, forget_own_token, use_own_client_id};
 
-/// Scopes for the session's Web API token.
-const SCOPES: &str = "playlist-read-private,playlist-read-collaborative,user-library-read,\
-user-library-modify,user-read-recently-played,user-read-private,user-read-playback-state,\
-user-modify-playback-state";
-const HOME_TILES: usize = 6;
+const HOME_TILES: usize = 12;
+/// Playlists without a picture that get a mosaic built at startup.
+const MOSAIC_LIMIT: usize = 40;
 /// Typing pause before a search request, so every keystroke does not hit the rate limit.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -40,6 +43,19 @@ pub enum LibraryCommand {
         uri: String,
         saved: bool,
     },
+    /// Full details (artists, length, cover) of a track the player reported only partly.
+    TrackMeta(String),
+    /// Similar tracks for "Радио по треку"; `title` names the queue.
+    Radio {
+        uri: String,
+        title: String,
+    },
+    Lyrics {
+        uri: String,
+        title: String,
+        artist: String,
+        duration_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +73,11 @@ pub enum LibraryEvent {
         page_id: u64,
         tracks: Vec<TrackItem>,
         done: bool,
+    },
+    /// A picture for the page found after its header (mosaic of a playlist without one).
+    PageImage {
+        page_id: u64,
+        url: String,
     },
     /// Discography on an artist page.
     PageTiles {
@@ -83,6 +104,16 @@ pub enum LibraryEvent {
         uri: String,
         saved: bool,
     },
+    TrackMeta(TrackItem),
+    Radio {
+        title: String,
+        tracks: Vec<TrackItem>,
+    },
+    /// `None`: no lyrics anywhere for this track.
+    Lyrics {
+        uri: String,
+        lyrics: Option<extras::Lyrics>,
+    },
     Error(String),
 }
 
@@ -108,21 +139,9 @@ impl SessionHttp {
 
 impl SessionHttp {
     async fn execute(&self, req: reqwest::RequestBuilder) -> Result<HttpResponse, ApiError> {
-        // login5 first: Spotify retired the Mercury keymaster endpoint (it answers
-        // "Service unavailable"). Keymaster stays as a fallback for older accounts/servers.
-        let token = match self.session.login5().auth_token().await {
-            Ok(t) => t,
-            Err(login5_err) => {
-                tracing::warn!(error = %login5_err, "login5 token failed, trying keymaster");
-                self.session
-                    .token_provider()
-                    .get_token(SCOPES)
-                    .await
-                    .map_err(|e| ApiError::Network(format!("токен: {login5_err}; {e}")))?
-            }
-        };
+        let token = webtoken::access_token(&self.session).await?;
         let resp = req
-            .bearer_auth(&token.access_token)
+            .bearer_auth(token.expose())
             .send()
             .await
             .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
@@ -206,6 +225,7 @@ pub async fn run(
                 Some(LibraryCommand::Open(req)) => svc.open(req),
                 Some(LibraryCommand::Search { query, kind, offset }) => svc.search(query, kind, offset),
                 Some(LibraryCommand::SetSaved { uri, saved }) => svc.set_saved(uri, saved),
+                Some(cmd) => svc.extra(cmd),
             },
             changed = sessions.changed() => {
                 if changed.is_err() {
@@ -242,6 +262,10 @@ impl Service {
             t.abort();
         }
         let events = self.events.clone();
+        if !webtoken::has_own_client_id() {
+            self.refresh_task = Some(tokio::spawn(refresh_internal(session, events)));
+            return;
+        }
         self.refresh_task = Some(tokio::spawn(async move {
             let api = WebApi::new(SessionHttp::new(session));
             match api.my_playlists().await {
@@ -296,6 +320,37 @@ impl Service {
 }
 
 impl Service {
+    /// Track cover, radio and lyrics: independent one-shot requests.
+    fn extra(&mut self, cmd: LibraryCommand) {
+        let events = self.events.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let task = async move {
+            let ev = match cmd {
+                LibraryCommand::TrackMeta(uri) => {
+                    LibraryEvent::TrackMeta(extras::track_meta(&session, &uri).await?)
+                }
+                LibraryCommand::Radio { uri, title } => match extras::radio(&session, &uri).await {
+                    Ok(tracks) => LibraryEvent::Radio { title, tracks },
+                    Err(e) => LibraryEvent::Error(format!("Радио не запустилось: {e}")),
+                },
+                LibraryCommand::Lyrics {
+                    uri,
+                    title,
+                    artist,
+                    duration_ms,
+                } => LibraryEvent::Lyrics {
+                    lyrics: extras::lyrics(&session, &uri, &title, &artist, duration_ms).await,
+                    uri,
+                },
+                _ => return None,
+            };
+            events.send(ev).await.ok()
+        };
+        tokio::spawn(task);
+    }
+
     fn set_saved(&self, uri: String, saved: bool) {
         let events = self.events.clone();
         let Some(session) = self.session.clone() else {
@@ -303,6 +358,14 @@ impl Service {
             return;
         };
         tokio::spawn(async move {
+            if !webtoken::has_own_client_id() {
+                let ev = match internal::set_saved(&session, &uri, saved).await {
+                    Ok(()) => LibraryEvent::Saved { uri, saved },
+                    Err(e) => LibraryEvent::Error(format!("Не удалось изменить «Любимые»: {e}")),
+                };
+                let _ = events.send(ev).await;
+                return;
+            }
             let api = WebApi::new(SessionHttp::new(session));
             let ev = match api.set_saved(std::slice::from_ref(&uri), saved).await {
                 Ok(()) => LibraryEvent::Saved { uri, saved },
@@ -337,9 +400,21 @@ impl Service {
             if offset == 0 {
                 tokio::time::sleep(SEARCH_DEBOUNCE).await;
             }
-            let api = WebApi::new(SessionHttp::new(session));
-            let kinds = kind.map_or(SearchKind::ALL.to_vec(), |k| vec![k]);
-            let ev = match api.search(&query, &kinds, offset).await {
+            let result = if webtoken::has_own_client_id() {
+                let api = WebApi::new(SessionHttp::new(session));
+                let kinds = kind.map_or(SearchKind::ALL.to_vec(), |k| vec![k]);
+                api.search(&query, &kinds, offset)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else if offset > 0 {
+                // The search context has no further pages here.
+                Ok(SearchResults::default())
+            } else {
+                internal::search(&session, &query)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let ev = match result {
                 Ok(results) => LibraryEvent::Search {
                     query,
                     kind,
@@ -377,6 +452,9 @@ async fn load_page(
     req: PageRequest,
     events: &mpsc::Sender<LibraryEvent>,
 ) -> Result<(), String> {
+    if !webtoken::has_own_client_id() && !matches!(req, PageRequest::Artist(_)) {
+        return load_page_internal(session, page_id, req, events).await;
+    }
     let api = WebApi::new(SessionHttp::new(session.clone()));
     let header = |header: PageHeader| LibraryEvent::PageHeader { page_id, header };
     let err = |e: ApiError| e.to_string();
@@ -445,4 +523,149 @@ async fn load_page(
         }
     }
     Ok(())
+}
+
+/// Sidebar, Liked count and home through the internal endpoints.
+async fn refresh_internal(session: Session, events: mpsc::Sender<LibraryEvent>) {
+    match internal::playlists(&session).await {
+        Ok(lists) => {
+            let mut lists = lists;
+            let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+            let _ = events
+                .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                .await;
+            // Playlists without a picture get a mosaic of their albums (sidebar and home), a few
+            // at a time, then one more update with all of them.
+            let missing: Vec<usize> = (0..lists.len())
+                .filter(|&i| lists[i].image_url.is_none())
+                .take(MOSAIC_LIMIT)
+                .collect();
+            let jobs: Vec<(usize, String)> = missing
+                .into_iter()
+                .map(|i| (i, lists[i].uri.clone()))
+                .collect();
+            let mut found = futures_util::stream::iter(jobs)
+                .map(|(i, uri)| {
+                    let session = session.clone();
+                    async move { (i, internal::fallback_cover(&session, &uri).await) }
+                })
+                .buffer_unordered(6);
+            // The sidebar fills in as mosaics arrive: every few of them, and once at the end.
+            let mut fresh = 0;
+            while let Some((i, url)) = found.next().await {
+                if url.is_none() {
+                    tracing::info!(uri = %lists[i].uri, "no mosaic for playlist");
+                    continue;
+                }
+                lists[i].image_url = url;
+                fresh += 1;
+                if fresh == 6 {
+                    fresh = 0;
+                    let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+                    let _ = events
+                        .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                        .await;
+                }
+            }
+            drop(found);
+            if fresh > 0 {
+                let _ = events.send(LibraryEvent::Playlists(lists.clone())).await;
+                let _ = events
+                    .send(LibraryEvent::Home(internal::home_tiles(&lists, HOME_TILES)))
+                    .await;
+            }
+        }
+        Err(e) => {
+            let _ = events
+                .send(LibraryEvent::Error(format!(
+                    "Плейлисты не загрузились: {e}"
+                )))
+                .await;
+        }
+    }
+    match internal::liked_uris(&session).await {
+        Ok(uris) => {
+            let n = u32::try_from(uris.len()).unwrap_or(u32::MAX);
+            let _ = events.send(LibraryEvent::LikedCount(n)).await;
+        }
+        Err(e) => tracing::info!(%e, "liked songs count unavailable"),
+    }
+}
+
+/// Loads track metadata in chunks so long lists appear progressively.
+async fn send_track_uris(
+    session: &Session,
+    events: &mpsc::Sender<LibraryEvent>,
+    page_id: u64,
+    uris: &[String],
+) -> Result<(), String> {
+    if uris.is_empty() {
+        let empty = TrackPage {
+            tracks: Vec::new(),
+            next: None,
+            total: Some(0),
+        };
+        return send_tracks(events, page_id, &empty).await;
+    }
+    let chunks: Vec<&[String]> = uris.chunks(internal::CHUNK).collect();
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let tracks = internal::tracks(session, chunk).await;
+        events
+            .send(LibraryEvent::PageTracks {
+                page_id,
+                tracks,
+                done: i == last,
+            })
+            .await
+            .map_err(|_| "UI закрыт".to_owned())?;
+    }
+    Ok(())
+}
+
+async fn load_page_internal(
+    session: &Session,
+    page_id: u64,
+    req: PageRequest,
+    events: &mpsc::Sender<LibraryEvent>,
+) -> Result<(), String> {
+    let (header, uris) = match req {
+        PageRequest::Liked => {
+            let uris = internal::liked_uris(session)
+                .await
+                .map_err(|e| e.to_string())?;
+            let header = PageHeader {
+                kind: CollectionKind::Liked,
+                uri: "liked".into(),
+                title: "Любимые треки".into(),
+                byline: session.username(),
+                byline_uri: None,
+                year: None,
+                total_tracks: Some(u32::try_from(uris.len()).unwrap_or(u32::MAX)),
+                image_url: None,
+            };
+            (header, uris)
+        }
+        PageRequest::Playlist(uri) => internal::playlist(session, &uri)
+            .await
+            .map_err(|e| e.to_string())?,
+        PageRequest::Album(uri) => internal::album(session, &uri)
+            .await
+            .map_err(|e| e.to_string())?,
+        PageRequest::Artist(_) => return Err("артист грузится через metadata".into()),
+    };
+    let needs_mosaic = header.image_url.is_none() && header.kind == CollectionKind::Playlist;
+    events
+        .send(LibraryEvent::PageHeader { page_id, header })
+        .await
+        .map_err(|_| "UI закрыт".to_owned())?;
+    if needs_mosaic && !uris.is_empty() {
+        let (session, events, uris) = (session.clone(), events.clone(), uris.clone());
+        tokio::spawn(async move {
+            if let Some(url) = internal::mosaic_for(&session, &uris).await {
+                let _ = events.send(LibraryEvent::PageImage { page_id, url }).await;
+            }
+        });
+    }
+    send_track_uris(session, events, page_id, &uris).await
 }

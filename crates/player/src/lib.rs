@@ -2,10 +2,12 @@
 
 pub mod queue;
 mod service;
+pub mod soloist;
 pub mod uri;
 
 pub use queue::{QueueItem, QueueSnapshot};
 pub use service::run;
+pub use soloist::{SoloistConfig, SoloistStatus};
 
 /// Commands from the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +34,11 @@ pub enum PlayerCommand {
     JumpTo(usize),
     /// Drop the hand-queued tracks.
     ClearQueue,
+    /// Drag and drop in the queue panel: entry `from` of the upcoming list goes to `to`.
+    MoveInQueue {
+        from: usize,
+        to: usize,
+    },
     /// New audio settings; a new output/bitrate applies from the next track.
     Configure(AudioOptions),
     /// Pause if playing (playback moved to another device).
@@ -49,6 +56,10 @@ pub enum PlayerCommand {
     },
     /// Volume in percent, 0..=100.
     SetVolume(u8),
+    /// Play through Spotify Soloist (`Some`) or the built-in librespot player (`None`).
+    Soloist(Option<SoloistConfig>),
+    /// Try Soloist again after a failure, or sign it in again.
+    SoloistRetry,
 }
 
 /// Audio settings the player needs (mirrors the `[audio]` section of config.toml).
@@ -118,6 +129,10 @@ pub enum PlayerEvent {
     Volume(u8),
     Queue(QueueSnapshot),
     Error(String),
+    /// Spotify refused the built-in player's audio keys several times in a row (librespot
+    /// issue #1649, mostly newer accounts): offer Soloist.
+    AudioKeyRefused,
+    Soloist(SoloistStatus),
 }
 
 /// Repeat mode of the play queue.

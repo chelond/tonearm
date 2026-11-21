@@ -13,12 +13,22 @@ pub struct Settings {
     pub audio: AudioSettings,
     pub cache: CacheSettings,
     pub ui: UiSettings,
+    pub player: PlayerSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerSettings {
+    /// Play through Spotify Soloist instead of the built-in librespot player. The Soloist key
+    /// itself lives in the keyring (`soloist-api-key`), never here.
+    pub soloist: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpotifySettings {
-    /// Own app from developer.spotify.com, reserved for a Web API fallback. Not a secret (PKCE).
+    /// Own app from developer.spotify.com for Web API tokens (avoids the shared client id's
+    /// rate limit). Empty = login5 token of the session. Not a secret (PKCE).
     pub client_id: String,
 }
 
@@ -45,6 +55,9 @@ pub struct CacheSettings {
 pub struct UiSettings {
     /// Desktop notification on track change (only while the window is in the background).
     pub notifications: bool,
+    /// Colour theme: a built-in id (`graphite`, `light`…) or `file:<name>.toml` from the
+    /// themes folder. Unknown ids fall back to the default.
+    pub theme: String,
 }
 
 impl Default for AudioSettings {
@@ -68,6 +81,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             notifications: true,
+            theme: "graphite".into(),
         }
     }
 }
