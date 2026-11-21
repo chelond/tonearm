@@ -55,6 +55,9 @@ pub struct CacheSettings {
 pub struct UiSettings {
     /// Desktop notification on track change (only while the window is in the background).
     pub notifications: bool,
+    /// Colour theme: a built-in id (`graphite`, `light`…) or `file:<name>.toml` from the
+    /// themes folder. Unknown ids fall back to the default.
+    pub theme: String,
 }
 
 impl Default for AudioSettings {
@@ -78,6 +81,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             notifications: true,
+            theme: "graphite".into(),
         }
     }
 }
