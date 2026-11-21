@@ -77,6 +77,9 @@ enum PaletteAction {
 #[derive(Default)]
 pub struct UiState {
     pub page_id: u64,
+    /// Events of pages older than this belong to a page we left (still in flight when we
+    /// navigated): ignore them.
+    min_page_id: u64,
     pub page_kind: Option<CollectionKind>,
     pub page_uri: String,
     pub page_title: String,
@@ -436,6 +439,7 @@ impl UiState {
             self.history.push(cur);
         }
         self.current = Some(req.clone());
+        self.min_page_id = self.page_id + 1;
         self.page_kind = None;
         self.tracks.clear();
         self.view.clear();
@@ -739,11 +743,13 @@ impl UiState {
             LibraryEvent::LikedCount(n) => w.set_liked_count(i32::try_from(n).unwrap_or(i32::MAX)),
             LibraryEvent::Home(tiles) if !tiles.is_empty() => fx.extend(self.set_home(w, tiles)),
             LibraryEvent::Home(_) => {}
-            LibraryEvent::PageHeader { page_id, header } => {
+            LibraryEvent::PageHeader { page_id, header } if page_id >= self.min_page_id => {
                 self.page_id = page_id;
                 fx.extend(self.set_header(w, &header));
             }
-            LibraryEvent::PageImage { page_id, url } if page_id == self.page_id => {
+            LibraryEvent::PageImage { page_id, url }
+                if page_id == self.page_id && page_id >= self.min_page_id =>
+            {
                 self.page_image_url = Some(url.clone());
                 fx.push(Effect::Cover {
                     url,
@@ -755,7 +761,7 @@ impl UiState {
                 page_id,
                 tracks,
                 done,
-            } if page_id == self.page_id => {
+            } if page_id == self.page_id && page_id >= self.min_page_id => {
                 let start = self.tracks.len();
                 self.tracks.extend(tracks);
                 if self.view_is_plain() {
@@ -783,7 +789,9 @@ impl UiState {
                     }
                 }
             }
-            LibraryEvent::PageTiles { page_id, tiles } if page_id == self.page_id => {
+            LibraryEvent::PageTiles { page_id, tiles }
+                if page_id == self.page_id && page_id >= self.min_page_id =>
+            {
                 self.tile_rows
                     .set_vec(tiles.iter().map(tile_data).collect::<Vec<_>>());
                 fx.extend(tiles.iter().filter_map(|t| {
@@ -796,7 +804,7 @@ impl UiState {
                 self.page_tiles = tiles;
                 w.set_page_loading(false);
             }
-            LibraryEvent::PageError { page_id, message } if page_id >= self.page_id => {
+            LibraryEvent::PageError { page_id, message } if page_id >= self.min_page_id => {
                 w.set_page_loading(false);
                 w.set_page_error(message.into());
                 self.autoplay = false;
