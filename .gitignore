@@ -1,9 +1,25 @@
+# Build output
 /target
+/dist
 **/*.rs.bk
+
+# makepkg output (packaging/arch)
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.*
+
 # Local config and secrets: never commit
 config.toml
 !/.cargo/config.toml
 *.local.toml
 .env
 *.token
-/dist
+*.pem
+*.key
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
