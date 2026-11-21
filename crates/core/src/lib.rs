@@ -8,6 +8,7 @@ pub mod config;
 pub mod connect;
 pub mod covers;
 pub mod file_store;
+pub mod lastfm;
 pub mod library;
 pub mod secret;
 pub mod update;

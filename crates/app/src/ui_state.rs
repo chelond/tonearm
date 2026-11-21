@@ -18,11 +18,14 @@ use tonearm_core::library::{
 use tonearm_player::{PlaybackState, PlayerCommand, QueueItem, QueueSnapshot, TrackInfo};
 
 use crate::history::{self, Context, Entry, QueuedTrack, Resume, Store};
-use crate::themes;
 use crate::{
     AppWindow, LyricRow, LyricWord, PaletteRow, PlayView, PlaylistEntry, QueueRow, RowState,
     StatRow, Theme, ThemeCard, TileData, TrackData,
 };
+use crate::{smart, themes};
+
+mod insights;
+pub use insights::wrapped_rows;
 
 /// Requests from the UI state to the async side (covers, playback, navigation).
 pub enum Effect {
@@ -47,6 +50,24 @@ pub enum Effect {
     Save(Box<Store>),
     /// Write only the resume point (cheap; every few seconds while playing).
     SaveResume(Box<Resume>),
+    /// Add a finished play to the permanent play log.
+    LogPlay(Box<Entry>),
+    /// Build a smart playlist off the UI thread; the answer carries `token`.
+    /// `plays`: `None` reads the play log (sample data in the preview).
+    Smart {
+        token: u64,
+        rule: Box<smart::Rule>,
+        liked: Vec<TrackItem>,
+        plays: Option<Vec<Entry>>,
+    },
+    /// Compute the summary of a year (0 = the latest with plays).
+    Wrapped {
+        year: i32,
+        plays: Option<Vec<Entry>>,
+    },
+    LastFm(tonearm_core::lastfm::LastFmCommand),
+    /// Write the smart playlist rules.
+    SaveRules(Vec<smart::Rule>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -59,6 +80,7 @@ pub enum CoverTarget {
     SearchTrack(String),
     Playlist(String),
     History(String),
+    Wrapped(String),
 }
 
 const DEFAULT_PAGE_ACCENT: Color = Color::from_rgb_u8(0x4A, 0x4A, 0x58);
@@ -166,6 +188,20 @@ pub struct UiState {
     shown_header: Option<PageHeader>,
     /// Colour taken from the page's cover.
     page_rgb: Option<[u8; 3]>,
+    smart_rules: Vec<smart::Rule>,
+    smart_rows: Rc<VecModel<PlaylistEntry>>,
+    /// A smart page waits for Liked Songs: their header and tracks are collected here.
+    smart_fetch: Option<insights::SmartFetch>,
+    /// Rule open in the editor (`None`: a new one).
+    smart_editing: Option<String>,
+    /// Tracks of the year summary, in the order shown (for playing them).
+    wrapped_items: Vec<Entry>,
+    wrapped_rows: insights::WrappedRows,
+    /// "Now playing" already sent to Last.fm for this track.
+    np_sent: String,
+    smart_seq: u64,
+    /// Signed in to Last.fm with scrobbling on.
+    pub lastfm_on: bool,
 }
 
 /// Pages kept in memory and tracks across all of them: about a few MB at most.
@@ -220,6 +256,8 @@ pub fn init(w: &AppWindow) {
     w.set_search_playlists(ModelRc::from(st.search.playlists.clone()));
     w.set_history_tracks(ModelRc::from(st.history_rows.clone()));
     w.set_stats_tracks(ModelRc::from(st.stat_track_rows.clone()));
+    let mut st = st;
+    st.init_insights(w);
     STATE.with(|s| *s.borrow_mut() = Some(st));
 }
 
@@ -320,6 +358,9 @@ fn kind_code(kind: CollectionKind) -> i32 {
 }
 
 pub fn request_from(kind: i32, uri: String) -> PageRequest {
+    if smart::id_of(&uri).is_some() {
+        return PageRequest::Playlist(uri);
+    }
     match kind {
         0 => PageRequest::Liked,
         2 => PageRequest::Album(uri),
@@ -469,6 +510,9 @@ impl UiState {
             return;
         };
         let key = request_uri(cur);
+        if smart::id_of(&key.1).is_some() {
+            return; // rebuilt on every visit
+        }
         let complete = !w.get_page_loading() && w.get_page_error().is_empty();
         if !complete || self.refresh.is_some() {
             // Half loaded: keep only the scroll position of an older copy.
@@ -477,8 +521,7 @@ impl UiState {
             }
             return;
         }
-        self.page_cache.retain(|c| c.key != key);
-        self.page_cache.push(CachedPage {
+        let page = CachedPage {
             key,
             header: self.shown_header.clone(),
             image_url: self.page_image_url.clone(),
@@ -486,7 +529,13 @@ impl UiState {
             tracks: self.tracks.clone(),
             tiles: self.page_tiles.clone(),
             scroll: w.get_coll_scroll(),
-        });
+        };
+        self.push_cache(page);
+    }
+
+    fn push_cache(&mut self, page: CachedPage) {
+        self.page_cache.retain(|c| c.key != page.key);
+        self.page_cache.push(page);
         while self.page_cache.len() > PAGE_CACHE
             || (self.page_cache.len() > 1
                 && self
@@ -605,6 +654,12 @@ impl UiState {
             DEFAULT_PAGE_ACCENT
         });
         w.set_page(crate::Page::Collection);
+        self.smart_fetch = None;
+        w.set_page_smart(false);
+        w.set_page_empty_hint("".into());
+        if let Some(id) = smart::id_of(&self.page_uri).map(str::to_owned) {
+            return self.open_smart(w, &id);
+        }
         let mut fx = self.restore_page(w, &(kind, self.page_uri.clone()));
         fx.push(Effect::Open(req));
         fx
@@ -874,6 +929,10 @@ impl UiState {
     }
 
     pub fn on_library(&mut self, w: &AppWindow, ev: LibraryEvent) -> Vec<Effect> {
+        let ev = match self.smart_liked(w, ev) {
+            Ok(fx) => return fx,
+            Err(ev) => *ev,
+        };
         let mut fx = Vec::new();
         match ev {
             LibraryEvent::Playlists(lists) => {
@@ -1410,6 +1469,7 @@ impl UiState {
                     }
                 }
             }
+            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &to_image(cover)),
             CoverTarget::Deck(uri) if *uri == self.playing_uri => {
                 w.set_track_image(to_image(cover));
                 w.set_track_backdrop(backdrop(cover));
@@ -1560,6 +1620,7 @@ impl UiState {
         self.meta_pending = still_pending && !complete;
         // Fetched ahead, so the lyrics are there the moment they are opened.
         fx.extend(self.lyrics_opened(w));
+        fx.extend(self.now_playing());
         fx
     }
 
@@ -1651,6 +1712,7 @@ impl UiState {
         // Fetched ahead, so the lyrics are there the moment they are opened.
         fx.extend(self.lyrics_opened(w));
         fx.push(self.save_resume(0));
+        fx.extend(self.now_playing());
         fx
     }
 
@@ -1665,20 +1727,29 @@ impl UiState {
             .iter()
             .chain(&self.search.results.tracks)
             .find(|x| x.uri == t.uri);
-        self.store.add(Entry {
+        let entry = Entry {
             uri: t.uri.clone(),
             title: t.title.clone(),
             artists: t.artists.clone(),
-            artist_uri: known.and_then(|k| k.artist_uri.clone()),
+            artist_uri: known
+                .and_then(|k| k.artist_uri.clone())
+                .or_else(|| self.playing_artist.clone()),
             album: t.album.clone(),
+            album_uri: known
+                .and_then(|k| k.album_uri.clone())
+                .or_else(|| self.playing_album.clone()),
             image_url: t.cover_url.clone(),
             duration_ms: t.duration_ms,
             listened_ms: self.listened_ms,
             at: self.started_at,
             context: self.context.clone(),
-        });
+        };
+        let mut fx = insights::scrobble(&entry);
+        fx.push(Effect::LogPlay(Box::new(entry.clone())));
+        self.store.add(entry);
         self.listened_ms = 0;
-        self.refresh_recent(w)
+        fx.extend(self.refresh_recent(w));
+        fx
     }
 
     /// Called by the 1 s clock while the local player plays.
@@ -1810,7 +1881,22 @@ impl UiState {
             // Nothing played this session: keep last session's state as it was.
             return Some(std::mem::take(&mut self.store));
         }
-        drop(self.finish_listen(w));
+        for fx in self.finish_listen(w) {
+            match fx {
+                Effect::LogPlay(e) => {
+                    if let Some(log) = history::PlayLog::open() {
+                        let _ = log.append(&e);
+                    }
+                }
+                // The Last.fm task is stopping: queue it on disk, it goes out next start.
+                Effect::LastFm(tonearm_core::lastfm::LastFmCommand::Scrobble(s))
+                    if self.lastfm_on =>
+                {
+                    tonearm_core::lastfm::Queue::load(tonearm_core::lastfm::queue_path()).push(s);
+                }
+                _ => {}
+            }
+        }
         match self.save_resume(pos) {
             Effect::Save(s) => Some(*s),
             _ => None,
@@ -2025,6 +2111,7 @@ impl UiState {
             ("search", "Поиск", crate::Page::Search),
             ("library", "Медиатека", crate::Page::Library),
             ("stats", "Статистика", crate::Page::Stats),
+            ("sparkle", "Итоги года", crate::Page::Wrapped),
             ("settings", "Настройки", crate::Page::Settings),
         ];
         let has_track = !self.playing.uri.is_empty();
@@ -2079,6 +2166,14 @@ impl UiState {
                     row(5, "heart-fill", "Любимые треки", "Плейлист"),
                     PaletteAction::Open(PageRequest::Liked),
                 );
+            }
+            for r in &self.smart_rules {
+                if matches(&r.name, &q) {
+                    push(
+                        row(1, "sparkle", &r.name, "Умный плейлист"),
+                        PaletteAction::Open(PageRequest::Playlist(smart::uri(&r.id))),
+                    );
+                }
             }
             for p in &self.playlists {
                 if matches(&p.name, &q) {

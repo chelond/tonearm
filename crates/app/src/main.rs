@@ -4,9 +4,11 @@
 mod history;
 mod mini;
 mod os_media;
+mod smart;
 mod themes;
 mod ui_state;
 mod updater;
+mod wrapped;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use tonearm_core::config::{BITRATES, CACHE_SIZES_MB, FADE_SECS, Settings};
 use tonearm_core::connect::{ConnectCommand, ConnectEvent, RemoteAction};
 use tonearm_core::covers::CoverCache;
+use tonearm_core::lastfm::{LastFmCommand, LastFmEvent};
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
 use tonearm_player::effects::{self, EffectsOptions};
@@ -177,6 +180,7 @@ struct Senders {
     player: mpsc::Sender<PlayerCommand>,
     library: mpsc::Sender<LibraryCommand>,
     connect: mpsc::Sender<ConnectCommand>,
+    lastfm: mpsc::Sender<LastFmCommand>,
     /// Spotify Connect: id of the remote device that plays now (`None` = this computer).
     remote: Arc<Mutex<Option<String>>>,
     remote_playing: Arc<AtomicBool>,
@@ -218,6 +222,11 @@ impl Senders {
             } else {
                 self.local(PlayerCommand::Soloist(None));
             }
+        }
+        if new.lastfm.scrobble != current.lastfm.scrobble {
+            self.lastfm_cmd(LastFmCommand::SetEnabled(new.lastfm.scrobble));
+            let on = new.lastfm.scrobble && w.get_lastfm_state() == 3;
+            ui_state::with(|st| st.lastfm_on = on);
         }
         if new.cache != current.cache {
             let covers = Arc::clone(&self.covers);
@@ -369,6 +378,12 @@ impl Senders {
         }
     }
 
+    fn lastfm_cmd(&self, cmd: LastFmCommand) {
+        if self.lastfm.try_send(cmd).is_err() {
+            tracing::debug!("last.fm busy, command dropped");
+        }
+    }
+
     fn connect(&self, cmd: ConnectCommand) {
         if self.connect.try_send(cmd).is_err() {
             tracing::debug!("connect busy, command dropped");
@@ -429,6 +444,91 @@ impl Senders {
                         self.rt
                             .spawn_blocking(move || history::save_resume(Some(&r)));
                     }
+                }
+                Effect::LogPlay(e) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt.spawn_blocking(move || {
+                            if let Some(log) = history::PlayLog::open()
+                                && let Err(err) = log.append(&e)
+                            {
+                                tracing::warn!(error = %err, "cannot write the play log");
+                            }
+                        });
+                    }
+                }
+                Effect::SaveRules(rules) => {
+                    if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+                        self.rt.spawn_blocking(move || smart::save(&rules));
+                    }
+                }
+                Effect::LastFm(cmd) => self.lastfm_cmd(cmd),
+                Effect::Smart {
+                    token,
+                    rule,
+                    liked,
+                    plays,
+                } => {
+                    let s = self.clone();
+                    self.rt.spawn_blocking(move || {
+                        let plays = plays.unwrap_or_else(|| {
+                            history::PlayLog::open().map_or_else(Vec::new, |l| l.read_all())
+                        });
+                        let tracks = smart::evaluate(&rule, &liked, &plays, history::now());
+                        drop(plays);
+                        let weak = s.window.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                let fx = ui_state::with(|st| st.on_smart(&w, token, tracks));
+                                s.run(fx);
+                            }
+                        });
+                    });
+                }
+                Effect::Wrapped { year, plays } => {
+                    let s = self.clone();
+                    self.rt.spawn_blocking(move || {
+                        let (years, entries) = match plays {
+                            Some(all) => {
+                                let mut years: Vec<i32> =
+                                    all.iter().map(|e| history::year_of(e.at)).collect();
+                                years.sort_unstable_by(|a, b| b.cmp(a));
+                                years.dedup();
+                                (years, all)
+                            }
+                            None => {
+                                let log = history::PlayLog::open();
+                                let years = log.as_ref().map(history::PlayLog::years);
+                                let years = years.unwrap_or_default();
+                                let pick = if year == 0 {
+                                    years.first().copied()
+                                } else {
+                                    Some(year)
+                                };
+                                let entries = match (&log, pick) {
+                                    (Some(l), Some(y)) => l.read_year(y),
+                                    _ => Vec::new(),
+                                };
+                                (years, entries)
+                            }
+                        };
+                        let year = if year == 0 {
+                            years
+                                .first()
+                                .copied()
+                                .unwrap_or_else(|| history::year_of(history::now()))
+                        } else {
+                            year
+                        };
+                        let summary = wrapped::summary(&entries, year);
+                        drop(entries);
+                        let weak = s.window.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                let fx = ui_state::with(|st| st.on_wrapped(&w, &summary, &years));
+                                s.run(fx);
+                            }
+                        });
+                    });
                 }
             }
         }
@@ -721,6 +821,14 @@ fn raise(w: &AppWindow) {
     });
 }
 
+fn apply_lastfm(w: &AppWindow, _s: &Senders, event: LastFmEvent) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
+        return;
+    }
+    ui_state::with(|st| st.on_lastfm(w, event));
+}
+
 fn apply_library(w: &AppWindow, s: &Senders, event: LibraryEvent) {
     // The preview has no session, so real library calls fail; keep its screens clean.
     if std::env::var_os("TONEARM_UI_PREVIEW").is_some()
@@ -905,6 +1013,8 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     }
     w.set_set_fade(index_of(&FADE_SECS, &s.effects.fade_secs, 0));
     w.set_set_visualizer(i32::from(s.effects.visualizer));
+    w.set_set_scrobble(i32::from(s.lastfm.scrobble));
+    w.set_smart_collapsed(s.ui.smart_collapsed);
 }
 
 /// The settings page → Settings (keeps what the page does not show, like the Client ID).
@@ -933,6 +1043,8 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
         .collect();
     s.effects.fade_secs = FADE_SECS[pick(w.get_set_fade(), FADE_SECS.len())];
     s.effects.visualizer = w.get_set_visualizer() != 0;
+    s.lastfm.scrobble = w.get_set_scrobble() != 0;
+    s.ui.smart_collapsed = w.get_smart_collapsed();
     s
 }
 
@@ -977,6 +1089,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (lev_tx, lev_rx) = mpsc::channel::<LibraryEvent>(64);
     let (ccmd_tx, ccmd_rx) = mpsc::channel::<ConnectCommand>(16);
     let (cev_tx, cev_rx) = mpsc::channel::<ConnectEvent>(16);
+    let (fcmd_tx, fcmd_rx) = mpsc::channel::<LastFmCommand>(64);
+    let (fev_tx, fev_rx) = mpsc::channel::<LastFmEvent>(16);
     // The core publishes the connected session; player and library pick it up.
     let (session_tx, session_rx) = watch::channel(None);
 
@@ -989,6 +1103,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let window = AppWindow::new()?;
     ui_state::init(&window);
+    ui_state::wrapped_rows(&window);
     show_settings(&window, &settings);
     // TONEARM_THEME=<id> overrides the saved theme (screenshots of every theme).
     let theme = std::env::var("TONEARM_THEME").unwrap_or_else(|_| settings.ui.theme.clone());
@@ -1001,6 +1116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth: cmd_tx.clone(),
         player: pcmd_tx,
         connect: ccmd_tx,
+        lastfm: fcmd_tx,
         remote: Arc::new(Mutex::new(None)),
         remote_playing: Arc::new(AtomicBool::new(false)),
         library: lcmd_tx,
@@ -1313,6 +1429,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let s = senders.clone();
+    window.on_smart_new(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.smart_new(&w));
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_edit(move || {
+        if let Some(w) = s.window.upgrade() {
+            ui_state::with(|st| st.smart_edit(&w));
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_save(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.smart_save(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_smart_delete(move || {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.smart_delete(&w));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_wrapped_opened(move |i| {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.wrapped_opened(&w, i));
+            s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_wrapped_play(move |i| {
+        let fx = ui_state::with(|st| st.wrapped_play(i));
+        s.run(fx);
+    });
+    let s = senders.clone();
+    window.on_lastfm_login(move || s.lastfm_cmd(LastFmCommand::Login));
+    let s = senders.clone();
+    window.on_lastfm_cancel(move || s.lastfm_cmd(LastFmCommand::CancelLogin));
+    let s = senders.clone();
+    window.on_lastfm_logout(move || s.lastfm_cmd(LastFmCommand::Logout));
+    let s = senders.clone();
     window.on_history_play(move |i| {
         let fx = ui_state::with(|st| st.history_play(i));
         s.run(fx);
@@ -1492,6 +1652,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         session_rx.clone(),
     ));
     let connect = runtime.spawn(tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx));
+    let lastfm = runtime.spawn(tonearm_core::lastfm::run(
+        settings.lastfm.clone(),
+        tonearm_core::system_store(),
+        fcmd_rx,
+        fev_tx,
+    ));
+    forward(
+        &runtime,
+        fev_rx,
+        window.as_weak(),
+        senders.clone(),
+        apply_lastfm,
+    );
     forward(
         &runtime,
         cev_rx,
@@ -1623,6 +1796,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(wait, player).await;
         let _ = tokio::time::timeout(wait, library).await;
         let _ = tokio::time::timeout(wait, connect).await;
+        let _ = tokio::time::timeout(wait, lastfm).await;
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     if updater.restart_requested() {
@@ -1751,8 +1925,15 @@ fn preview(w: &AppWindow, senders: &Senders) {
             cover_url: Some("preview:deck".into()),
         };
         fx.extend(st.on_track(w, &track));
-        if screen == "stats" || screen == "home" {
+        if screen == "stats" || screen == "home" || screen.starts_with("smart") {
             fx.extend(st.preview_history(w));
+        }
+        if screen == "wrapped" {
+            st.preview_year();
+        }
+        if screen == "smart" {
+            let req = PageRequest::Playlist(smart::uri("on-repeat"));
+            fx.extend(st.open(w, req, true));
         }
         // Feed the OS media controls too, once they are registered (after the event loop starts).
         slint::Timer::single_shot(Duration::from_millis(300), move || {
@@ -1781,6 +1962,8 @@ fn preview(w: &AppWindow, senders: &Senders) {
         w.set_page(Page::Settings);
         w.set_username("nightowl".into());
         w.set_cache_used_mb(214);
+        w.set_lastfm_state(3);
+        w.set_lastfm_user("nightowl".into());
         let devices: Vec<slint::SharedString> =
             vec!["Built-in Audio Analog Stereo".into(), "USB DAC".into()];
         w.set_audio_devices(slint::ModelRc::new(slint::VecModel::from(devices)));
@@ -1861,6 +2044,12 @@ fn preview(w: &AppWindow, senders: &Senders) {
                 mini::toggle(&w);
             }
         });
+    }
+    if screen == "wrapped" {
+        w.set_page(Page::Wrapped);
+    }
+    if screen == "smart-editor" {
+        ui_state::with(|st| st.smart_new(w));
     }
     if screen.starts_with("lyrics") {
         use tonearm_core::library::lyrics::{LyricLine, Lyrics, fill_timings};

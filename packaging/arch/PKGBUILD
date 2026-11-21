@@ -30,6 +30,12 @@ build() {
   cd "$(_srcroot)"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
+  # Last.fm API account for scrobbling: TONEARM_LASTFM_KEY / TONEARM_LASTFM_SECRET from the
+  # environment, or from packaging/arch/lastfm.env (not in git). Without them the build works,
+  # only Last.fm is off.
+  if [[ -f "$startdir/lastfm.env" ]]; then
+    set -a; source "$startdir/lastfm.env"; set +a
+  fi
   cargo build --frozen --release -p tonearm
 }
 

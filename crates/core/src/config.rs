@@ -16,6 +16,28 @@ pub struct Settings {
     pub ui: UiSettings,
     pub player: PlayerSettings,
     pub update: UpdateSettings,
+    pub lastfm: LastFmSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastFmSettings {
+    /// Send plays to Last.fm (once signed in; the session key is in the keyring).
+    pub scrobble: bool,
+    /// Own API account from last.fm/api, instead of the one built into release builds.
+    /// Empty = built-in.
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+impl Default for LastFmSettings {
+    fn default() -> Self {
+        Self {
+            scrobble: true,
+            api_key: String::new(),
+            api_secret: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -111,6 +133,8 @@ pub struct UiSettings {
     pub theme: String,
     /// Lyrics lit word by word (adds NetEase, an unofficial source) instead of line by line.
     pub lyrics_words: bool,
+    /// The sidebar's smart playlists are folded.
+    pub smart_collapsed: bool,
 }
 
 impl Default for AudioSettings {
@@ -136,6 +160,7 @@ impl Default for UiSettings {
             notifications: true,
             theme: "graphite".into(),
             lyrics_words: false,
+            smart_collapsed: false,
         }
     }
 }

@@ -24,6 +24,13 @@ max_size_mb = 512      # covers; the settings page offers 128 | 256 | 512 | 1024
 notifications = true   # notify on track change while the window is in the background
 theme = "graphite"     # graphite, midnight, oled, forest, sakura, synthwave, light, sand, or "file:<name>.toml"
 
+[lastfm]
+scrobble = true        # send plays to Last.fm once signed in (Settings → Last.fm)
+# Own API account from https://www.last.fm/api/account/create instead of the one built into
+# release builds. Leave empty to use the built-in one.
+api_key = ""
+api_secret = ""
+
 [update]
 check = true           # look for a new version at startup and once a day
 # Release feed in the shape of GitHub's releases/latest JSON; empty = GitHub Releases.
