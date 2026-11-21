@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
 ### Добавлено
 
 - Эквалайзер на 10 полос с пресетами («Басы», «Верха», «Голос», «Рок» и другие) и своими
@@ -58,13 +60,7 @@
 
 - «Продолжить с места» больше не играет кусок начала трека перед перемоткой.
 - Очередь в панели не сбрасывает прокрутку и перетаскивание при смене трека.
-
-### Исправлено
-
 - Текст без синхронизации налезал строками друг на друга.
-
-### Исправлено
-
 - Фото артистов не загружались на странице артиста и в поиске.
 
 ## [0.1.1] - 2026-11-21
@@ -100,6 +96,7 @@
 - Обновление одной кнопкой из GitHub Releases, файлы проверяются по подписи ed25519.
 - Пакеты: PKGBUILD для Arch Linux, exe и zip для Windows, MSI через cargo-wix.
 
-[Unreleased]: https://github.com/chelond/tonearm/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/chelond/tonearm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chelond/tonearm/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/chelond/tonearm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/chelond/tonearm/releases/tag/v0.1.0

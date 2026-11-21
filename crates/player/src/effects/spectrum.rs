@@ -174,8 +174,8 @@ mod capture {
                     let mut samples = vec![0f32; Analyzer::block()];
                     // Ends when pw-record is killed (EOF).
                     while stdout.read_exact(&mut bytes).is_ok() {
-                        for (s, b) in samples.iter_mut().zip(bytes.chunks_exact(4)) {
-                            *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        for (s, b) in samples.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                            *s = f32::from_le_bytes(*b);
                         }
                         on_frame(analyzer.frame(&samples));
                     }
