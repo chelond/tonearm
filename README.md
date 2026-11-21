@@ -237,7 +237,7 @@ docs/          дизайн и заметки о решениях
 ```
 
 Интерфейс можно смотреть без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран:
-`home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `lyrics`, `palette`, `stats`, `menu`,
+`home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `lyrics`, `lyrics-plain`, `palette`, `stats`, `menu`,
 `devices`, `settings`, `login`, `waiting`, `offline`, `update`, `update-downloading`, `update-failed`.
 
 Рендерер по умолчанию программный (так меньше памяти). OpenGL можно попробовать через

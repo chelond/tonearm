@@ -815,6 +815,7 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_normalisation(i32::from(s.audio.normalisation));
     w.set_set_gapless(i32::from(s.audio.gapless));
     w.set_set_notifications(i32::from(s.ui.notifications));
+    w.set_lyrics_mode(i32::from(s.ui.lyrics_words));
     w.set_set_device(s.audio.device.as_str().into());
     // A hand-edited size that is not one of the steps shows as the nearest larger step.
     let cache = CACHE_SIZES_MB
@@ -834,6 +835,7 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.audio.gapless = w.get_set_gapless() != 0;
     s.audio.device = w.get_set_device().to_string();
     s.ui.notifications = w.get_set_notifications() != 0;
+    s.ui.lyrics_words = w.get_lyrics_mode() == 1;
     s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
@@ -1129,6 +1131,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(w) = s.window.upgrade() {
             let fx = ui_state::with(|st| st.radio_current(&w));
             s.run(fx);
+        }
+    });
+    let s = senders.clone();
+    window.on_lyrics_mode_changed(move || {
+        s.settings_changed();
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.lyrics_mode_changed(&w));
+            s.run(fx);
+            lyrics_kick(&w);
         }
     });
     let s = senders.clone();
@@ -1665,7 +1676,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
     if screen == "stats" {
         w.set_page(Page::Stats);
     }
-    if screen == "lyrics" {
+    if screen.starts_with("lyrics") {
         use tonearm_core::library::lyrics::{LyricLine, Lyrics, fill_timings};
         let lines = [
             "Город спит, и только мы",
@@ -1687,10 +1698,19 @@ fn preview(w: &AppWindow, senders: &Senders) {
                 words: Vec::new(),
             })
             .collect();
-        fill_timings(&mut lines, 240_000);
+        // `lyrics-plain`: the same text without times.
+        let synced = screen == "lyrics";
+        if synced {
+            w.set_lyrics_mode(1);
+            fill_timings(&mut lines, 240_000, true);
+        } else {
+            for l in &mut lines {
+                l.start_ms = None;
+            }
+        }
         let lyrics = Lyrics {
             lines,
-            synced: true,
+            synced,
             provider: "LRCLIB".into(),
             ..Lyrics::default()
         };

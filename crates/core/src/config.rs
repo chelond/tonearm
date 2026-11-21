@@ -78,6 +78,8 @@ pub struct UiSettings {
     /// Colour theme: a built-in id (`graphite`, `light`…) or `file:<name>.toml` from the
     /// themes folder. Unknown ids fall back to the default.
     pub theme: String,
+    /// Lyrics lit word by word (adds NetEase, an unofficial source) instead of line by line.
+    pub lyrics_words: bool,
 }
 
 impl Default for AudioSettings {
@@ -102,6 +104,7 @@ impl Default for UiSettings {
         Self {
             notifications: true,
             theme: "graphite".into(),
+            lyrics_words: false,
         }
     }
 }

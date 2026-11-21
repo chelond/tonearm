@@ -897,6 +897,7 @@ export component AppWindow inherits Window {
     in property <bool> lyrics-word-synced;            // the source timed each word
     in property <int> lyrics-line: -1;                // synced: the line and word being sung
     in property <int> lyrics-word: -1;
+    in-out property <int> lyrics-mode: 0;             // 0 by line (official sources), 1 by word
     in property <string> lyrics-status;               // "" shown, else "Загружаем…" / "Текста нет"
     in property <string> lyrics-provider;
     // quick jump (Ctrl+K)
@@ -989,6 +990,7 @@ export component AppWindow inherits Window {
     callback row-action(int /* source */, int /* index */, int /* action */);
     callback radio-current();
     callback lyrics-opened();
+    callback lyrics-mode-changed();
     callback palette-opened();
     callback palette-edited(string);
     callback palette-activate(int);
@@ -2310,6 +2312,12 @@ export component AppWindow inherits Window {
                                     Text { text: root.track-title; font-size: 16px; font-weight: 600; color: #FFFFFF; overflow: elide; }
                                     Text { text: root.track-artists; font-size: 13px; color: #FFFFFFB0; overflow: elide; }
                                 }
+                                Segmented {
+                                    y: (parent.height - self.height) / 2;
+                                    items: ["Строки", "Слова"];
+                                    current <=> root.lyrics-mode;
+                                    changed => { root.lyrics-mode-changed(); }
+                                }
                                 IconButton { icon: "close"; clicked => { root.lyrics-open = false; } }
                             }
                             if root.lyrics-status != "": Text {
@@ -2332,16 +2340,18 @@ export component AppWindow inherits Window {
                                     if root.duration-ms > 0 { root.seek(ms / root.duration-ms); }
                                 }
                             }
-                            if root.lyrics-status == "" && !root.lyrics-synced: ScrollView {
+                            // plain text: scrolled by hand; each line takes the height its wrapping needs
+                            if root.lyrics-status == "" && !root.lyrics-synced: plain := Flickable {
                                 vertical-stretch: 1;
-                                VerticalLayout {
+                                content-height: plain-col.preferred-height;
+                                plain-col := VerticalLayout {
+                                    width: plain.width;
                                     padding-top: 40px;
                                     padding-bottom: 40px;
                                     alignment: start;
                                     spacing: 10px;
                                     for l in root.lyrics: Text {
-                                        min-height: 16px;
-                                        text: l.text;
+                                        text: l.text != "" ? l.text : " ";
                                         font-family: Fonts.display;
                                         font-weight: 700;
                                         font-size: 24px;
@@ -2351,8 +2361,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.lyrics-provider != "": Caption {
-                                text: "Текст: " + root.lyrics-provider
-                                    + (!root.lyrics-synced ? " · без синхронизации" : root.lyrics-word-synced ? " · по словам" : "");
+                                text: "Текст: " + root.lyrics-provider;
                                 color: #FFFFFF70;
                             }
                         }

@@ -56,6 +56,8 @@ pub enum LibraryCommand {
         title: String,
         artist: String,
         duration_ms: u32,
+        /// Word-by-word mode (adds the unofficial NetEase source).
+        words: bool,
     },
 }
 
@@ -348,8 +350,10 @@ impl Service {
                     title,
                     artist,
                     duration_ms,
+                    words,
                 } => LibraryEvent::Lyrics {
-                    lyrics: lyrics::lyrics(&session, &uri, &title, &artist, duration_ms).await,
+                    lyrics: lyrics::lyrics(&session, &uri, &title, &artist, duration_ms, words)
+                        .await,
                     uri,
                 },
                 _ => return None,

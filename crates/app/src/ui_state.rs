@@ -885,7 +885,20 @@ impl UiState {
                         };
                         w.set_lyrics_synced(l.synced);
                         w.set_lyrics_word_synced(l.word_synced);
-                        w.set_lyrics_provider(l.provider.into());
+                        let timed_words = l
+                            .lines
+                            .iter()
+                            .any(|x| x.words.iter().any(|wd| wd.text != "•"));
+                        let how = if !l.synced {
+                            " · без синхронизации"
+                        } else if l.word_synced {
+                            " · по словам"
+                        } else if timed_words {
+                            " · слова по темпу песни"
+                        } else {
+                            ""
+                        };
+                        w.set_lyrics_provider(format!("{}{how}", l.provider).into());
                         w.set_lyrics_status("".into());
                     }
                     None => {
@@ -1575,7 +1588,19 @@ impl UiState {
             title: self.playing.title.clone(),
             artist: self.playing.artists.clone(),
             duration_ms: self.playing.duration_ms,
+            words: w.get_lyrics_mode() == 1,
         })]
+    }
+
+    /// "Строки" / "Слова" switched: the lyrics are fetched again for the new mode.
+    pub fn lyrics_mode_changed(&mut self, w: &AppWindow) -> Vec<Effect> {
+        self.lyrics_uri.clear();
+        self.lyrics_asked.clear();
+        self.lyrics.clear();
+        w.set_lyrics(ModelRc::default());
+        w.set_lyrics_line(-1);
+        w.set_lyrics_word(-1);
+        self.lyrics_opened(w)
     }
 
     /// Snapshot for "continue where you left off"; written off the UI thread.
