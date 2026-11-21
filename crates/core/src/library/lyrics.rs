@@ -2,9 +2,8 @@
 //! public lyrics database, asked at the same time. The best of the two wins: timed by word, then
 //! timed by line, then plain text.
 //!
-//! Every synced line gets word timings. Real ones come from LRCLIB's enhanced LRC
-//! (`<mm:ss.xx>` before each word); the rest are spread over the line by length, so the karaoke
-//! fill works for every synced track. [`Lyrics::word_synced`] says which of the two it is.
+//! Word timings come only from the source (LRCLIB's enhanced LRC, `<mm:ss.xx>` before each
+//! word); they are never guessed. Without them a synced line is lit as a whole.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -82,7 +81,7 @@ pub async fn lyrics(
         "lyrics sources"
     );
     let mut best = pick(spotify, lrclib)?;
-    estimate_words(&mut best.lines, duration_ms);
+    fill_timings(&mut best.lines, duration_ms);
     if let Ok(mut c) = CACHE.lock() {
         if c.len() >= CACHE_LEN {
             c.pop_front();
@@ -461,10 +460,10 @@ fn lrc_time(s: &str) -> Option<u32> {
     Some(m * 60_000 + ms)
 }
 
-/// Gives every synced line word timings: closes open-ended real ones and spreads the line's
-/// time over its words by length for the rest. Breaks between verses (empty lines) become
-/// "• • •", the dots lighting up one by one over the break.
-pub fn estimate_words(lines: &mut [LyricLine], duration_ms: u32) {
+/// Closes open-ended word stamps (the last word of a line) and turns breaks between verses
+/// (empty lines of 3 s or more) into "• • •", the dots lighting up one by one. Lines without
+/// word stamps stay without: they are lit whole.
+pub fn fill_timings(lines: &mut [LyricLine], duration_ms: u32) {
     let starts: Vec<Option<u32>> = lines.iter().map(|l| l.start_ms).collect();
     for (i, line) in lines.iter_mut().enumerate() {
         let Some(start) = line.start_ms else { continue };
@@ -501,26 +500,8 @@ pub fn estimate_words(lines: &mut [LyricLine], duration_ms: u32) {
             }
             continue;
         }
-        let pieces: Vec<&str> = line.text.split_whitespace().collect();
-        let weights: Vec<u32> = pieces
-            .iter()
-            .map(|p| u32::try_from(p.chars().count()).unwrap_or(1) + 1)
-            .collect();
-        let total: u32 = weights.iter().sum::<u32>().max(1);
-        // Singing runs at about 14 characters a second; a held last note stretches the line,
-        // a long instrumental after it does not.
-        let sung = gap.min(700 + total * 75).max(400);
-        let mut at = 0u32;
-        for (p, w) in pieces.iter().zip(&weights) {
-            let s = start + sung * at / total;
-            at += w;
-            let e = start + sung * at / total;
-            line.words.push(LyricWord {
-                start_ms: s,
-                end_ms: e.max(s + 1),
-                text: (*p).to_owned(),
-            });
-        }
+        // No word stamps: the line is lit as a whole. Guessed word times ran ahead of or
+        // behind the voice, so they are not made up.
     }
 }
 
@@ -573,7 +554,7 @@ mod tests {
             ]
         );
         let mut l = l;
-        estimate_words(&mut l, 10_000);
+        fill_timings(&mut l, 10_000);
         assert_eq!(l[1].words[0].end_ms, 5500, "open last word is capped");
         assert!(
             parse_lrclib(&serde_json::json!({"syncedLyrics": "[00:01.00]<00:01.00>a"}))
@@ -583,21 +564,14 @@ mod tests {
     }
 
     #[test]
-    fn estimated_words_cover_the_sung_part() {
+    fn lines_without_stamps_get_no_words() {
         let mut l = parse_lrc("[00:10.00]one two three\n[00:30.00]\n[00:40.00]end");
-        estimate_words(&mut l, 45_000);
-        let w = &l[0].words;
-        assert_eq!(w.len(), 3);
-        assert_eq!(w[0].start_ms, 10_000);
-        assert!(
-            w[2].end_ms <= 10_000 + 700 + 16 * 75,
-            "not stretched over the break"
-        );
-        assert!(w.windows(2).all(|p| p[0].end_ms <= p[1].start_ms));
+        fill_timings(&mut l, 45_000);
+        assert!(l[0].words.is_empty(), "word times are not guessed");
         assert_eq!(l[1].words.len(), 3);
         assert_eq!(l[1].words[0].text, "•");
         assert_eq!(l[1].words[2].end_ms, 39_700);
-        assert!(l[2].words[0].end_ms <= 45_000);
+        assert!(l[2].words.is_empty());
     }
 
     #[test]

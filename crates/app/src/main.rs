@@ -1666,7 +1666,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
         w.set_page(Page::Stats);
     }
     if screen == "lyrics" {
-        use tonearm_core::library::lyrics::{LyricLine, Lyrics, estimate_words};
+        use tonearm_core::library::lyrics::{LyricLine, Lyrics, fill_timings};
         let lines = [
             "Город спит, и только мы",
             "Едем вдоль реки",
@@ -1687,7 +1687,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
                 words: Vec::new(),
             })
             .collect();
-        estimate_words(&mut lines, 240_000);
+        fill_timings(&mut lines, 240_000);
         let lyrics = Lyrics {
             lines,
             synced: true,
