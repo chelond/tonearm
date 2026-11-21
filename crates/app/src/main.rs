@@ -417,6 +417,19 @@ impl Senders {
     }
 
     fn load_cover(&self, url: String, size: u32, target: CoverTarget) {
+        // Sizes are in logical pixels: decode for the screen's density (sharp on HiDPI), up to
+        // 2× so a 4K screen does not cost four times the memory.
+        let scale = self
+            .window
+            .upgrade()
+            .map_or(1.0, |w| w.window().scale_factor())
+            .clamp(1.0, 2.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let size = ((size as f32) * scale).round() as u32;
         let senders = self.clone();
         let covers = Arc::clone(&self.covers);
         let weak = self.window.clone();
