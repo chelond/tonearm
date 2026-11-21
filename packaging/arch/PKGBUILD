@@ -1,7 +1,7 @@
 # Maintainer: chelond
 # Build from a local checkout: cd packaging/arch && makepkg -si
 pkgname=tonearm
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Lightweight native music streaming client (unofficial, requires Premium)"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommo
 optdepends=('gnome-keyring: keep the login in Secret Service instead of the encrypted file'
             'playerctl: control playback from the command line over MPRIS')
 makedepends=('cargo')
-options=('!lto')
+options=('!lto' '!debug')
 source=()
 
 _srcroot() { realpath "$startdir/../.."; }
