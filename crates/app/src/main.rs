@@ -417,6 +417,7 @@ impl Senders {
     }
 
     fn load_cover(&self, url: String, size: u32, target: CoverTarget) {
+        let senders = self.clone();
         let covers = Arc::clone(&self.covers);
         let weak = self.window.clone();
         #[cfg(debug_assertions)]
@@ -438,7 +439,19 @@ impl Senders {
                         }
                     });
                 }
-                Err(e) => tracing::info!(%e, "cover not loaded"),
+                Err(e) => {
+                    tracing::info!(%e, %url, "cover not loaded");
+                    // The player's cover for the playing track failed: try the album's.
+                    if let CoverTarget::Deck(uri) = target {
+                        let s = senders;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                let fx = ui_state::with(|st| st.deck_cover_failed(&w, &uri, &url));
+                                s.run(fx);
+                            }
+                        });
+                    }
+                }
             }
         });
     }
@@ -896,6 +909,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     window.on_theme_open_folder(open_themes_folder);
+    let s = senders.clone();
+    window.on_open_playing(move |artist| {
+        if let Some(w) = s.window.upgrade() {
+            let fx = ui_state::with(|st| st.open_playing(&w, artist));
+            s.run(fx);
+        }
+    });
     let s = senders.clone();
     window.on_clear_cache(move || {
         let covers = Arc::clone(&s.covers);
