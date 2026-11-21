@@ -603,6 +603,10 @@ impl Service {
         self.solo.seek_after_load = (position_ms > 0).then_some(position_ms);
         self.solo.anchor = None;
         self.solo_send(json!({"command": "play", "uri": item.uri}));
+        // The queue is ours: Soloist must not loop the one track it was given. With repeat off it
+        // goes idle at the end, which advances the queue (the end-of-track check is the fallback).
+        self.solo_send(json!({"command": "set_repeat_track", "enabled": false}));
+        self.solo_send(json!({"command": "set_repeat_context", "enabled": false}));
         self.set_state(PlaybackState::Loading, position_ms).await;
     }
 
