@@ -1,0 +1,20 @@
+name = "Светлая"
+base = "light"
+accent_from_cover = true
+
+[colors]
+bg = "#F6F6F8"
+sidebar = "#EDEDF1"
+surface = "#FFFFFF"
+surface-2 = "#FFFFFF"
+hover = "#0000000A"
+pressed = "#00000014"
+selected = "#0000000F"
+line = "#00000012"
+line-2 = "#00000024"
+text-1 = "#16161B"
+text-2 = "#55555F"
+text-3 = "#8A8A94"
+danger = "#E5484D"
+accent = "#E8552B"
+on-accent = "#FFFFFF"

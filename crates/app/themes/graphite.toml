@@ -1,0 +1,24 @@
+# Tonearm theme. Copy this file into the themes folder (Settings → Appearance → "Папка тем"),
+# change the colours and pick it in Settings. Colours are "#RRGGBB" or "#RRGGBBAA".
+# Anything left out is taken from the base theme ("dark" or "light").
+name = "Графит"
+base = "dark"
+# true: the accent follows the playing cover; false: always `accent` below.
+accent_from_cover = true
+
+[colors]
+bg = "#0E0E11"         # window background
+sidebar = "#0A0A0D"    # left panel
+surface = "#16161B"    # cards, player bar
+surface-2 = "#1E1E24"  # menus, inputs, raised things
+hover = "#FFFFFF0D"    # under the mouse
+pressed = "#FFFFFF17"
+selected = "#FFFFFF14" # the open page in the sidebar
+line = "#FFFFFF12"     # thin separators
+line-2 = "#FFFFFF26"   # borders, empty progress bar
+text-1 = "#F4F4F6"     # titles
+text-2 = "#A6A6B0"     # normal text
+text-3 = "#6E6E78"     # hints
+danger = "#FF5A5F"
+accent = "#FF6A3D"
+on-accent = "#0E0E11"  # text on accent buttons

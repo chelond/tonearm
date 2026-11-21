@@ -60,6 +60,28 @@ librespot выдаёт многоразовые учётные данные, о�
 
 Хранится не пароль, а многоразовый токен этого устройства; отозвать его можно на сайте Spotify («Выйти везде»).
 
+### Свой Client ID для Web API (если «Spotify ограничил запросы»)
+
+Плейлисты, медиатека и поиск идут через Web API. По умолчанию токен для него берётся из сессии librespot,
+а она работает под общим Client ID официального клиента, которым пользуются все программы на librespot.
+Поэтому Spotify часто отвечает 429 («ограничил запросы»). Решение: зарегистрировать своё приложение.
+
+1. Откройте <https://developer.spotify.com/dashboard> → **Create app**.
+2. Redirect URI: `http://127.0.0.1:8898/login`, API: **Web API**. Сохраните и скопируйте **Client ID**
+   (Client Secret не нужен, вход по PKCE).
+3. В разделе **User Management** приложения добавьте email своего аккаунта Spotify (в Development Mode
+   приложение работает только для пользователей из этого списка).
+4. Впишите Client ID в `config.toml` (Windows: `%APPDATA%\tonearm\config\config.toml`,
+   Linux: `~/.config/tonearm/config.toml`):
+   ```toml
+   [spotify]
+   client_id = "ваш_client_id"
+   ```
+5. Перезапустите Tonearm. Один раз откроется браузер: разрешите доступ. Refresh-токен ляжет в keyring,
+   дальше без браузера. «Выйти» удаляет и его.
+
+Воспроизведение по-прежнему идёт через librespot, Client ID влияет только на Web API.
+
 ## Звук
 
 Вывод через ALSA (cpal/rodio из librespot). С PipeWire нужен `pipewire-alsa`, с PulseAudio — `pulseaudio-alsa`
@@ -67,6 +89,22 @@ librespot выдаёт многоразовые учётные данные, о�
 а после подключения наушников достаточно снова нажать «Играть». Качество потока: 320 кбит/с.
 
 Для проверки интерфейса без аккаунта (только debug-сборка): `TONEARM_UI_PREVIEW=<экран> cargo run`, где экран: `home`, `library`, `playlist`, `search`, `search-tracks`, `queue`, `menu`, `devices`, `settings`, `login`, `waiting`, `offline`.
+
+## Плеер Spotify Soloist
+
+Некоторым аккаунтам (чаще новым) Spotify не выдаёт ключи для встроенного плеера на librespot
+(librespot issue #1649), и треки не играют. Тогда включите **Настройки → Плеер → Soloist**.
+Soloist — официальный фоновый плеер Spotify; нужен Premium.
+
+1. Нажмите «Получить ключ»: откроется developer.spotify.com/dashboard/soloist. Нажмите там
+   «Copy» у своего ключа. Tonearm заберёт его из буфера обмена сам (или вставьте в поле и Enter).
+   Ключ хранится в системном хранилище паролей, в файлы не пишется.
+2. Tonearm скачивает Soloist с серверов Spotify (в архив Tonearm он не входит: распространять
+   его нельзя), запускает в фоне и входит в него вашим аккаунтом сам, через Spotify Connect.
+   Если автоматический вход не прошёл, один раз выберите устройство «Tonearm» в Spotify на телефоне.
+3. Сборки Soloist живут 90 дней; Tonearm сам скачивает новую, когда текущей больше 60 дней.
+
+Soloist закрывается вместе с Tonearm. Его журнал: `soloist/soloist.log` в папке данных Tonearm.
 
 ## Настройки
 
@@ -77,6 +115,14 @@ librespot выдаёт многоразовые учётные данные, о�
 `SLINT_BACKEND=winit-femtovg tonearm`.
 
 Логи: `RUST_LOG=debug tonearm`.
+
+## Темы оформления
+
+В Настройках → Оформление восемь готовых тем (тёмные и светлые). Свои темы это файлы `.toml` в папке тем
+(`~/.config/tonearm/themes`, `%APPDATA%\tonearm\config\themes`); кнопка «Создать из текущей» кладёт туда
+копию выбранной темы. В файле достаточно указать только те цвета, которые меняются, остальное берётся из
+`base = "dark"` или `"light"`. Сохранённые изменения видны в приложении сразу. Пример со всеми цветами:
+[crates/app/themes/graphite.toml](crates/app/themes/graphite.toml).
 
 ## Горячие клавиши
 

@@ -23,7 +23,9 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 pub enum ApiError {
     #[error("нет связи со Spotify: {0}")]
     Network(String),
-    #[error("Spotify ограничил запросы, попробуйте позже")]
+    #[error(
+        "Spotify ограничил запросы, попробуйте позже (поможет свой Client ID в config.toml, см. README)"
+    )]
     RateLimited,
     #[error("нет доступа ({0})")]
     Forbidden(u16),
@@ -243,7 +245,9 @@ fn convert_track(t: ApiTrack) -> Option<TrackItem> {
         return None;
     }
     let album = t.album.unwrap_or_default();
+    let image_url = pick_image(&album.images, 300);
     Some(TrackItem {
+        image_url,
         playable: !t.is_local
             && t.is_playable.unwrap_or(true)
             && t.uri.starts_with("spotify:track:"),

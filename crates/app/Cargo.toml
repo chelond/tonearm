@@ -20,14 +20,26 @@ tracing-subscriber.workspace = true
 slint.workspace = true
 souvlaki.workspace = true
 directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Theme files (already used by tonearm-core for config.toml).
+toml.workspace = true
+# Already in the tree (via librespot): local time for the greeting and date.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Already in the tree through Slint: reads the Soloist key the user copies on Spotify's page.
+arboard = { version = "3", default-features = false }
+open = "5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle.workspace = true
-# Same version already in the tree; only for the fatal-error message box.
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+# Same version already in the tree; the fatal-error message box and the dark title bar.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 slint-build.workspace = true

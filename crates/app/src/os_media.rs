@@ -53,6 +53,9 @@ pub fn init(
     if cfg!(windows) && hwnd.is_none() {
         return false;
     }
+    if let Some(h) = hwnd {
+        dark_title_bar(h);
+    }
     let config = PlatformConfig {
         display_name: "Tonearm",
         dbus_name: "tonearm",
@@ -138,6 +141,36 @@ fn window_handle(window: &AppWindow) -> Option<*mut std::ffi::c_void> {
         _ => None,
     }
 }
+
+/// Dark title bar in the app's background colour instead of Windows' white one.
+#[cfg(windows)]
+fn dark_title_bar(hwnd: *mut std::ffi::c_void) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    };
+    let dark: i32 = 1;
+    // COLORREF is 0x00BBGGRR: #0E0E11, the window background (Windows 11; ignored on 10).
+    let caption: u32 = 0x0011_0E0E;
+    // SAFETY: hwnd is this process's live window; the pointers outlive the calls.
+    #[allow(unsafe_code)]
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE.cast_unsigned(),
+            (&raw const dark).cast(),
+            4,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR.cast_unsigned(),
+            (&raw const caption).cast(),
+            4,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn dark_title_bar(_hwnd: *mut std::ffi::c_void) {}
 
 #[cfg(not(windows))]
 fn window_handle(_window: &AppWindow) -> Option<*mut std::ffi::c_void> {
