@@ -141,6 +141,8 @@ pub struct UiState {
     /// Album and first artist of the playing track (the player bar links to them).
     playing_album: Option<String>,
     playing_artist: Option<String>,
+    /// A click on the title (false) or artist (true) waits for the track's details.
+    open_when_known: Option<bool>,
     palette: Vec<PaletteAction>,
     /// Seconds since the resume state was last written.
     since_save: u32,
@@ -1277,8 +1279,7 @@ impl UiState {
         match target {
             Some(req) => self.open(w, req, true),
             None if self.playing_uri.starts_with("spotify:track:") => {
-                w.set_notice("Ещё загружаем данные трека, попробуйте через секунду".into());
-                w.set_notice_is_error(false);
+                self.open_when_known = Some(artist);
                 if self.meta_pending {
                     Vec::new()
                 } else {
@@ -1323,6 +1324,16 @@ impl UiState {
         if self.playing_artist.is_none() {
             self.playing_artist.clone_from(&item.artist_uri);
         }
+        if let Some(artist) = self.open_when_known.take() {
+            let known = if artist {
+                &self.playing_artist
+            } else {
+                &self.playing_album
+            };
+            if known.is_some() {
+                fx.extend(self.open_playing(w, artist));
+            }
+        }
         let t = &self.playing;
         w.set_track_title(t.title.clone().into());
         w.set_track_artists(t.artists.clone().into());
@@ -1366,6 +1377,7 @@ impl UiState {
         }
         let mut fx = self.finish_listen(w);
         self.deck_retried = false;
+        self.open_when_known = None;
         let mut track = track.clone();
         self.fill_known(&mut track);
         let track = &track;
