@@ -136,6 +136,11 @@ pub struct UiState {
     /// When the active theme file last changed (custom themes reload on edit).
     theme_mtime: Option<std::time::SystemTime>,
     theme_check: u32,
+    /// The playing track's cover already fell back to the metadata once.
+    deck_retried: bool,
+    /// Album and first artist of the playing track (the player bar links to them).
+    playing_album: Option<String>,
+    playing_artist: Option<String>,
     palette: Vec<PaletteAction>,
     /// Seconds since the resume state was last written.
     since_save: u32,
@@ -1242,6 +1247,65 @@ impl UiState {
     }
 
     /// Details of the playing track arrived from the metadata service.
+    /// Album and first artist of a track from the lists we showed or the history.
+    fn known_links(&self, uri: &str) -> (Option<String>, Option<String>) {
+        if let Some(t) = self
+            .tracks
+            .iter()
+            .chain(&self.search.results.tracks)
+            .find(|t| t.uri == uri)
+        {
+            return (t.album_uri.clone(), t.artist_uri.clone());
+        }
+        let artist = self
+            .store
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.uri == uri)
+            .and_then(|e| e.artist_uri.clone());
+        (None, artist)
+    }
+
+    /// A click on the title (album) or the artist in the player bar.
+    pub fn open_playing(&mut self, w: &AppWindow, artist: bool) -> Vec<Effect> {
+        let target = if artist {
+            self.playing_artist.clone().map(PageRequest::Artist)
+        } else {
+            self.playing_album.clone().map(PageRequest::Album)
+        };
+        match target {
+            Some(req) => self.open(w, req, true),
+            None if self.playing_uri.starts_with("spotify:track:") => {
+                w.set_notice("Ещё загружаем данные трека, попробуйте через секунду".into());
+                w.set_notice_is_error(false);
+                if self.meta_pending {
+                    Vec::new()
+                } else {
+                    self.meta_pending = true;
+                    vec![Effect::Library(LibraryCommand::TrackMeta(
+                        self.playing_uri.clone(),
+                    ))]
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The playing track's cover did not load: ask the metadata service for the album's, once.
+    pub fn deck_cover_failed(&mut self, _w: &AppWindow, uri: &str, url: &str) -> Vec<Effect> {
+        if uri != self.playing_uri || self.playing.cover_url.as_deref() != Some(url) {
+            return Vec::new();
+        }
+        self.playing.cover_url = None;
+        if self.deck_retried || self.meta_pending || !uri.starts_with("spotify:track:") {
+            return Vec::new();
+        }
+        self.deck_retried = true;
+        self.meta_pending = true;
+        vec![Effect::Library(LibraryCommand::TrackMeta(uri.to_owned()))]
+    }
+
     /// `still_pending`: a fuller report is expected (lyrics wait for it unless the track is
     /// complete now).
     fn on_track_meta(
@@ -1253,6 +1317,12 @@ impl UiState {
         let mut fx = Vec::new();
         let had_cover = self.playing.cover_url.is_some();
         merge_track(&mut self.playing, item);
+        if self.playing_album.is_none() {
+            self.playing_album.clone_from(&item.album_uri);
+        }
+        if self.playing_artist.is_none() {
+            self.playing_artist.clone_from(&item.artist_uri);
+        }
         let t = &self.playing;
         w.set_track_title(t.title.clone().into());
         w.set_track_artists(t.artists.clone().into());
@@ -1295,11 +1365,17 @@ impl UiState {
             return fx;
         }
         let mut fx = self.finish_listen(w);
+        self.deck_retried = false;
         let mut track = track.clone();
         self.fill_known(&mut track);
         let track = &track;
+        (self.playing_album, self.playing_artist) = self.known_links(&track.uri);
         self.meta_pending = track.uri.starts_with("spotify:track:")
-            && (track.duration_ms == 0 || track.artists.is_empty() || track.cover_url.is_none());
+            && (track.duration_ms == 0
+                || track.artists.is_empty()
+                || track.cover_url.is_none()
+                || self.playing_album.is_none()
+                || self.playing_artist.is_none());
         let previous = std::mem::replace(&mut self.playing_uri, track.uri.clone());
         self.playing = track.clone();
         self.listened_ms = 0;

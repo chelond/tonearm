@@ -846,6 +846,8 @@ export component AppWindow inherits Window {
     in property <string> theme-id;
     in property <string> theme-errors;
     callback theme-picked(string);
+    // Player bar: open the playing track's album (false) or artist (true).
+    callback open-playing(bool);
     callback theme-open-folder();
     callback theme-new();
     callback theme-reload();
@@ -1290,9 +1292,17 @@ export component AppWindow inherits Window {
                                                 font-weight: 700;
                                                 font-size: 34px;
                                                 color: #FFFFFF;
+                                                opacity: hero-title-t.has-hover ? 0.85 : 1;
                                                 overflow: elide;
+                                                hero-title-t := TouchArea { mouse-cursor: pointer; clicked => { root.open-playing(false); } }
                                             }
-                                            Text { text: root.track-artists; font-size: 15px; color: #FFFFFFC0; overflow: elide; }
+                                            Text {
+                                                text: root.track-artists;
+                                                font-size: 15px;
+                                                color: hero-artist-t.has-hover ? #FFFFFF : #FFFFFFC0;
+                                                overflow: elide;
+                                                hero-artist-t := TouchArea { mouse-cursor: pointer; clicked => { root.open-playing(true); } }
+                                            }
                                             HorizontalLayout {
                                                 spacing: 10px;
                                                 alignment: start;
@@ -2383,14 +2393,32 @@ export component AppWindow inherits Window {
                                 height: parent.height;
                                 alignment: center;
                                 spacing: 3px;
+                                // title → album, artist → artist page
                                 Text {
                                     text: root.track-title != "" ? root.track-title : "Ничего не играет";
                                     font-size: 14px;
                                     font-weight: 600;
-                                    color: root.track-title != "" ? Theme.text-1 : Theme.text-3;
+                                    color: root.track-title == "" ? Theme.text-3 : title-t.has-hover ? Theme.accent : Theme.text-1;
+                                    animate color { duration: Theme.fast; }
                                     overflow: elide;
+                                    title-t := TouchArea {
+                                        enabled: root.track-title != "";
+                                        mouse-cursor: pointer;
+                                        clicked => { root.open-playing(false); }
+                                    }
                                 }
-                                Text { text: root.track-artists; font-size: 12px; color: Theme.text-2; overflow: elide; }
+                                Text {
+                                    text: root.track-artists;
+                                    font-size: 12px;
+                                    color: artist-t.has-hover ? Theme.text-1 : Theme.text-2;
+                                    animate color { duration: Theme.fast; }
+                                    overflow: elide;
+                                    artist-t := TouchArea {
+                                        enabled: root.track-artists != "";
+                                        mouse-cursor: pointer;
+                                        clicked => { root.open-playing(true); }
+                                    }
+                                }
                                 if root.remote-name != "": HorizontalLayout {
                                     spacing: 6px;
                                     Icon { name: "devices"; size: 12px; ink: Theme.accent; }
