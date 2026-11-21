@@ -133,6 +133,8 @@ pub struct UiSettings {
     pub theme: String,
     /// Lyrics lit word by word (adds NetEase, an unofficial source) instead of line by line.
     pub lyrics_words: bool,
+    /// Album art behind the lyrics: 0 off, 1 subtle, 2 vivid.
+    pub lyrics_backdrop: u8,
     /// The sidebar's smart playlists are folded.
     pub smart_collapsed: bool,
 }
@@ -160,6 +162,7 @@ impl Default for UiSettings {
             notifications: true,
             theme: "graphite".into(),
             lyrics_words: false,
+            lyrics_backdrop: 1,
             smart_collapsed: false,
         }
     }

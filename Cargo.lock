@@ -6770,6 +6770,7 @@ dependencies = [
  "arboard",
  "chrono",
  "directories",
+ "image",
  "open",
  "raw-window-handle",
  "serde",

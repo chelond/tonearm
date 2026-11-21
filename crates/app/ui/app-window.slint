@@ -1049,6 +1049,7 @@ export component AppWindow inherits Window {
     in-out property <int> lyrics-mode: 0;             // 0 by line (official sources), 1 by word
     in property <string> lyrics-status;               // "" shown, else "Загружаем…" / "Текста нет"
     in property <string> lyrics-provider;
+    in-out property <int> set-lyrics-backdrop: 1;     // off | subtle | vivid
     // quick jump (Ctrl+K)
     in-out property <bool> palette-open;
     in-out property <string> palette-query;
@@ -2533,6 +2534,15 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     SettingsGroup {
+                                        title: "Текст песни";
+                                        SettingRow {
+                                            title: "Фон из обложки";
+                                            hint: "Размытая обложка за текстом; можно отключить или изменить яркость";
+                                            last: true;
+                                            Segmented { items: ["Выкл", "Мягкий", "Яркий"]; current <=> root.set-lyrics-backdrop; changed => { root.settings-changed(); } }
+                                        }
+                                    }
+                                    SettingsGroup {
                                         title: "Last.fm";
                                         SettingRow {
                                             title: root.lastfm-state == 3 ? "Вы вошли как " + root.lastfm-user : "Скробблинг в Last.fm";
@@ -2650,13 +2660,13 @@ export component AppWindow inherits Window {
                         opacity: self.shown ? 1 : 0;
                         animate opacity { duration: 260ms; }
                         background: Theme.bg;
-                        if root.track-has-image: Image {
+                        if root.track-has-image && root.set-lyrics-backdrop > 0: Image {
                             width: parent.width;
                             height: parent.height;
                             source: root.track-backdrop;
                             image-fit: cover;
                             image-rendering: smooth;
-                            opacity: 0.45;
+                            opacity: root.set-lyrics-backdrop == 2 ? 0.62 : 0.45;
                         }
                         Rectangle { background: @linear-gradient(180deg, #00000066 0%, #000000B0 100%); }
                         TouchArea { }
@@ -2692,7 +2702,7 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            // synced: follows the song, the current line in the upper third
+                            // synced: centers the active line and keeps nearby lines in view
                             if root.lyrics-status == "" && root.lyrics-synced: LyricsView {
                                 vertical-stretch: 1;
                                 lines: root.lyrics;

@@ -1,5 +1,4 @@
-// Synced lyrics: the song's lines follow the playback, the current one in the upper third, its
-// words lighting up as they are sung.
+// Synced lyrics: the current line stays centered, with two nearby lines on either side.
 import { Fonts } from "theme.slint";
 
 // start/end in ms of the song.
@@ -24,44 +23,50 @@ component Word inherits Rectangle {
         font-weight: 700;
         font-size: root.size;
         color: !root.active || root.lit ? #FFFFFF : #FFFFFF59;
-        animate color { duration: 150ms; easing: ease-out; }
+        animate font-size { duration: 480ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+        animate color { duration: 420ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     }
 }
 
 component Line inherits Rectangle {
     in property <LyricRow> line;
     in property <bool> active;
-    in property <bool> past;
+    in property <int> distance;
     // Index of the word being sung in this line, -1 before the first.
     in property <int> word;
     in property <length> size;
     callback clicked();
-    // Lines further from the current one fade out.
-    opacity: root.active ? 1 : root.past ? 0.38 : 0.5;
-    animate opacity { duration: 400ms; easing: ease-out; }
+    // Keep a clear five-line focus window; more distant lines recede into the background.
+    property <length> display-size: root.distance == 0 ? root.size
+        : root.distance == 1 ? root.size * 0.78
+        : root.distance == 2 ? root.size * 0.66
+        : root.size * 0.58;
+    opacity: root.distance == 0 ? 1 : root.distance == 1 ? 0.68 : root.distance == 2 ? 0.38 : 0.10;
+    animate opacity { duration: 520ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     min-height: root.line.words.length == 0 && root.line.text == "" ? 8px : 0px;
     VerticalLayout {
         padding-top: 6px;
         padding-bottom: 6px;
-        // The current line steps in a little (no animation: it would lay the line out each frame).
-        padding-left: root.active ? 10px : 0px;
+        // Keep text geometry stable while focus moves; only colour and opacity ease between lines.
+        padding-left: 0px;
         if root.line.words.length > 0: FlexboxLayout {
-            spacing-horizontal: root.size * 0.28;
+            spacing-horizontal: root.display-size * 0.22;
             spacing-vertical: 2px;
             for w[k] in root.line.words: Word {
                 text: w.text;
                 active: root.active;
                 lit: k <= root.word;
-                size: root.size;
+                size: root.display-size;
             }
         }
         if root.line.words.length == 0 && root.line.text != "": Text {
             text: root.line.text;
             font-family: Fonts.display;
             font-weight: 700;
-            font-size: root.size;
+            font-size: root.display-size;
             color: #FFFFFF;
             wrap: word-wrap;
+            animate font-size { duration: 480ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         }
     }
     TouchArea {
@@ -76,15 +81,15 @@ export component LyricsView inherits Rectangle {
     // runs on a frame clock, so the screen stays still between words.
     in property <int> current-line: -1;
     in property <int> current-word: -1;
-    in property <length> size: 30px;
+    in property <length> size: 48px;
     callback seek-to(int);
 
     property <length> focus-y: 0;
     lyr := Flickable {
         interactive: false;
         content-height: col.preferred-height + root.height;
-        content-y: min(0px, -(root.focus-y - root.height * 0.36));
-        animate content-y { duration: 550ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+        content-y: min(0px, -(root.focus-y - root.height * 0.50));
+        animate content-y { duration: 900ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         col := VerticalLayout {
             width: lyr.width;
             padding-top: 24px;
@@ -93,16 +98,13 @@ export component LyricsView inherits Rectangle {
                 property <bool> current: i == root.current-line;
                 line: l;
                 active: self.current;
-                past: i < root.current-line;
+                distance: abs(i - root.current-line);
                 word: self.current ? root.current-word : -1;
                 size: root.size;
                 init => {
                     if self.current { root.focus-y = self.y + self.height / 2; }
                 }
                 changed current => {
-                    if self.current { root.focus-y = self.y + self.height / 2; }
-                }
-                changed y => {
                     if self.current { root.focus-y = self.y + self.height / 2; }
                 }
                 clicked => { root.seek-to(l.start); }
