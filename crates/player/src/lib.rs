@@ -21,6 +21,8 @@ pub enum PlayerCommand {
         start: usize,
         name: String,
         shuffle: Option<bool>,
+        /// Where to start the first track (resume), without playing its beginning first.
+        position_ms: u32,
     },
     Next,
     /// Restarts the track if it has played for more than 3 s, otherwise goes back.

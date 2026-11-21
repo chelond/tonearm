@@ -39,11 +39,12 @@ export global Fmt {
 component PageIn inherits Rectangle {
     property <bool> shown: false;
     init => { self.shown = true; }
-    opacity: self.shown ? 1 : 0;
-    animate opacity { duration: 260ms; easing: ease-out; }
+    // Starts mostly visible and settles quickly: a click shows the page at once.
+    opacity: self.shown ? 1 : 0.4;
+    animate opacity { duration: 140ms; easing: ease-out; }
     Rectangle {
-        y: root.shown ? 0px : 14px;
-        animate y { duration: 320ms; easing: ease-out; }
+        y: root.shown ? 0px : 8px;
+        animate y { duration: 180ms; easing: ease-out; }
         width: root.width;
         height: root.height;
         @children
@@ -78,7 +79,7 @@ component NavItem inherits Rectangle {
     callback clicked();
     height: 40px;
     border-radius: 8px;
-    background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    background: root.active ? Theme.selected : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.fast; }
     // accent mark that grows on the open page
     Rectangle {
@@ -111,7 +112,13 @@ component NavItem inherits Rectangle {
             horizontal-stretch: 1;
         }
     }
-    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        // Navigation acts on press, not on release: one frame sooner and it feels instant.
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Sidebar playlist with a small cover.
@@ -126,7 +133,7 @@ component SidebarRow inherits Rectangle {
     callback clicked();
     height: 52px;
     border-radius: 8px;
-    background: root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+    background: root.active ? Theme.selected : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.fast; }
     HorizontalLayout {
         padding-left: 8px;
@@ -164,7 +171,13 @@ component SidebarRow inherits Rectangle {
             Icon { name: "volume"; size: 14px; ink: Theme.accent; }
         }
     }
-    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        // Navigation acts on press, not on release: one frame sooner and it feels instant.
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Card with a cover; hover lifts it and shows a play button.
@@ -178,14 +191,14 @@ component TileView inherits Rectangle {
     property <bool> appeared: false;
     init => { self.appeared = true; }
     opacity: self.appeared ? 1 : 0;
-    animate opacity { duration: 380ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
+    animate opacity { duration: 220ms; delay: min(root.index, 10) * 18ms; easing: ease-out; }
     border-radius: Layout.radius;
-    background: touch.has-hover ? Theme.surface-2 : Theme.surface;
-    animate background { duration: Theme.normal; }
+    background: touch.pressed ? Theme.line-2 : touch.has-hover ? Theme.surface-2 : Theme.surface;
+    animate background { duration: Theme.fast; }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
     VerticalLayout {
         y: root.appeared ? 0px : 18px;
-        animate y { duration: 460ms; delay: min(root.index, 14) * 40ms; easing: ease-out; }
+        animate y { duration: 260ms; delay: min(root.index, 10) * 18ms; easing: ease-out; }
         padding: 12px;
         spacing: 10px;
         Rectangle {
@@ -257,12 +270,12 @@ component QuickCard inherits Rectangle {
     property <bool> appeared: false;
     init => { self.appeared = true; }
     opacity: self.appeared ? 1 : 0;
-    animate opacity { duration: 320ms; delay: min(root.index, 8) * 45ms; easing: ease-out; }
+    animate opacity { duration: 200ms; delay: min(root.index, 8) * 18ms; easing: ease-out; }
     height: 60px;
     border-radius: 8px;
     clip: true;
-    background: touch.has-hover ? Theme.line-2 : Theme.hover;
-    animate background { duration: Theme.normal; }
+    background: touch.pressed ? Theme.line-2.darker(0.15) : touch.has-hover ? Theme.line-2 : Theme.hover;
+    animate background { duration: Theme.fast; }
     touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
     HorizontalLayout {
         spacing: 14px;
@@ -299,7 +312,7 @@ component Chip inherits Rectangle {
     height: 32px;
     width: tx.preferred-width + 28px;
     border-radius: 16px;
-    background: root.active ? Theme.text-1 : t.has-hover ? Theme.line-2 : Theme.hover;
+    background: root.active ? Theme.text-1 : t.pressed ? Theme.pressed : t.has-hover ? Theme.line-2 : Theme.hover;
     animate background { duration: Theme.fast; }
     tx := Text {
         text: root.text;
@@ -307,7 +320,12 @@ component Chip inherits Rectangle {
         font-weight: root.active ? 600 : 400;
         color: root.active ? Theme.bg : Theme.text-1;
     }
-    t := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    t := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.clicked(); }
+        }
+    }
 }
 
 // Text field with an icon and a clear button.
@@ -318,6 +336,10 @@ component SearchField inherits Rectangle {
     callback edited(string);
     callback accepted(string);
     callback escape();
+    /// Esc in an empty field: give the keyboard back to the shortcuts.
+    callback leave();
+    in property <int> focus-request;
+    changed focus-request => { input.focus(); input.select-all(); }
     public function focus-input() { input.focus(); }
     height: 40px;
     border-radius: self.height / 2;
@@ -337,7 +359,12 @@ component SearchField inherits Rectangle {
             horizontal-stretch: 1;
             FocusScope {
                 key-pressed(e) => {
-                    if e.text == Key.Escape { root.escape(); return accept; }
+                    if e.text == Key.Escape {
+                        if root.text == "" { root.leave(); } else { root.escape(); }
+                        return accept;
+                    }
+                    // Down: leave the field so Space, arrows and Q work on the results.
+                    if e.text == Key.DownArrow { root.leave(); return accept; }
                     reject
                 }
                 input := TextInput {
@@ -882,7 +909,7 @@ export component AppWindow inherits Window {
     in property <image> track-backdrop;               // tiny copy of the cover; scaled up it is a blur
     in property <int> position-ms;
     in property <int> duration-ms;
-    in-out property <int> volume-level: 8;
+    in-out property <int> volume-level: 70;
     in property <bool> resume-pending;                // last session's track, not loaded yet
     // queue
     in-out property <bool> queue-open;
@@ -949,6 +976,8 @@ export component AppWindow inherits Window {
     property <int> drag-index: -1;
     property <length> drag-dy;
     property <bool> playing-now: root.play-view == PlayView.playing;
+    // Bumped to put the keyboard into the search field.
+    property <int> search-focus;
     in-out property <length> coll-scroll;             // collection list scroll (header collapses)
     // Kept as state, not a binding on coll-scroll: the header height changes the list's height,
     // which clamps the scroll, which would change the header again (a binding loop on short
@@ -1124,7 +1153,8 @@ export component AppWindow inherits Window {
         if self.page == Page.stats { root.stats-opened(); }
         self.lyrics-open = false;
     }
-    changed active-uri => { self.coll-scroll = 0; self.coll-compact = false; }
+    // The scroll position is set from Rust: 0 for a new page, where it was for one seen before.
+    changed active-uri => { self.coll-compact = self.coll-scroll < -24px; }
     changed coll-scroll => {
         if self.coll-scroll < -24px { self.coll-compact = true; }
         else if self.coll-scroll >= 0 { self.coll-compact = false; }
@@ -1153,6 +1183,7 @@ export component AppWindow inherits Window {
             }
             if e.text == "/" || (e.modifiers.control && (e.text == "f" || e.text == "а")) {
                 root.page = Page.search;
+                root.search-focus += 1;
                 return accept;
             }
             if e.text == Key.RightArrow {
@@ -1164,7 +1195,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if e.text == Key.UpArrow || e.text == Key.DownArrow {
-                root.volume-level = max(0, min(12, root.volume-level + (e.text == Key.UpArrow ? 1 : -1)));
+                root.volume-level = max(0, min(100, root.volume-level + (e.text == Key.UpArrow ? 5 : -5)));
                 root.volume-changed(root.volume-level);
                 return accept;
             }
@@ -1470,7 +1501,9 @@ export component AppWindow inherits Window {
                                     init => { self.focus-input(); }
                                     edited(t) => { root.search-edited(t); }
                                     accepted(t) => { root.search-accepted(t); }
+                                    focus-request: root.search-focus;
                                     escape => { root.search-query = ""; root.search-edited(""); }
+                                    leave => { keys.focus(); }
                                 }
                                 if root.search-hint != "": Text {
                                     text: root.search-hint;
@@ -1818,6 +1851,7 @@ export component AppWindow inherits Window {
                                     placeholder: "Фильтр";
                                     edited(t) => { root.page-filter-edited(t); }
                                     escape => { root.page-filter = ""; root.page-filter-edited(""); }
+                                    leave => { keys.focus(); }
                                 }
                                 if root.page-kind != 3: Rectangle {
                                     width: sort-row.preferred-width + 24px;
@@ -2636,7 +2670,7 @@ export component AppWindow inherits Window {
                         IconButton {
                             y: (parent.height - self.height) / 2;
                             icon: root.volume-level == 0 ? "mute" : "volume";
-                            property <int> before-mute: 8;
+                            property <int> before-mute: 70;
                             clicked => {
                                 if root.volume-level > 0 { self.before-mute = root.volume-level; root.volume-level = 0; } else { root.volume-level = self.before-mute; }
                                 root.volume-changed(root.volume-level);
@@ -2645,12 +2679,18 @@ export component AppWindow inherits Window {
                         Slider {
                             width: 110px;
                             y: (parent.height - self.height) / 2;
-                            value: root.volume-level / 12;
+                            value: root.volume-level / 100;
                             committed(v) => {
-                                root.volume-level = round(v * 12);
+                                root.volume-level = round(v * 100);
                                 root.volume-changed(root.volume-level);
                             }
-                            moving(v) => { root.volume-level = round(v * 12); }
+                            // Live while dragging, so the change is heard at once.
+                            moving(v) => {
+                                if round(v * 100) != root.volume-level {
+                                    root.volume-level = round(v * 100);
+                                    root.volume-changed(root.volume-level);
+                                }
+                            }
                         }
                     }
                 }

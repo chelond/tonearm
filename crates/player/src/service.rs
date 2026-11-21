@@ -113,12 +113,20 @@ struct Solo {
     shown: Option<TrackInfo>,
     /// Position anchor for the 500 ms ticks (Soloist reports only changes).
     anchor: Option<(u32, Instant)>,
+    /// Play/pause already shown on click; reports of the old state are stale for a moment.
+    expect: Option<(PlaybackState, Instant)>,
+    /// A seek already shown on click; positions from before it are stale for a moment.
+    seek_sent: Option<(u32, Instant)>,
+    /// Volume set here; Soloist's echoes of older values are ignored for a moment.
+    volume_sent: Option<Instant>,
 }
 
 /// After this long a missing confirmation of `play` no longer holds events back.
 const AWAIT_LIMIT: Duration = Duration::from_secs(8);
 /// The next track is started this long before Soloist's end, before it can loop the track.
 const SOLO_END_EARLY_MS: u32 = 250;
+/// How long a click's result stays on screen while Soloist still reports the old state.
+const OPTIMISTIC_HOLD: Duration = Duration::from_millis(2000);
 
 /// Runs until the command channel closes. Sessions come from the core via `sessions`.
 pub async fn run(
@@ -297,6 +305,7 @@ impl Service {
                 start,
                 name,
                 shuffle,
+                position_ms,
             } => {
                 if let Some(on) = shuffle {
                     self.queue.set_shuffle(false);
@@ -306,7 +315,7 @@ impl Service {
                     self.queue.set_context(items, start, name);
                 }
                 if let Some(item) = self.queue.current().cloned() {
-                    self.play_item(&item).await;
+                    self.play_item_at(&item, position_ms).await;
                 }
                 self.emit_queue().await;
             }
@@ -319,15 +328,13 @@ impl Service {
             }
             PlayerCommand::Prev => {
                 if self.position_ms > RESTART_THRESHOLD_MS && self.solo.handle.is_some() {
-                    self.solo_send(json!({"command": "seek", "position_ms": 0}));
-                    self.position_ms = 0;
-                    if self.state == PlaybackState::Playing {
-                        self.solo.anchor = Some((0, Instant::now()));
-                    }
+                    self.solo_seek(0).await;
                 } else if self.position_ms > RESTART_THRESHOLD_MS
                     && let Some(p) = &self.player
                 {
                     p.seek(0);
+                    let state = self.state;
+                    self.set_state(state, 0).await;
                 } else if let Some(item) = self.queue.prev() {
                     self.play_item(&item).await;
                     self.emit_queue().await;
@@ -351,7 +358,7 @@ impl Service {
             }
             PlayerCommand::Pause if self.solo.handle.is_some() => {
                 if self.state == PlaybackState::Playing {
-                    self.solo_send(json!({"command": "pause"}));
+                    self.solo_pause().await;
                 }
             }
             PlayerCommand::Pause => {
@@ -393,9 +400,13 @@ impl Service {
                 self.emit_queue().await;
             }
             PlayerCommand::TogglePlay if self.solo.handle.is_some() => match self.state {
-                PlaybackState::Playing => self.solo_send(json!({"command": "pause"})),
+                PlaybackState::Playing => self.solo_pause().await,
                 PlaybackState::Paused if self.solo.playing_uri.is_some() => {
                     self.solo_send(json!({"command": "play"}));
+                    self.solo.expect = Some((PlaybackState::Playing, Instant::now()));
+                    self.solo.anchor = Some((self.position_ms, Instant::now()));
+                    let pos = self.position_ms;
+                    self.set_state(PlaybackState::Playing, pos).await;
                 }
                 _ => {
                     if let Some(item) = self.queue.current().cloned() {
@@ -413,11 +424,7 @@ impl Service {
                 }
             },
             PlayerCommand::Seek { position_ms } if self.solo.handle.is_some() => {
-                self.solo_send(json!({"command": "seek", "position_ms": position_ms}));
-                self.position_ms = position_ms;
-                if self.state == PlaybackState::Playing {
-                    self.solo.anchor = Some((position_ms, Instant::now()));
-                }
+                self.solo_seek(position_ms).await;
             }
             PlayerCommand::Seek { position_ms } => {
                 if let Some(p) = &self.player {
@@ -455,6 +462,26 @@ impl Service {
         self.play_item_at(item, 0).await;
     }
 
+    /// Puts the picked track into the player bar right away, from what the list already knows;
+    /// the engine's own report of it fills in the rest later.
+    async fn show_picked(&mut self, item: &QueueItem) {
+        if item.title.is_empty() {
+            return;
+        }
+        let track = TrackInfo {
+            uri: item.uri.clone(),
+            title: item.title.clone(),
+            artists: item.artists.clone(),
+            album: String::new(),
+            duration_ms: item.duration_ms,
+            cover_url: item.cover_url.clone(),
+        };
+        if self.solo.handle.is_some() {
+            self.solo.shown = Some(track.clone());
+        }
+        self.emit(PlayerEvent::Track(track)).await;
+    }
+
     async fn play_item_at(&mut self, item: &QueueItem, position_ms: u32) {
         if self.solo.handle.is_some() {
             return self.solo_play(item, position_ms).await;
@@ -471,6 +498,7 @@ impl Service {
         };
         self.current_uri = Some(item.uri.clone());
         player.load(uri, true, position_ms);
+        self.show_picked(item).await;
         self.set_state(PlaybackState::Loading, position_ms).await;
     }
 
@@ -490,6 +518,7 @@ impl Service {
         self.volume = percent.min(100);
         if self.solo.handle.is_some() {
             self.solo_send(json!({"command": "set_volume", "volume": self.volume}));
+            self.solo.volume_sent = Some(Instant::now());
         }
         let volume = percent_to_volume(percent);
         self.mixer.set_volume(volume);
@@ -616,13 +645,79 @@ impl Service {
         // goes idle at the end, which advances the queue (the end-of-track check is the fallback).
         self.solo_send(json!({"command": "set_repeat_track", "enabled": false}));
         self.solo_send(json!({"command": "set_repeat_context", "enabled": false}));
+        self.solo.expect = None;
+        self.solo.seek_sent = None;
+        self.show_picked(item).await;
         self.set_state(PlaybackState::Loading, position_ms).await;
     }
 
+    /// Pause, shown at once: the position stops where it is now.
+    async fn solo_pause(&mut self) {
+        self.solo_send(json!({"command": "pause"}));
+        let pos = self.solo_now();
+        self.solo.anchor = None;
+        self.solo.expect = Some((PlaybackState::Paused, Instant::now()));
+        self.set_state(PlaybackState::Paused, pos).await;
+    }
+
+    async fn solo_seek(&mut self, position_ms: u32) {
+        self.solo_send(json!({"command": "seek", "position_ms": position_ms}));
+        self.solo.seek_sent = Some((position_ms, Instant::now()));
+        if self.state == PlaybackState::Playing {
+            self.solo.anchor = Some((position_ms, Instant::now()));
+        }
+        let state = self.state;
+        self.set_state(state, position_ms).await;
+    }
+
+    /// The position now, moved on from the last report while playing.
+    fn solo_now(&self) -> u32 {
+        match self.solo.anchor {
+            Some((ms, at)) => {
+                ms.saturating_add(u32::try_from(at.elapsed().as_millis()).unwrap_or(u32::MAX))
+            }
+            None => self.position_ms,
+        }
+    }
+
+    /// `false` while a report contradicts what a click just put on screen.
+    fn solo_agrees(&mut self, state: PlaybackState) -> bool {
+        match self.solo.expect {
+            Some((want, at)) if want != state && at.elapsed() < OPTIMISTIC_HOLD => false,
+            Some(_) => {
+                self.solo.expect = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// `false` for a position reported from before our seek.
+    fn solo_seek_settled(&mut self, ms: u32) -> bool {
+        match self.solo.seek_sent {
+            Some((want, at)) if at.elapsed() < OPTIMISTIC_HOLD && want.abs_diff(ms) > 3000 => false,
+            Some(_) => {
+                self.solo.seek_sent = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// `false` for a volume echo older than the one we just set.
+    fn solo_volume_settled(&mut self, v: u8) -> bool {
+        match self.solo.volume_sent {
+            Some(at) if at.elapsed() < OPTIMISTIC_HOLD && v != self.volume => false,
+            _ => {
+                self.solo.volume_sent = None;
+                true
+            }
+        }
+    }
+
     async fn solo_tick(&mut self) {
-        if let Some((ms, at)) = self.solo.anchor {
-            let now =
-                ms.saturating_add(u32::try_from(at.elapsed().as_millis()).unwrap_or(u32::MAX));
+        if self.solo.anchor.is_some() {
+            let now = self.solo_now();
             // Soloist plays a single URI and, at its end, starts it again (or goes idle without
             // saying so): move on with Tonearm's queue right at the end instead.
             let duration = self.solo_duration();
@@ -754,6 +849,14 @@ impl Service {
                 return;
             }
         };
+        if !self.solo_agrees(state) {
+            return;
+        }
+        let pos = if self.solo.seek_sent.is_some() && !self.solo_seek_settled(pos) {
+            self.solo_now()
+        } else {
+            pos
+        };
         self.solo.anchor = (state == PlaybackState::Playing).then(|| (pos, Instant::now()));
         self.set_state(state, pos).await;
     }
@@ -766,7 +869,9 @@ impl Service {
             }
             soloist::Event::Snapshot(snap) => {
                 self.solo.active = snap.active;
-                if let Some(v) = snap.volume {
+                if let Some(v) = snap.volume
+                    && self.solo_volume_settled(v)
+                {
                     self.volume = v;
                     self.emit(PlayerEvent::Volume(v)).await;
                 }
@@ -779,7 +884,7 @@ impl Service {
                 if !self.solo_waiting() && self.solo_wrapped(ms) {
                     tracing::info!(ms, "soloist looped the track, next from the queue");
                     self.solo_advance().await;
-                } else if !self.solo_waiting() {
+                } else if !self.solo_waiting() && self.solo_seek_settled(ms) {
                     if self.state == PlaybackState::Playing {
                         self.solo.anchor = Some((ms, Instant::now()));
                     }
@@ -787,10 +892,11 @@ impl Service {
                     self.set_state(state, ms).await;
                 }
             }
-            soloist::Event::Volume(v) => {
+            soloist::Event::Volume(v) if self.solo_volume_settled(v) => {
                 self.volume = v;
                 self.emit(PlayerEvent::Volume(v)).await;
             }
+            soloist::Event::Volume(_) => {}
         }
     }
 }

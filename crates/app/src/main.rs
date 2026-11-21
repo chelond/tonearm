@@ -25,6 +25,8 @@ slint::include_modules!();
 
 /// How long an informational notice stays up.
 const NOTICE_SECS: u32 = 5;
+/// The library is fetched again on coming back to the window, at most this often.
+const LIBRARY_REFRESH: Duration = Duration::from_secs(300);
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
@@ -328,11 +330,16 @@ impl Senders {
                         ConnectCommand::Control(RemoteAction::Seek(position_ms))
                     }
                     PlayerCommand::SetVolume(p) => ConnectCommand::Control(RemoteAction::Volume(p)),
-                    PlayerCommand::PlayContext { items, start, .. } => ConnectCommand::PlayOn {
+                    PlayerCommand::PlayContext {
+                        items,
+                        start,
+                        position_ms,
+                        ..
+                    } => ConnectCommand::PlayOn {
                         device_id,
                         uris: items.into_iter().map(|i| i.uri).collect(),
                         offset: start,
-                        position_ms: 0,
+                        position_ms,
                     },
                     PlayerCommand::Load(uri) => ConnectCommand::PlayOn {
                         device_id,
@@ -573,7 +580,7 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
         }
         PlayerEvent::Volume(percent) => {
             os_media::on_volume(percent);
-            w.set_volume_level((i32::from(percent) * 12 + 50) / 100);
+            w.set_volume_level(i32::from(percent));
         }
         PlayerEvent::Error(text) => {
             w.set_notice(text.into());
@@ -635,7 +642,7 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
             w.set_position_ms(i32::try_from(state.progress_ms).unwrap_or(0));
             ui_state::with(|st| st.position_changed(w));
             if let Some(v) = state.device.volume_percent {
-                w.set_volume_level((i32::from(v) * 12 + 50) / 100);
+                w.set_volume_level(i32::from(v));
             }
             let track = tonearm_player::TrackInfo {
                 uri: state.uri.clone(),
@@ -1301,7 +1308,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     let s = senders.clone();
     window.on_volume_changed(move |level| {
-        let percent = u8::try_from(level.clamp(0, 12) * 100 / 12).unwrap_or(100);
+        let percent = u8::try_from(level.clamp(0, 100)).unwrap_or(100);
         s.player(PlayerCommand::SetVolume(percent));
     });
 
@@ -1311,6 +1318,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let weak = window.as_weak();
     // Informational notices ("Добавлено в «Любимые»") go away by themselves; errors stay.
     let mut notice_seen = (slint::SharedString::new(), 0u32);
+    // Back in the window after a while: playlists made or followed elsewhere show up.
+    let mut was_focused = true;
+    let mut library_at = std::time::Instant::now();
     tick.start(
         slint::TimerMode::Repeated,
         Duration::from_secs(1),
@@ -1328,6 +1338,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if w.get_auth_view() == AuthView::Waiting {
                     w.set_waited_secs(w.get_waited_secs() + 1);
                 }
+                let focused = window_focused(&w);
+                if focused
+                    && !was_focused
+                    && w.get_auth_view() == AuthView::LoggedIn
+                    && library_at.elapsed() >= LIBRARY_REFRESH
+                {
+                    library_at = std::time::Instant::now();
+                    tick_senders.run(vec![Effect::Library(LibraryCommand::Refresh)]);
+                }
+                was_focused = focused;
                 if w.get_offline() && w.get_retry_in_secs() > 0 {
                     w.set_retry_in_secs(w.get_retry_in_secs() - 1);
                 }
@@ -1616,6 +1636,7 @@ fn preview(w: &AppWindow, senders: &Senders) {
             title: t.into(),
             artists: a.into(),
             duration_ms: 200_000,
+            cover_url: None,
         };
         let snap = QueueSnapshot {
             context_name: "Ночные маршруты".into(),

@@ -153,6 +153,31 @@ pub struct UiState {
     palette: Vec<PaletteAction>,
     /// Seconds since the resume state was last written.
     since_save: u32,
+    queue_rows: Rc<VecModel<QueueRow>>,
+    /// Pages seen lately, newest last: shown at once when opened again.
+    page_cache: Vec<CachedPage>,
+    /// The page came from `page_cache`; its fresh tracks are collected here and swapped in
+    /// once complete, only if they differ.
+    refresh: Option<Vec<TrackItem>>,
+    /// Header now on screen, so an identical fresh one does not redraw it.
+    shown_header: Option<PageHeader>,
+    /// Colour taken from the page's cover.
+    page_rgb: Option<[u8; 3]>,
+}
+
+/// Pages kept in memory and tracks across all of them: about a few MB at most.
+const PAGE_CACHE: usize = 12;
+const PAGE_CACHE_TRACKS: usize = 20_000;
+
+/// A loaded page, kept to show it again without waiting for the network.
+struct CachedPage {
+    key: (i32, String),
+    header: Option<PageHeader>,
+    image_url: Option<String>,
+    rgb: Option<[u8; 3]>,
+    tracks: Vec<TrackItem>,
+    tiles: Vec<Tile>,
+    scroll: f32,
 }
 
 /// What the search page shows.
@@ -435,7 +460,104 @@ impl UiState {
     }
 
     /// Navigates to a page; the library loads it and answers with events.
+    /// Keeps the page on screen (and where it is scrolled to) for a later visit.
+    fn remember_page(&mut self, w: &AppWindow) {
+        let Some(cur) = self.current.as_ref() else {
+            return;
+        };
+        let key = request_uri(cur);
+        let complete = !w.get_page_loading() && w.get_page_error().is_empty();
+        if !complete || self.refresh.is_some() {
+            // Half loaded: keep only the scroll position of an older copy.
+            if let Some(c) = self.page_cache.iter_mut().find(|c| c.key == key) {
+                c.scroll = w.get_coll_scroll();
+            }
+            return;
+        }
+        self.page_cache.retain(|c| c.key != key);
+        self.page_cache.push(CachedPage {
+            key,
+            header: self.shown_header.clone(),
+            image_url: self.page_image_url.clone(),
+            rgb: self.page_rgb,
+            tracks: self.tracks.clone(),
+            tiles: self.page_tiles.clone(),
+            scroll: w.get_coll_scroll(),
+        });
+        while self.page_cache.len() > PAGE_CACHE
+            || (self.page_cache.len() > 1
+                && self.page_cache.iter().map(|c| c.tracks.len()).sum::<usize>()
+                    > PAGE_CACHE_TRACKS)
+        {
+            self.page_cache.remove(0);
+        }
+    }
+
+    /// Puts a cached copy of the page on screen; fresh data replaces it when it differs.
+    fn restore_page(&mut self, w: &AppWindow, key: &(i32, String)) -> Vec<Effect> {
+        let Some(pos) = self.page_cache.iter().position(|c| c.key == *key) else {
+            w.set_coll_scroll(0.0);
+            return Vec::new();
+        };
+        let c = self.page_cache.remove(pos);
+        let mut fx = Vec::new();
+        // The fresh copy gets the next page id; covers already asked go to it.
+        self.page_id = self.min_page_id;
+        if let Some(h) = &c.header {
+            fx.extend(self.set_header(w, h));
+        }
+        self.shown_header = c.header;
+        if let Some(url) = c.image_url.clone()
+            && fx.is_empty()
+        {
+            fx.push(Effect::Cover {
+                url,
+                size: 400,
+                target: CoverTarget::Page(self.page_id),
+            });
+        }
+        self.page_image_url = c.image_url;
+        if let Some(rgb) = c.rgb {
+            Theme::get(w).set_page_accent(self.tint(rgb));
+            self.page_rgb = Some(rgb);
+        }
+        self.tracks = c.tracks;
+        self.rebuild_view(w);
+        fx.extend(self.set_page_tiles(&c.tiles));
+        self.page_tiles = c.tiles;
+        self.finish_tracks(w);
+        w.set_page_loading(false);
+        w.set_coll_scroll(c.scroll);
+        self.refresh = Some(Vec::new());
+        fx
+    }
+
+    fn set_page_tiles(&self, tiles: &[Tile]) -> Vec<Effect> {
+        self.tile_rows
+            .set_vec(tiles.iter().map(tile_data).collect::<Vec<_>>());
+        tiles
+            .iter()
+            .filter_map(|t| {
+                t.image_url.as_ref().map(|u| Effect::Cover {
+                    url: u.clone(),
+                    size: 240,
+                    target: CoverTarget::Search(t.uri.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Labels of a page whose tracks are all in.
+    fn finish_tracks(&self, w: &AppWindow) {
+        let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
+        w.set_page_length_label(format_duration(total).into());
+        w.set_page_tracks_label(self.tracks.len().to_string().into());
+    }
+
     pub fn open(&mut self, w: &AppWindow, req: PageRequest, push_history: bool) -> Vec<Effect> {
+        if w.get_page() == crate::Page::Collection {
+            self.remember_page(w);
+        }
         if push_history && let Some(cur) = self.current.take() {
             self.history.push(cur);
         }
@@ -451,6 +573,9 @@ impl UiState {
         self.sort = 0;
         self.autoplay = false;
         self.page_image_url = None;
+        self.refresh = None;
+        self.shown_header = None;
+        self.page_rgb = None;
         w.set_page_filter("".into());
         w.set_page_sort(0);
         w.set_page_shown(0);
@@ -473,7 +598,9 @@ impl UiState {
             DEFAULT_PAGE_ACCENT
         });
         w.set_page(crate::Page::Collection);
-        vec![Effect::Open(req)]
+        let mut fx = self.restore_page(w, &(kind, self.page_uri.clone()));
+        fx.push(Effect::Open(req));
+        fx
     }
 
     /// The play button on a tile or card: play that collection (opening it to load its tracks).
@@ -483,8 +610,14 @@ impl UiState {
         if self.page_uri == page_uri && !self.tracks.is_empty() {
             return self.play_page(false);
         }
-        let fx = self.open(w, req, true);
-        self.autoplay = true;
+        let mut fx = self.open(w, req, true);
+        if self.tracks.is_empty() {
+            self.autoplay = true;
+        } else {
+            // Shown from memory: play right away.
+            fx.extend(self.play_page(false));
+            self.mark_context(w);
+        }
         fx
     }
 
@@ -636,7 +769,9 @@ impl UiState {
                 manual: i < q.manual,
             })
             .collect();
-        w.set_queue_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        // Updated in place: a new model would drop a drag in progress and scroll to the top.
+        sync_rows(&self.queue_rows, rows);
+        w.set_queue_items(ModelRc::from(self.queue_rows.clone()));
         w.set_queue_context(q.context_name.clone().into());
         w.set_shuffle_on(q.shuffle);
         w.set_repeat_mode(match q.repeat {
@@ -726,7 +861,7 @@ impl UiState {
                 }
             })
             .collect();
-        update_rows(&self.playlist_rows, rows);
+        sync_rows(&self.playlist_rows, rows);
         self.playlists = lists;
         fx
     }
@@ -746,10 +881,15 @@ impl UiState {
             LibraryEvent::Home(_) => {}
             LibraryEvent::PageHeader { page_id, header } if page_id >= self.min_page_id => {
                 self.page_id = page_id;
-                fx.extend(self.set_header(w, &header));
+                if self.shown_header.as_ref() != Some(&header) {
+                    fx.extend(self.set_header(w, &header));
+                    self.shown_header = Some(header);
+                }
             }
             LibraryEvent::PageImage { page_id, url }
-                if page_id == self.page_id && page_id >= self.min_page_id =>
+                if page_id == self.page_id
+                    && page_id >= self.min_page_id
+                    && self.page_image_url.as_ref() != Some(&url) =>
             {
                 self.page_image_url = Some(url.clone());
                 fx.push(Effect::Cover {
@@ -757,6 +897,25 @@ impl UiState {
                     size: 400,
                     target: CoverTarget::Page(page_id),
                 });
+            }
+            LibraryEvent::PageTracks {
+                page_id,
+                tracks,
+                done,
+            } if page_id == self.page_id
+                && page_id >= self.min_page_id
+                && self.refresh.is_some() =>
+            {
+                let fresh = self.refresh.get_or_insert_default();
+                fresh.extend(tracks);
+                if done {
+                    let fresh = self.refresh.take().unwrap_or_default();
+                    if fresh != self.tracks {
+                        self.tracks = fresh;
+                        self.rebuild_view(w);
+                        self.finish_tracks(w);
+                    }
+                }
             }
             LibraryEvent::PageTracks {
                 page_id,
@@ -781,9 +940,7 @@ impl UiState {
                 }
                 if done {
                     w.set_page_loading(false);
-                    let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
-                    w.set_page_length_label(format_duration(total).into());
-                    w.set_page_tracks_label(self.tracks.len().to_string().into());
+                    self.finish_tracks(w);
                     if std::mem::take(&mut self.autoplay) {
                         fx.extend(self.play_page(false));
                         self.mark_context(w);
@@ -793,17 +950,17 @@ impl UiState {
             LibraryEvent::PageTiles { page_id, tiles }
                 if page_id == self.page_id && page_id >= self.min_page_id =>
             {
-                self.tile_rows
-                    .set_vec(tiles.iter().map(tile_data).collect::<Vec<_>>());
-                fx.extend(tiles.iter().filter_map(|t| {
-                    t.image_url.as_ref().map(|u| Effect::Cover {
-                        url: u.clone(),
-                        size: 240,
-                        target: CoverTarget::Search(t.uri.clone()),
-                    })
-                }));
-                self.page_tiles = tiles;
+                if tiles != self.page_tiles {
+                    fx.extend(self.set_page_tiles(&tiles));
+                    self.page_tiles = tiles;
+                }
                 w.set_page_loading(false);
+            }
+            LibraryEvent::PageError { page_id, .. }
+                if page_id >= self.min_page_id && self.refresh.is_some() =>
+            {
+                // The copy from memory stays; it is only not refreshed.
+                self.refresh = None;
             }
             LibraryEvent::PageError { page_id, message } if page_id >= self.min_page_id => {
                 w.set_page_loading(false);
@@ -1200,6 +1357,7 @@ impl UiState {
             CoverTarget::Page(id) if *id == self.page_id => {
                 w.set_page_image(to_image(cover));
                 w.set_page_has_image(true);
+                self.page_rgb = Some(cover.accent);
                 Theme::get(w).set_page_accent(self.tint(cover.accent));
             }
             CoverTarget::Search(uri) => {
@@ -1703,6 +1861,7 @@ impl UiState {
                 title: q.title.clone(),
                 artists: q.artists.clone(),
                 duration_ms: q.duration_ms,
+                cover_url: (q.uri == r.uri).then(|| r.cover_url.clone()).flatten(),
             })
             .collect();
         let mut start = r.start;
@@ -1712,23 +1871,20 @@ impl UiState {
                 title: r.title.clone(),
                 artists: r.artists.clone(),
                 duration_ms: r.duration_ms,
+                cover_url: r.cover_url.clone(),
             }];
             start = 0;
         }
         self.context_items.clone_from(&items);
         self.playing_uri.clear();
-        Some(vec![
-            Effect::Player(PlayerCommand::PlayContext {
-                items,
-                start,
-                name: r.context.title.clone(),
-                shuffle: None,
-            }),
-            Effect::Player(PlayerCommand::PlayAt {
-                uri: r.uri,
-                position_ms: r.position_ms,
-            }),
-        ])
+        // One command: the track starts at the saved position, not first from its beginning.
+        Some(vec![Effect::Player(PlayerCommand::PlayContext {
+            items,
+            start,
+            name: r.context.title.clone(),
+            shuffle: None,
+            position_ms: r.position_ms,
+        })])
     }
 
     pub fn stats_opened(&mut self, w: &AppWindow) -> Vec<Effect> {
@@ -1994,6 +2150,7 @@ fn queue_item(t: &TrackItem) -> QueueItem {
         title: t.title.clone(),
         artists: t.artists.clone(),
         duration_ms: t.duration_ms,
+        cover_url: t.image_url.clone(),
     }
 }
 
@@ -2026,6 +2183,7 @@ fn context(
         start,
         name: name.to_owned(),
         shuffle,
+        position_ms: 0,
     })]
 }
 
@@ -2296,6 +2454,25 @@ impl<T: Clone + 'static> VecModelExt<T> for VecModel<T> {
     }
 }
 
+/// Replaces a list's rows in place: changed rows are set, extra ones added or removed at the
+/// end, so the list keeps its scroll position and the items under the mouse.
+fn sync_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    use slint::Model as _;
+    let new_len = rows.len();
+    for (i, row) in rows.into_iter().enumerate() {
+        if i < model.row_count() {
+            if model.row_data(i).as_ref() != Some(&row) {
+                model.set_row_data(i, row);
+            }
+        } else {
+            model.push(row);
+        }
+    }
+    while model.row_count() > new_len {
+        model.remove(model.row_count() - 1);
+    }
+}
+
 /// Replaces a list's rows, touching only the ones that changed when the length is the same:
 /// a reset would re-create every tile and replay its entrance animation.
 fn update_rows<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
@@ -2384,6 +2561,18 @@ fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_rows_updates_in_place() {
+        use slint::Model as _;
+        let m = slint::VecModel::from(vec![1, 2, 3, 4]);
+        super::sync_rows(&m, vec![2, 3, 4]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), [2, 3, 4]);
+        super::sync_rows(&m, vec![2, 9, 4, 5, 6]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), [2, 9, 4, 5, 6]);
+        super::sync_rows(&m, Vec::new());
+        assert_eq!(m.row_count(), 0);
+    }
+
     #[test]
     fn lyrics_position_lights_words() {
         use tonearm_core::library::lyrics::LyricWord;
