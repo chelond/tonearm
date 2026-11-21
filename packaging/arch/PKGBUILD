@@ -1,7 +1,7 @@
 # Maintainer: chelond
 # Build from a local checkout: cd packaging/arch && makepkg -si
 pkgname=tonearm
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Lightweight native music streaming client (unofficial, requires Premium)"
 arch=('x86_64' 'aarch64')

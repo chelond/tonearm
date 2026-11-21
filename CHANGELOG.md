@@ -5,8 +5,11 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-21
+
 ### Исправлено
 
+- Приложение падало при переходе на страницу артиста из нижней панели плеера.
 - Обновление на Arch могло выбрать пустой пакет `tonearm-debug` вместо самой программы.
   Отладочный пакет больше не собирается.
 
@@ -35,5 +38,6 @@
 - Обновление одной кнопкой из GitHub Releases, файлы проверяются по подписи ed25519.
 - Пакеты: PKGBUILD для Arch Linux, exe и zip для Windows, MSI через cargo-wix.
 
-[Unreleased]: https://github.com/chelond/tonearm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/chelond/tonearm/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/chelond/tonearm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/chelond/tonearm/releases/tag/v0.1.0
