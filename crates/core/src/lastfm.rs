@@ -354,14 +354,10 @@ impl Queue {
 
     fn save(&self) {
         let Some(p) = &self.path else { return };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(data) = serde_json::to_vec(&self.items) {
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, data).is_ok() {
-                let _ = std::fs::rename(&tmp, p);
-            }
+        if let Ok(data) = serde_json::to_vec(&self.items)
+            && let Err(e) = crate::fsutil::write_atomic(p, &data, crate::fsutil::Access::Private)
+        {
+            tracing::warn!(error = %e, "cannot save the scrobble queue");
         }
     }
 

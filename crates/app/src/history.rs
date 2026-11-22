@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tonearm_core::fsutil;
 
 /// History entries kept (a few months of normal listening, well under 1 MB).
 const MAX_ENTRIES: usize = 3000;
@@ -95,21 +96,28 @@ fn path(name: &str) -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "tonearm").map(|d| d.data_dir().join(name))
 }
 
-/// Writes atomically (temp file + rename) so a crash never leaves half a file.
+/// Writes atomically (unique temp file + rename) so a crash never leaves half a file.
+/// Synchronous: only for the final save at exit (after [`fsutil::flush`]) and for tests.
 fn write_json<T: Serialize>(name: &str, value: &T) {
     let Some(p) = path(name) else {
         return;
     };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let Ok(data) = serde_json::to_vec(value) else {
         return;
     };
-    let tmp = p.with_extension("tmp");
-    if std::fs::write(&tmp, data).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
+    if let Err(e) = fsutil::write_atomic(&p, &data, fsutil::Access::Private) {
+        tracing::warn!(error = %e, file = name, "cannot save");
     }
+}
+
+/// Queues the write on the shared writer thread (keeps order, newest snapshot wins).
+fn write_json_later<T: Serialize + Send + 'static>(name: &str, value: T) {
+    let Some(p) = path(name) else {
+        return;
+    };
+    fsutil::write_later(p, fsutil::Access::Private, move || {
+        serde_json::to_vec(&value).ok()
+    });
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
@@ -238,10 +246,21 @@ impl Store {
         store
     }
 
-    /// The history (written when a track ends) and the resume point.
+    /// The history (written when a track ends) and the resume point. Synchronous: use at exit,
+    /// after [`fsutil::flush`], so no queued older snapshot lands after it.
     pub fn save(&self) {
         write_json(HISTORY_FILE, &self.entries);
-        save_resume(self.resume.as_ref());
+        if let Some(r) = &self.resume {
+            write_json(RESUME_FILE, r);
+        }
+    }
+
+    /// Like [`Store::save`], queued on the writer thread (serialised there, not on the caller).
+    pub fn save_later(self) {
+        write_json_later(HISTORY_FILE, self.entries);
+        if let Some(r) = self.resume {
+            write_json_later(RESUME_FILE, r);
+        }
     }
     pub fn add(&mut self, e: Entry) {
         self.entries.push(e);
@@ -333,10 +352,10 @@ impl Store {
     }
 }
 
-/// Only the small resume file (written every few seconds while playing).
-pub fn save_resume(resume: Option<&Resume>) {
+/// Only the small resume file (written every few seconds while playing), queued.
+pub fn save_resume(resume: Option<Resume>) {
     if let Some(r) = resume {
-        write_json(RESUME_FILE, r);
+        write_json_later(RESUME_FILE, r);
     }
 }
 

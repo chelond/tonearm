@@ -239,11 +239,7 @@ impl Senders {
         if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
             return; // sample data: never touch the real config
         }
-        self.rt.spawn_blocking(move || {
-            if let Err(e) = new.save() {
-                tracing::warn!(error = %e, "cannot save config.toml");
-            }
-        });
+        new.save_later();
     }
 
     /// Starts Soloist with the saved key, or asks for one.
@@ -436,13 +432,12 @@ impl Senders {
                 }
                 Effect::Save(store) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt.spawn_blocking(move || store.save());
+                        store.save_later();
                     }
                 }
                 Effect::SaveResume(r) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt
-                            .spawn_blocking(move || history::save_resume(Some(&r)));
+                        history::save_resume(Some(*r));
                     }
                 }
                 Effect::LogPlay(e) => {
@@ -458,7 +453,7 @@ impl Senders {
                 }
                 Effect::SaveRules(rules) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt.spawn_blocking(move || smart::save(&rules));
+                        smart::save_later(rules);
                     }
                 }
                 Effect::LastFm(cmd) => self.lastfm_cmd(cmd),
@@ -1784,6 +1779,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window.run()?;
 
+    // Queued saves first, so none of them can land after (and over) the final one below.
+    tonearm_core::fsutil::flush();
     // Continue where we left off next time: write the history and position now.
     if std::env::var_os("TONEARM_UI_PREVIEW").is_none()
         && let Some(store) = ui_state::with(|st| st.save_now(&window))

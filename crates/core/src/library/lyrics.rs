@@ -7,7 +7,7 @@
 //! times spread at the song's own pace.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use librespot_core::{Session, SpotifyId, SpotifyUri};
@@ -205,16 +205,22 @@ enum Fetch {
 }
 
 async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
-        .user_agent(concat!(
-            "Tonearm/",
-            env!("CARGO_PKG_VERSION"),
-            " (https://github.com/chelond/tonearm)"
-        ))
-        .build()
-        .ok()?;
+    // One pool for the whole run: no new TLS handshake with LRCLIB for every track.
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(4))
+                .user_agent(concat!(
+                    "Tonearm/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (https://github.com/chelond/tonearm)"
+                ))
+                .build()
+                .ok()
+        })
+        .as_ref()?;
     let artist = artist.split(", ").next().unwrap_or(artist).trim();
     let mut titles = vec![title.trim().to_owned()];
     let clean = clean_title(title);
@@ -232,7 +238,7 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
                 ("artist_name", artist),
                 ("duration", duration.as_str()),
             ];
-            match lrclib_get(&client, "get", &q, duration_ms).await {
+            match lrclib_get(client, "get", &q, duration_ms).await {
                 Fetch::Hit(l) => {
                     if keep(l, &mut best) {
                         return best;
@@ -257,7 +263,7 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
     searches.push(vec![("q", format!("{last} {artist}").trim().to_owned())]);
     for q in searches {
         let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        match lrclib_get(&client, "search", &q, duration_ms).await {
+        match lrclib_get(client, "search", &q, duration_ms).await {
             Fetch::Hit(l) => {
                 if keep(l, &mut best) {
                     return best;
@@ -273,18 +279,23 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
 /// NetEase Cloud Music: no key, word timings (YRC) for many tracks. An unofficial API: any
 /// failure just means no lyrics from it.
 async fn netease(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        reqwest::header::REFERER,
-        HeaderValue::from_static("https://music.163.com/"),
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
-        .default_headers(headers)
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) Tonearm")
-        .build()
-        .ok()?;
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::REFERER,
+                HeaderValue::from_static("https://music.163.com/"),
+            );
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(4))
+                .default_headers(headers)
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) Tonearm")
+                .build()
+                .ok()
+        })
+        .as_ref()?;
     let artist = artist.split(", ").next().unwrap_or(artist).trim();
     let clean = clean_title(title);
     let query = format!("{clean} {artist}");

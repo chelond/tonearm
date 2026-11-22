@@ -128,13 +128,19 @@ pub struct SessionHttp {
 }
 
 impl SessionHttp {
+    /// Cheap: all instances share one connection pool (reqwest clients are reference-counted),
+    /// so TLS sessions to api.spotify.com are reused between pages instead of renegotiated.
     #[must_use]
     pub fn new(session: Session) -> Self {
-        Self {
-            client: reqwest::Client::builder()
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        });
+        Self {
+            client: client.clone(),
             session,
         }
     }

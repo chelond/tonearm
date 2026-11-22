@@ -232,18 +232,31 @@ impl Settings {
         }
     }
 
-    /// Atomic write: temp file + rename, so a crash never leaves half a config.
+    /// Queues the save on the file writer thread: saves happen in call order and only the newest
+    /// pending one is written, so fast setting changes can never leave an older config on disk.
+    pub fn save_later(&self) {
+        let Some(path) = Self::path() else { return };
+        let settings = self.clone();
+        crate::fsutil::write_later(path, crate::fsutil::Access::Private, move || {
+            settings
+                .file_text()
+                .map_err(|e| tracing::warn!(error = %e, "cannot serialise config.toml"))
+                .ok()
+                .map(String::into_bytes)
+        });
+    }
+
+    fn file_text(&self) -> Result<String, toml::ser::Error> {
+        let text = toml::to_string_pretty(self)?;
+        Ok(format!(
+            "# Tonearm settings. Login tokens are never stored here.\n\n{text}"
+        ))
+    }
+
+    /// Atomic write (unique temp file + rename), owner-only: `[lastfm] api_secret` may be here.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(
-            &tmp,
-            format!("# Tonearm settings. Tokens are never stored here.\n\n{text}"),
-        )?;
-        std::fs::rename(tmp, path)
+        let text = self.file_text().map_err(std::io::Error::other)?;
+        crate::fsutil::write_atomic(path, text.as_bytes(), crate::fsutil::Access::Private)
     }
 }
 
