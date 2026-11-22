@@ -565,7 +565,7 @@ impl Senders {
                                     Some(year)
                                 };
                                 let entries = match (&log, pick) {
-                                    (Some(l), Some(y)) => l.read_year(y),
+                                    (Some(l), Some(y)) => l.plays_in(y),
                                     _ => Vec::new(),
                                 };
                                 (years, entries)

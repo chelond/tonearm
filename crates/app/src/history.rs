@@ -96,6 +96,28 @@ fn path(name: &str) -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "tonearm").map(|d| d.data_dir().join(name))
 }
 
+/// Appends one JSON line. If an earlier write was cut off mid-line (crash, full disk), the
+/// unfinished line is closed first, so it costs only itself and not the play written now.
+fn append_line(file: &std::path::Path, e: &Entry) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut line = serde_json::to_vec(e).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(file)?;
+    if f.metadata()?.len() > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::End(-1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            line.insert(0, b'\n');
+        }
+    }
+    f.write_all(&line)
+}
+
 /// Writes atomically (unique temp file + rename) so a crash never leaves half a file.
 /// Synchronous: only for the final save at exit (after [`fsutil::flush`]) and for tests.
 fn write_json<T: Serialize>(name: &str, value: &T) {
@@ -162,31 +184,43 @@ impl PlayLog {
 
     /// Adds one play at the end of its year's file.
     pub fn append(&self, e: &Entry) -> std::io::Result<()> {
-        use std::io::Write;
         std::fs::create_dir_all(&self.dir)?;
-        let mut line = serde_json::to_vec(e).map_err(std::io::Error::other)?;
-        line.push(b'\n');
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.file(year_of(e.at)))?;
-        f.write_all(&line)
+        append_line(&self.file(year_of(e.at)), e)
     }
 
     /// First start with the log: copy the history kept so far into it, so the year summary
-    /// starts from everything already known.
+    /// starts from everything already known. Written into a side directory and renamed into
+    /// place at the end, so a crash halfway leaves no half-seeded log (it is redone next time).
     pub fn seed(&self, entries: &[Entry]) {
         if self.dir.exists() {
             return;
         }
-        for e in entries {
-            if let Err(err) = self.append(e) {
-                tracing::warn!(error = %err, "cannot write the play log");
-                return;
+        let tmp = self.dir.with_extension("seeding");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let seeded = std::fs::create_dir_all(&tmp).and_then(|()| {
+            for e in entries {
+                append_line(&tmp.join(format!("{}.jsonl", year_of(e.at))), e)?;
             }
+            std::fs::rename(&tmp, &self.dir)
+        });
+        if let Err(err) = seeded {
+            tracing::warn!(error = %err, "cannot write the play log");
+            let _ = std::fs::remove_dir_all(&tmp);
         }
-        // An empty history still marks the log as started.
-        let _ = std::fs::create_dir_all(&self.dir);
+    }
+
+    /// Plays that happened in `year` in local time. A play near New Year can sit in the
+    /// neighbouring file (the file is picked by the time zone at the moment of the play), so
+    /// those are read too.
+    #[must_use]
+    pub fn plays_in(&self, year: i32) -> Vec<Entry> {
+        let mut out: Vec<Entry> = [year - 1, year, year + 1]
+            .into_iter()
+            .flat_map(|y| self.read_year(y))
+            .filter(|e| year_of(e.at) == year)
+            .collect();
+        out.sort_by_key(|e| e.at);
+        out
     }
 
     /// Years with plays, newest first.
@@ -442,6 +476,51 @@ mod tests {
         std::fs::write(&f, text).unwrap();
         log.append(&entry("t4", "B", b + 20, "")).unwrap();
         assert_eq!(log.read_year(2026).len(), 3);
+    }
+
+    #[test]
+    fn a_cut_off_line_costs_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = PlayLog::at(dir.path().join("plays"));
+        let b = 1_780_315_200;
+        log.append(&entry("t1", "A", b, "")).unwrap();
+        let f = dir.path().join("plays/2026.jsonl");
+        let mut text = std::fs::read_to_string(&f).unwrap();
+        text.push_str("{\"uri\":\"half"); // crash in the middle of a write
+        std::fs::write(&f, text).unwrap();
+        log.append(&entry("t2", "A", b + 1, "")).unwrap();
+        let uris: Vec<String> = log.read_year(2026).into_iter().map(|e| e.uri).collect();
+        assert_eq!(uris, ["t1", "t2"]);
+    }
+
+    #[test]
+    fn plays_near_new_year_count_for_their_local_year() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = PlayLog::at(dir.path().join("plays"));
+        let mid_2026 = 1_780_315_200;
+        // A 2026 play that ended up in 2025.jsonl (written under another time zone).
+        std::fs::create_dir_all(dir.path().join("plays")).unwrap();
+        append_line(
+            &dir.path().join("plays/2025.jsonl"),
+            &entry("moved", "A", mid_2026, ""),
+        )
+        .unwrap();
+        log.append(&entry("t1", "A", mid_2026 + 5, "")).unwrap();
+        let uris: Vec<String> = log.plays_in(2026).into_iter().map(|e| e.uri).collect();
+        assert_eq!(uris, ["moved", "t1"]);
+        assert!(log.plays_in(2025).is_empty());
+    }
+
+    #[test]
+    fn seeding_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = PlayLog::at(dir.path().join("plays"));
+        // Left over by a crash during seeding.
+        std::fs::create_dir_all(dir.path().join("plays.seeding")).unwrap();
+        std::fs::write(dir.path().join("plays.seeding/2026.jsonl"), "{half").unwrap();
+        log.seed(&[entry("t1", "A", 1_780_315_200, "")]);
+        assert!(!dir.path().join("plays.seeding").exists());
+        assert_eq!(log.read_year(2026).len(), 1);
     }
 
     #[test]
