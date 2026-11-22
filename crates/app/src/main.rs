@@ -989,6 +989,7 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_notifications(i32::from(s.ui.notifications));
     w.set_lyrics_mode(i32::from(s.ui.lyrics_words));
     w.set_set_lyrics_backdrop(i32::from(s.ui.lyrics_backdrop.min(2)));
+    w.set_set_lyrics_layout(i32::from(s.ui.lyrics_layout.min(1)));
     w.set_set_device(s.audio.device.as_str().into());
     // A hand-edited size that is not one of the steps shows as the nearest larger step.
     let cache = CACHE_SIZES_MB
@@ -1030,6 +1031,7 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.ui.lyrics_backdrop = u8::try_from(w.get_set_lyrics_backdrop())
         .unwrap_or(1)
         .min(2);
+    s.ui.lyrics_layout = u8::try_from(w.get_set_lyrics_layout()).unwrap_or(0).min(1);
     s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;

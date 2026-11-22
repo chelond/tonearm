@@ -36,6 +36,9 @@ component Line inherits Rectangle {
     in property <int> word;
     in property <length> size;
     callback clicked();
+    property <bool> hovered: row-touch.has-hover;
+    background: root.hovered ? #FFFFFF18 : #00000000;
+    animate background { duration: 160ms; easing: ease-out; }
     // Keep a clear five-line focus window; more distant lines recede into the background.
     property <length> display-size: root.distance == 0 ? root.size
         : root.distance == 1 ? root.size * 0.78
@@ -69,10 +72,30 @@ component Line inherits Rectangle {
             animate font-size { duration: 480ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         }
     }
-    TouchArea {
+    row-touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
+}
+
+export component PlainLyricLine inherits Rectangle {
+    in property <string> text;
+    width: parent.width;
+    height: label.preferred-height + 16px;
+    background: row-touch.has-hover ? #FFFFFF18 : #00000000;
+    animate background { duration: 160ms; easing: ease-out; }
+    label := Text {
+        x: 12px;
+        y: 8px;
+        width: root.width - 24px;
+        text: root.text != "" ? root.text : " ";
+        font-family: Fonts.display;
+        font-weight: 700;
+        font-size: 24px;
+        color: #FFFFFFE0;
+        wrap: word-wrap;
+    }
+    row-touch := TouchArea { }
 }
 
 export component LyricsView inherits Rectangle {
@@ -81,26 +104,31 @@ export component LyricsView inherits Rectangle {
     // runs on a frame clock, so the screen stays still between words.
     in property <int> current-line: -1;
     in property <int> current-word: -1;
+    in property <int> layout-mode: 0; // scrolling list | centered five-line focus
     in property <length> size: 48px;
     callback seek-to(int);
 
     property <length> focus-y: 0;
+    property <int> focus-index: root.current-line < 0 ? 0 : root.current-line;
     lyr := Flickable {
         interactive: false;
-        content-height: col.preferred-height + root.height;
-        content-y: min(0px, -(root.focus-y - root.height * 0.50));
+        content-height: root.layout-mode == 1 ? max(root.height, col.preferred-height)
+            : col.preferred-height + root.height;
+        content-y: root.layout-mode == 1 ? 0px : min(0px, -(root.focus-y - root.height * 0.50));
         animate content-y { duration: 900ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         col := VerticalLayout {
             width: lyr.width;
-            padding-top: 24px;
-            alignment: start;
-            for l[i] in root.lines: Line {
+            height: root.layout-mode == 1 ? max(root.height, self.preferred-height) : self.preferred-height;
+            padding-top: root.layout-mode == 0 ? 24px : 0px;
+            alignment: root.layout-mode == 1 ? center : start;
+            for l[i] in root.lines: if root.layout-mode == 0 || abs(i - root.focus-index) <= 2: Line {
                 property <bool> current: i == root.current-line;
+                property <int> distance: abs(i - root.focus-index);
                 line: l;
                 active: self.current;
-                distance: abs(i - root.current-line);
+                distance: self.distance;
                 word: self.current ? root.current-word : -1;
-                size: root.size;
+                size: root.layout-mode == 1 ? root.size * 1.16 : root.size;
                 init => {
                     if self.current { root.focus-y = self.y + self.height / 2; }
                 }

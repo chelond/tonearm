@@ -135,6 +135,8 @@ pub struct UiSettings {
     pub lyrics_words: bool,
     /// Album art behind the lyrics: 0 off, 1 subtle, 2 vivid.
     pub lyrics_backdrop: u8,
+    /// Synced lyrics layout: 0 scrolling list, 1 centered five-line focus.
+    pub lyrics_layout: u8,
     /// The sidebar's smart playlists are folded.
     pub smart_collapsed: bool,
 }
@@ -163,6 +165,7 @@ impl Default for UiSettings {
             theme: "graphite".into(),
             lyrics_words: false,
             lyrics_backdrop: 1,
+            lyrics_layout: 0,
             smart_collapsed: false,
         }
     }
