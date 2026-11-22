@@ -32,6 +32,28 @@ export global Theme {
     out property <duration> slow: 600ms;
 }
 
+// Russian number words, the same rules as crates/app/src/ru.rs: "1 трек", "2 трека",
+// "5 треков", thousands grouped with a narrow no-break space ("1 284 трека").
+export global Ru {
+    pure public function form(n: int, one: string, few: string, many: string) -> string {
+        return Math.mod(n, 100) >= 11 && Math.mod(n, 100) <= 14 ? many
+            : Math.mod(n, 10) == 1 ? one
+            : Math.mod(n, 10) >= 2 && Math.mod(n, 10) <= 4 ? few
+            : many;
+    }
+    pure public function pad3(n: int) -> string {
+        return n < 10 ? "00" + n : n < 100 ? "0" + n : "" + n;
+    }
+    pure public function number(n: int) -> string {
+        return n < 1000 ? "" + n
+            : n < 1000000 ? Math.floor(n / 1000) + "\u{202F}" + pad3(Math.mod(n, 1000))
+            : Math.floor(n / 1000000) + "\u{202F}" + pad3(Math.mod(Math.floor(n / 1000), 1000)) + "\u{202F}" + pad3(Math.mod(n, 1000));
+    }
+    pure public function tracks(n: int) -> string {
+        return number(n) + " " + form(n, "трек", "трека", "треков");
+    }
+}
+
 export global Fonts {
     out property <string> display: "Inter Display";
     out property <string> text: "Inter";

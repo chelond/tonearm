@@ -565,7 +565,7 @@ impl UiState {
     fn finish_tracks(&self, w: &AppWindow) {
         let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
         w.set_page_length_label(format_duration(total).into());
-        w.set_page_tracks_label(self.tracks.len().to_string().into());
+        w.set_page_tracks_label(crate::ru::count_of(self.tracks.len(), crate::ru::TRACKS).into());
     }
 
     pub fn open(&mut self, w: &AppWindow, req: PageRequest, push_history: bool) -> Vec<Effect> {
@@ -1109,7 +1109,7 @@ impl UiState {
                 uri: p.uri.clone(),
                 kind: CollectionKind::Playlist,
                 title: p.name.clone(),
-                subtitle: format!("{} треков", p.track_count),
+                subtitle: crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS),
                 image_url: p.image_url.clone(),
             })
             .collect()
@@ -1123,7 +1123,7 @@ impl UiState {
                 if t.kind == CollectionKind::Playlist
                     && let Some(p) = self.playlists.iter().find(|p| p.uri == t.uri)
                 {
-                    t.subtitle = format!("{} треков", p.track_count);
+                    t.subtitle = crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS);
                 }
                 t
             })
@@ -1219,7 +1219,7 @@ impl UiState {
         w.set_page_byline(byline.into());
         w.set_page_year_label(h.year.map(|y| y.to_string()).unwrap_or_default().into());
         if let Some(n) = h.total_tracks {
-            w.set_page_tracks_label(n.to_string().into());
+            w.set_page_tracks_label(crate::ru::count(u64::from(n), crate::ru::TRACKS).into());
         }
         h.image_url
             .as_ref()
@@ -2158,7 +2158,10 @@ impl UiState {
                             1,
                             "library",
                             &p.name,
-                            &format!("Плейлист · {} треков", p.track_count),
+                            &format!(
+                                "Плейлист · {}",
+                                crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS)
+                            ),
                         ),
                         PaletteAction::Open(PageRequest::Playlist(p.uri.clone())),
                     );
@@ -2234,12 +2237,7 @@ impl UiState {
 }
 
 fn plays_label(n: usize) -> String {
-    let word = match (n % 10, n % 100) {
-        (1, x) if x != 11 => "раз",
-        (2..=4, x) if !(12..=14).contains(&x) => "раза",
-        _ => "раз",
-    };
-    format!("{n} {word}")
+    crate::ru::count_of(n, crate::ru::TIMES)
 }
 
 fn queue_item(t: &TrackItem) -> QueueItem {

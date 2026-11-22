@@ -4,6 +4,7 @@
 mod history;
 mod mini;
 mod os_media;
+mod ru;
 mod smart;
 mod themes;
 mod ui_state;
