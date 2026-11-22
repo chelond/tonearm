@@ -10,3 +10,4 @@ surface-2 = "#161616"
 line = "#FFFFFF10"
 accent = "#FFFFFF"
 on-accent = "#000000"
+text-3 = "#7E7E89"  # hints: 4.5:1 on every surface
