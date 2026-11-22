@@ -102,6 +102,10 @@ fn executable() -> &'static str {
 pub async fn current(root: &Path) -> Option<Build> {
     let bytes = tokio::fs::read(root.join("current.json")).await.ok()?;
     let build: Build = serde_json::from_slice(&bytes).ok()?;
+    // `digest` names a directory under `root`: only a SHA-256 hex string is a valid one.
+    if build.digest.len() != 64 || !build.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     (build.usable(now()) && tokio::fs::metadata(build.exe(root)).await.is_ok()).then_some(build)
 }
 
@@ -147,9 +151,10 @@ pub async fn download(
     }
     let mut data = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
     let mut last = u8::MAX;
-    while let Some(chunk) = resp
-        .chunk()
+    // A CDN that stops sending mid-file must not hang the supervisor forever.
+    while let Some(chunk) = tokio::time::timeout(std::time::Duration::from_secs(60), resp.chunk())
         .await
+        .map_err(|_| InstallError::Download("загрузка остановилась".into()))?
         .map_err(|e| InstallError::Download(e.to_string()))?
     {
         data.extend_from_slice(&chunk);

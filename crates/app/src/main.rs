@@ -44,12 +44,7 @@ fn init_logging() {
         }
     }
     // Also log to a file: a Windows release build has no console, so this is the only trace.
-    let file = log_path().and_then(|p| {
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir).ok()?;
-        }
-        std::fs::File::create(p).ok()
-    });
+    let file = log_path().and_then(|p| open_log(&p));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     match file {
         Some(f) => {
@@ -61,6 +56,21 @@ fn init_logging() {
         }
         None => builder.init(),
     }
+}
+
+/// Starts a fresh log, keeping the previous run's as `tonearm.log.1` (after a crash that one is
+/// what tells what happened). Owner-only: track names and account ids are in it.
+fn open_log(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let _ = std::fs::rename(path, path.with_extension("log.1"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).ok()
 }
 
 /// `tonearm.log` in the local data dir (`%LOCALAPPDATA%\tonearm\data` on Windows).
@@ -132,6 +142,9 @@ fn soloist_config(api_key: String) -> Option<SoloistConfig> {
         pipewire_device: None,
     })
 }
+
+/// How long "ПОЛУЧИТЬ КЛЮЧ" waits for the key to be copied.
+const KEY_WATCH_SECS: u32 = 180;
 
 /// What Spotify's "Copy" button puts on the clipboard: one token of printable characters.
 /// The format is not documented, so stay loose but never take ordinary text or a link.
@@ -286,31 +299,42 @@ impl Senders {
         });
     }
 
-    /// After "ПОЛУЧИТЬ КЛЮЧ": watch the clipboard for ten minutes for the key the user copies.
+    /// After "ПОЛУЧИТЬ КЛЮЧ": wait (up to three minutes) for the next clipboard change, which is
+    /// the user pressing "Copy" on the key page. Only that one change is looked at: whatever is
+    /// copied later (a password from a password manager, say) is never read as the key.
     fn watch_clipboard_for_key(&self) {
         if self.key_watch.swap(true, Ordering::SeqCst) {
             return;
         }
         let s = self.clone();
         std::thread::spawn(move || {
-            let found = (|| {
+            let changed = (|| {
                 let mut clipboard = arboard::Clipboard::new().ok()?;
                 let before = clipboard.get_text().ok();
-                for _ in 0..600 {
+                for _ in 0..KEY_WATCH_SECS {
                     std::thread::sleep(Duration::from_secs(1));
-                    let Ok(text) = clipboard.get_text() else {
-                        continue;
-                    };
-                    if Some(&text) != before.as_ref() && looks_like_key(&text) {
-                        return Some(text.trim().to_owned());
+                    match clipboard.get_text() {
+                        Ok(text) if Some(&text) != before.as_ref() => return Some(text),
+                        _ => {}
                     }
                 }
                 None
             })();
             s.key_watch.store(false, Ordering::SeqCst);
-            if let Some(key) = found {
-                tracing::info!("soloist key taken from the clipboard");
-                s.use_soloist_key(key);
+            match changed {
+                Some(text) if looks_like_key(&text) => {
+                    tracing::info!("soloist key taken from the clipboard");
+                    s.use_soloist_key(text.trim().to_owned());
+                }
+                Some(_) => {
+                    tracing::info!("clipboard changed, but not to a key");
+                    let _ = s.window.upgrade_in_event_loop(|w| {
+                        w.set_soloist_detail(
+                            "В буфере обмена не ключ. Скопируйте ключ ещё раз и вставьте его в поле.".into(),
+                        );
+                    });
+                }
+                None => {}
             }
         });
     }

@@ -218,9 +218,15 @@ fn feed_or_default(feed: &str) -> &str {
 /// Asks the feed for the latest release; `Ok(None)` = this is the newest version.
 pub async fn check(feed: &str, current: &str) -> Result<Option<Release>, UpdateError> {
     let kind = install_kind();
+    let feed = feed_or_default(feed);
+    if !https(feed) {
+        return Err(UpdateError::Network(
+            "адрес обновлений в config.toml должен начинаться с https://".into(),
+        ));
+    }
     let http = client(Some(Duration::from_secs(20)))?;
     let resp = http
-        .get(feed_or_default(feed))
+        .get(feed)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -238,6 +244,26 @@ pub async fn check(feed: &str, current: &str) -> Result<Option<Release>, UpdateE
     pick(release, current, kind)
 }
 
+/// A file name with no directory part (`a/../b`, `..`, `C:\x` are refused): the name from the
+/// feed becomes a path on disk.
+fn plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', ':'])
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+}
+
+/// Downloads come over TLS only, whatever a custom feed says.
+fn https(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
+/// The page handed to the OS opener: only GitHub release pages, never `file://` or app schemes.
+fn safe_page(url: Option<String>) -> String {
+    url.filter(|u| u.starts_with("https://github.com/"))
+        .unwrap_or_else(|| RELEASES_PAGE.to_owned())
+}
+
 fn pick(
     release: FeedRelease,
     current: &str,
@@ -249,7 +275,7 @@ fn pick(
     let asset = release
         .assets
         .iter()
-        .find(|a| wanted_asset(&a.name, kind))
+        .find(|a| plain_file_name(&a.name) && wanted_asset(&a.name, kind))
         .ok_or(UpdateError::NoAsset)?;
     let sig_name = format!("{}.sig", asset.name);
     let sig = release
@@ -257,10 +283,15 @@ fn pick(
         .iter()
         .find(|a| a.name == sig_name)
         .ok_or(UpdateError::NoAsset)?;
+    if !https(&asset.browser_download_url) || !https(&sig.browser_download_url) {
+        return Err(UpdateError::Network(
+            "сервер обновлений дал ссылку не по https".into(),
+        ));
+    }
     Ok(Some(Release {
         version: release.tag_name.trim_start_matches('v').to_owned(),
         notes: release.body.unwrap_or_default(),
-        page: release.html_url.unwrap_or_else(|| RELEASES_PAGE.to_owned()),
+        page: safe_page(release.html_url),
         asset_name: asset.name.clone(),
         asset_url: asset.browser_download_url.clone(),
         sig_url: sig.browser_download_url.clone(),
@@ -280,8 +311,10 @@ fn verify(data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
 fn target_path(release: &Release) -> Result<PathBuf, UpdateError> {
     match release.kind {
         InstallKind::Pacman => {
-            let dir = std::env::temp_dir().join("tonearm-update");
-            std::fs::create_dir_all(&dir).map_err(|e| UpdateError::Install(e.to_string()))?;
+            // Not the shared /tmp: another local user could pre-create the directory there and
+            // swap the package while pkexec waits for the password, and pacman (as root) would
+            // install theirs. A 0700 directory in our own cache dir cannot be touched by others.
+            let dir = private_update_dir().map_err(|e| UpdateError::Install(e.to_string()))?;
             Ok(dir.join(&release.asset_name))
         }
         InstallKind::Binary => {
@@ -292,6 +325,37 @@ fn target_path(release: &Release) -> Result<PathBuf, UpdateError> {
     }
 }
 
+/// `~/.cache/tonearm/update`, owner-only. It lives in the user's home, where other users cannot
+/// create or replace anything, and it is refused if something other than a directory is there.
+fn private_update_dir() -> std::io::Result<PathBuf> {
+    let dir = directories::ProjectDirs::from("", "", "tonearm")
+        .map(|d| d.cache_dir().join("update"))
+        .ok_or_else(|| std::io::Error::other("нет каталога кэша"))?;
+    std::fs::create_dir_all(&dir)?;
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(std::io::Error::other("каталог обновления подменён"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Creates `path` fresh (an old file or a planted link there is removed first, never followed).
+fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// Downloads the release file and its signature, verifies it and writes it to disk.
 /// `progress(done, total)` is called as bytes arrive (`total` is 0 when unknown).
 pub async fn download(
@@ -300,23 +364,34 @@ pub async fn download(
 ) -> Result<Downloaded, UpdateError> {
     let path = target_path(release)?;
     // Fail before the download if the file cannot be written anyway.
-    if let Err(e) = std::fs::write(&path, b"") {
-        let dir = path.parent().unwrap_or(&path).display().to_string();
-        return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
-            UpdateError::NotWritable(dir)
-        } else {
-            UpdateError::Install(e.to_string())
-        });
-    }
+    let file = match create_fresh(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            let dir = path.parent().unwrap_or(&path).display().to_string();
+            return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
+                UpdateError::NotWritable(dir)
+            } else {
+                UpdateError::Install(e.to_string())
+            });
+        }
+    };
     let result = fetch_verified(release, &mut progress).await;
     let data = match result {
         Ok(d) => d,
         Err(e) => {
+            drop(file);
             let _ = std::fs::remove_file(&path);
             return Err(e);
         }
     };
-    let write = tokio::fs::write(&path, &data).await;
+    // Write into the file we created (not by path again: nothing can be swapped in between).
+    let write = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = file;
+        file.write_all(&data).and_then(|()| file.sync_all())
+    })
+    .await
+    .map_err(|e| UpdateError::Install(e.to_string()))?;
     if let Err(e) = write {
         let _ = std::fs::remove_file(&path);
         return Err(UpdateError::Install(e.to_string()));
@@ -334,16 +409,21 @@ async fn fetch_verified(
 ) -> Result<Vec<u8>, UpdateError> {
     let http = client(None)?;
     let net = |e: reqwest::Error| UpdateError::Network(e.to_string());
-    let signature = http
+    let sig_resp = http
         .get(&release.sig_url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(net)?
-        .bytes()
-        .await
         .map_err(net)?;
+    // A signature is 64 bytes: do not read an endless body into memory.
+    if sig_resp.content_length().is_some_and(|n| n > 1024) {
+        return Err(UpdateError::BadSignature);
+    }
+    let signature = sig_resp.bytes().await.map_err(net)?;
+    if signature.len() != 64 {
+        return Err(UpdateError::BadSignature);
+    }
     let mut resp = http
         .get(&release.asset_url)
         .send()
@@ -463,6 +543,60 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn feed_file_names_cannot_leave_the_directory() {
+        assert!(plain_file_name("tonearm-0.3.0-1-x86_64.pkg.tar.zst"));
+        assert!(!plain_file_name("tonearm-../../.bashrc-x86_64.pkg.tar.zst"));
+        assert!(!plain_file_name("../tonearm-linux-x86_64"));
+        assert!(!plain_file_name("..\\tonearm-windows-x86_64.exe"));
+        assert!(!plain_file_name("C:tonearm-windows-x86_64.exe"));
+        assert!(!plain_file_name(".hidden"));
+        assert!(!plain_file_name(""));
+    }
+
+    #[test]
+    fn only_https_and_github_pages() {
+        assert!(https("https://github.com/x"));
+        assert!(!https("http://mirror.local/x"));
+        assert_eq!(
+            safe_page(Some(
+                "https://github.com/chelond/tonearm/releases/tag/v1".into()
+            )),
+            "https://github.com/chelond/tonearm/releases/tag/v1"
+        );
+        assert_eq!(safe_page(Some("file:///etc/passwd".into())), RELEASES_PAGE);
+        assert_eq!(safe_page(Some("ms-settings:".into())), RELEASES_PAGE);
+        assert_eq!(safe_page(None), RELEASES_PAGE);
+    }
+
+    #[test]
+    fn http_download_links_are_refused() {
+        let mut f = feed(
+            "v99.0.0",
+            &["tonearm-linux-x86_64", "tonearm-linux-x86_64.sig"],
+        );
+        for a in &mut f.assets {
+            a.browser_download_url = a.browser_download_url.replace("https://", "http://");
+        }
+        if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
+            assert!(pick(f, "0.1.0", InstallKind::Binary).is_err());
+        }
+    }
+
+    #[test]
+    fn create_fresh_does_not_follow_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let path = dir.path().join("pkg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let mut f = create_fresh(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

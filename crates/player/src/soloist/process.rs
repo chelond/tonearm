@@ -137,15 +137,22 @@ fn keep_output(child: &mut Child, log: PathBuf, key: String) {
     drop(tx);
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        let Ok(mut file) = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log)
-            .await
-        else {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        // Owner-only: Soloist's own output may carry account details.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let Ok(mut file) = options.open(&log).await else {
             return;
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A log left by an older version was created world-readable.
+            let _ = file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await;
+        }
         while let Some(line) = rx.recv().await {
             let line = if key.is_empty() {
                 line

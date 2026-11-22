@@ -161,11 +161,9 @@ impl SessionHttp {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = resp
-            .bytes()
+        let body = crate::net::body_limited(resp, crate::net::MAX_API, Duration::from_secs(20))
             .await
-            .map_err(|e| ApiError::Network(e.without_url().to_string()))?
-            .to_vec();
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         Ok(HttpResponse {
             status,
             body,

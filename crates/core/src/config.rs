@@ -1,5 +1,6 @@
-//! User settings in `config.toml` (platform config dir). Never holds secrets: tokens and the
-//! login live in the keyring / encrypted store. Unknown or broken values fall back to defaults,
+//! User settings in `config.toml` (platform config dir). Login tokens and session keys live in
+//! the keyring / encrypted store, never here; the only secret that can be here is the optional
+//! own Last.fm `api_secret` a user types in by hand, so the file is written owner-only (0600). Unknown or broken values fall back to defaults,
 //! so a hand-edited file can never stop the app from starting.
 
 use std::path::{Path, PathBuf};

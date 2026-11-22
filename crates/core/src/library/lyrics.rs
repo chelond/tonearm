@@ -299,19 +299,17 @@ async fn netease(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> 
     let artist = artist.split(", ").next().unwrap_or(artist).trim();
     let clean = clean_title(title);
     let query = format!("{clean} {artist}");
-    let found: serde_json::Value = client
+    let found = client
         .get("https://music.163.com/api/search/get")
         .query(&[("s", query.trim()), ("type", "1"), ("limit", "10")])
         .send()
         .await
         .map_err(|e| tracing::info!(error = %e, "NetEase unreachable"))
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let found = crate::net::json_limited(found, crate::net::MAX_JSON).await?;
     let id = netease_match(&found, &clean, artist, duration_ms)?;
     let id = id.to_string();
-    let json: serde_json::Value = client
+    let json = client
         .get("https://music.163.com/api/song/lyric/v1")
         .query(&[
             ("id", id.as_str()),
@@ -326,10 +324,8 @@ async fn netease(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> 
         ])
         .send()
         .await
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let json = crate::net::json_limited(json, crate::net::MAX_JSON).await?;
     parse_netease(&json)
 }
 
@@ -507,7 +503,7 @@ async fn lrclib_get(
             Fetch::Miss
         };
     }
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
+    let Some(json) = crate::net::json_limited(resp, crate::net::MAX_JSON).await else {
         return Fetch::Miss;
     };
     let found = if json.is_array() {

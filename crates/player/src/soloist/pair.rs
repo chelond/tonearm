@@ -66,8 +66,27 @@ pub async fn find(device_name: &str, wait: Duration) -> Result<Endpoint, PairErr
     Err(PairError::NotFound)
 }
 
-/// Endpoint URLs of every Spotify Connect device that answers within `wait`, loopback first.
+/// Addresses of this computer's network interfaces (plus loopback).
+fn local_addrs() -> Vec<IpAddr> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces.into_iter().map(|i| i.ip()).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list network interfaces; only loopback is trusted");
+            Vec::new()
+        }
+    }
+}
+
+/// Soloist runs on this computer, so only an address of this computer can be it. Anything else
+/// on the network that answers with the same name gets nothing: the blob carries the account.
+fn is_this_computer(addr: IpAddr, local: &[IpAddr]) -> bool {
+    addr.is_loopback() || local.contains(&addr)
+}
+
+/// Endpoint URLs of the Spotify Connect devices on this computer that answer within `wait`,
+/// loopback first.
 fn browse(wait: Duration) -> Result<Vec<String>, PairError> {
+    let local = local_addrs();
     let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| PairError::Other(e.to_string()))?;
     let events = daemon
         .browse(SERVICE)
@@ -82,9 +101,15 @@ fn browse(wait: Duration) -> Result<Vec<String>, PairError> {
                     .get_property_val_str("CPath")
                     .unwrap_or("/")
                     .to_owned();
-                let mut addrs: Vec<IpAddr> =
-                    service.addresses.iter().map(|a| a.to_ip_addr()).collect();
-                // Soloist runs here: try our own addresses before the rest of the network.
+                let mut addrs: Vec<IpAddr> = service
+                    .addresses
+                    .iter()
+                    .map(|a| a.to_ip_addr())
+                    .filter(|a| is_this_computer(*a, &local))
+                    .collect();
+                if addrs.is_empty() {
+                    tracing::debug!(name = %service.fullname, "connect device elsewhere on the network, skipped");
+                }
                 addrs.sort_by_key(|a| (!a.is_loopback(), a.is_ipv6()));
                 for addr in addrs {
                     let host = match addr {
@@ -298,6 +323,20 @@ fn outer_blob(shared: &[u8], iv: &[u8; 16], plain: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_this_computer_gets_the_account() {
+        let local: Vec<IpAddr> = vec!["192.168.1.20".parse().unwrap(), "fd00::20".parse().unwrap()];
+        assert!(is_this_computer("127.0.0.1".parse().unwrap(), &local));
+        assert!(is_this_computer("::1".parse().unwrap(), &local));
+        assert!(is_this_computer("192.168.1.20".parse().unwrap(), &local));
+        assert!(is_this_computer("fd00::20".parse().unwrap(), &local));
+        // A spoofed "Tonearm" elsewhere in the LAN.
+        assert!(!is_this_computer("192.168.1.66".parse().unwrap(), &local));
+        assert!(!is_this_computer("fd00::66".parse().unwrap(), &local));
+        assert!(!is_this_computer("192.168.1.66".parse().unwrap(), &[]));
+    }
+
     use super::*;
     use librespot_core::authentication::Credentials;
     use librespot_protocol::authentication::AuthenticationType;

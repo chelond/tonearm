@@ -11,6 +11,7 @@ pub mod file_store;
 pub mod fsutil;
 pub mod lastfm;
 pub mod library;
+pub mod net;
 pub mod secret;
 pub mod update;
 

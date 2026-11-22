@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use image::imageops::FilterType;
 
@@ -233,7 +233,9 @@ impl CoverCache {
             .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|e| e.to_string())?;
-        Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+        crate::net::body_limited(resp, crate::net::MAX_IMAGE, Duration::from_secs(20))
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

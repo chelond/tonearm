@@ -276,7 +276,9 @@ impl Client {
             .send()
             .await
             .map_err(|_| Error::Network)?;
-        let bytes = resp.bytes().await.map_err(|_| Error::Network)?;
+        let bytes = crate::net::body_limited(resp, crate::net::MAX_JSON, Duration::from_secs(20))
+            .await
+            .map_err(|_| Error::Network)?;
         let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| Error::Format)?;
         if let Ok(e) = serde_json::from_value::<ApiError>(json.clone()) {
             return Err(Error::Api {
