@@ -144,21 +144,49 @@ impl Queue {
     }
 
     /// Plays the `index`-th entry of [`QueueSnapshot::upcoming`]: skips everything before it.
+    /// A track of the context: the hand-queued tracks stay queued (they play after it).
     pub fn jump(&mut self, index: usize) -> Option<QueueItem> {
         if index < self.manual.len() {
             self.manual.drain(..index);
             return self.next(false);
         }
         let skip = index - self.manual.len();
-        self.manual.clear();
-        for _ in 0..skip {
-            self.next(false)?;
+        let start = self.pos;
+        for _ in 0..=skip {
+            match self.next_pos() {
+                Some(p) => self.pos = Some(p),
+                None => {
+                    self.pos = start;
+                    return None;
+                }
+            }
         }
-        self.next(false)
+        self.playing_manual = None;
+        self.current().cloned()
     }
 
     pub fn add(&mut self, item: QueueItem) {
         self.manual.push_back(item);
+    }
+
+    /// Plays right after the current track.
+    pub fn add_next(&mut self, item: QueueItem) {
+        self.manual.push_front(item);
+    }
+
+    /// Removes the `index`-th entry of [`QueueSnapshot::upcoming`]: a hand-queued track, or one
+    /// of the context's still ahead (skipped this time round; the page still lists it).
+    pub fn remove_upcoming(&mut self, index: usize) {
+        let m = self.manual.len();
+        if index < m {
+            self.manual.remove(index);
+            return;
+        }
+        let start = self.pos.map_or(0, |p| p + 1);
+        let at = start + index - m;
+        if at < self.order.len() {
+            self.order.remove(at);
+        }
     }
 
     /// Moves to `uri` in the context if it is there.
@@ -381,10 +409,34 @@ mod tests {
             uri: "spotify:track:x".into(),
             ..QueueItem::default()
         });
-        // upcoming: x, 1, 2, 3, 4 → index 3 is track 3
+        // upcoming: x, 1, 2, 3, 4 → index 3 is track 3; the queued x still plays next.
         assert_eq!(uri(q.jump(3)), "3");
-        assert_eq!(q.snapshot(10).manual, 0);
+        assert_eq!(q.snapshot(10).manual, 1);
+        assert_eq!(uri(q.next(true)), "x");
         assert_eq!(uri(q.next(true)), "4");
+        // Past the end: nothing moves.
+        assert!(q.jump(9).is_none());
+        assert_eq!(uri(q.current().cloned()), "4");
+    }
+
+    #[test]
+    fn play_next_and_remove() {
+        let mut q = Queue::default();
+        q.set_context(items(4), 0, "P".into());
+        let item = |u: &str| QueueItem {
+            uri: format!("spotify:track:{u}"),
+            ..QueueItem::default()
+        };
+        q.add(item("a"));
+        q.add_next(item("b"));
+        // upcoming: b, a, 1, 2, 3
+        q.remove_upcoming(1); // a
+        q.remove_upcoming(2); // 2
+        q.remove_upcoming(99);
+        assert_eq!(uri(q.next(true)), "b");
+        assert_eq!(uri(q.next(true)), "1");
+        assert_eq!(uri(q.next(true)), "3");
+        assert!(q.next(true).is_none());
     }
 
     #[test]

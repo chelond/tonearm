@@ -426,6 +426,14 @@ impl Service {
                 self.queue.add(item);
                 self.emit_queue().await;
             }
+            PlayerCommand::PlayNext(item) => {
+                self.queue.add_next(item);
+                self.emit_queue().await;
+            }
+            PlayerCommand::RemoveFromQueue(index) => {
+                self.queue.remove_upcoming(index);
+                self.emit_queue().await;
+            }
             PlayerCommand::JumpTo(index) => {
                 if let Some(item) = self.queue.jump(index) {
                     self.play_item(&item).await;
@@ -545,7 +553,12 @@ impl Service {
 
     /// End of track: continue with the queue, or stop at its end.
     async fn advance(&mut self) {
-        match self.queue.next(true) {
+        self.advance_by(true).await;
+    }
+
+    /// `auto = false` skips even in "repeat one": a track that cannot play is not retried.
+    async fn advance_by(&mut self, auto: bool) {
+        match self.queue.next(auto) {
             Some(item) => self.play_item(&item).await,
             None => {
                 let end = self.position_ms;
@@ -613,7 +626,7 @@ impl Service {
                 .await;
                 self.skips += 1;
                 if self.skips < MAX_SKIPS {
-                    self.advance().await;
+                    self.advance_by(false).await;
                 } else {
                     self.emit(PlayerEvent::AudioKeyRefused).await;
                     self.set_state(PlaybackState::Stopped, 0).await;

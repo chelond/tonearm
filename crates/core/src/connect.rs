@@ -84,6 +84,8 @@ pub enum ConnectEvent {
         position_ms: u32,
     },
     Error(String),
+    /// Moving playback to a device failed: it keeps playing here.
+    HandoffFailed(String),
 }
 
 // ---- JSON ----
@@ -378,17 +380,11 @@ impl Service {
                 let r = api
                     .play_on(&device_id, &uris[from..to], offset - from, position_ms)
                     .await;
-                if r.is_ok() {
-                    self.start_polling();
-                }
-                r.map(|()| None)
+                return self.handed_off(r).await;
             }
             ConnectCommand::Transfer { device_id } => {
                 let r = api.transfer(&device_id, true).await;
-                if r.is_ok() {
-                    self.start_polling();
-                }
-                r.map(|()| None)
+                return self.handed_off(r).await;
             }
             ConnectCommand::Control(action) => {
                 let r = api.control(&action).await;
@@ -419,6 +415,19 @@ impl Service {
             Err(e) => {
                 self.emit(ConnectEvent::Error(format!("Spotify Connect: {e}")))
                     .await;
+            }
+        }
+    }
+
+    /// After `PlayOn`/`Transfer`: follow the device, or tell the app to keep playing here.
+    async fn handed_off<E: std::fmt::Display>(&mut self, r: Result<(), E>) {
+        match r {
+            Ok(()) => self.start_polling(),
+            Err(e) => {
+                self.emit(ConnectEvent::HandoffFailed(format!(
+                    "Не удалось переключить на устройство: {e}. Музыка играет здесь."
+                )))
+                .await;
             }
         }
     }

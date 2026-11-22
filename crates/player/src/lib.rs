@@ -34,8 +34,12 @@ pub enum PlayerCommand {
     CycleRepeat,
     /// "Добавить в очередь": plays after the current track, before the context continues.
     Enqueue(QueueItem),
+    /// "Играть следующим": right after the current track, ahead of the queued ones.
+    PlayNext(QueueItem),
     /// Play the n-th entry of the upcoming list.
     JumpTo(usize),
+    /// Remove the n-th entry of the upcoming list.
+    RemoveFromQueue(usize),
     /// Drop the hand-queued tracks.
     ClearQueue,
     /// Drag and drop in the queue panel: entry `from` of the upcoming list goes to `to`.

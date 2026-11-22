@@ -704,7 +704,8 @@ impl UiState {
         }
     }
 
-    /// Right-click menu: 0 add to queue, 1 go to artist, 2 go to album, 3 like, 4 radio.
+    /// Right-click menu: 0 add to queue, 1 go to artist, 2 go to album, 3 like, 4 radio,
+    /// 5 play next.
     pub fn row_action(
         &mut self,
         w: &AppWindow,
@@ -717,6 +718,7 @@ impl UiState {
         };
         match action {
             0 if t.playable => vec![Effect::Player(PlayerCommand::Enqueue(queue_item(&t)))],
+            5 if t.playable => vec![Effect::Player(PlayerCommand::PlayNext(queue_item(&t)))],
             1 => t
                 .artist_uri
                 .map(|u| self.open(w, PageRequest::Artist(u), true))
@@ -1044,7 +1046,19 @@ impl UiState {
                     ..Context::default()
                 };
                 let name = ctx.title.clone();
-                fx.extend(self.start_context(&tracks, Some(0), &name, Some(false), ctx));
+                // The seed comes first; if it is the track playing now, it goes on from where
+                // it is instead of starting over. Shuffle stays as the user set it.
+                let seed_playing = tracks.first().is_some_and(|t| t.uri == self.playing_uri);
+                let at = u32::try_from(w.get_position_ms()).unwrap_or(0);
+                let mut start = self.start_context(&tracks, Some(0), &name, None, ctx);
+                if seed_playing {
+                    for e in &mut start {
+                        if let Effect::Player(PlayerCommand::PlayContext { position_ms, .. }) = e {
+                            *position_ms = at;
+                        }
+                    }
+                }
+                fx.extend(start);
                 self.mark_context(w);
             }
             LibraryEvent::Lyrics { uri, lyrics } if uri == self.playing_uri => {

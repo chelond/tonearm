@@ -864,6 +864,15 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
                 s.local(PlayerCommand::PlayAt { uri, position_ms });
             }
         }
+        ConnectEvent::HandoffFailed(text) => {
+            // The app switched to "remote" before asking; go back to this computer.
+            s.set_remote(None);
+            s.remote_playing.store(false, Ordering::Relaxed);
+            w.set_remote_name("".into());
+            s.local(PlayerCommand::Resume);
+            w.set_notice(text.into());
+            w.set_notice_is_error(true);
+        }
         ConnectEvent::Error(text) => {
             w.set_devices_loading(false);
             // The preview has no session, so every Connect call fails; keep its screens clean.
@@ -1632,6 +1641,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.player(PlayerCommand::JumpTo(
             usize::try_from(i).unwrap_or(usize::MAX),
         ));
+    });
+    let s = senders.clone();
+    window.on_queue_remove(move |i| {
+        if let Ok(i) = usize::try_from(i) {
+            s.player(PlayerCommand::RemoveFromQueue(i));
+        }
     });
     let s = senders.clone();
     window.on_row_action(move |source, index, action| {

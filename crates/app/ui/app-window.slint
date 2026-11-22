@@ -459,6 +459,7 @@ component QueueLine inherits Rectangle {
     in property <bool> dragging;
     in property <length> drag-dy;
     callback clicked();
+    callback removed();
     callback drag-start();
     callback drag-move(length);
     callback drag-end(length);
@@ -485,6 +486,13 @@ component QueueLine inherits Rectangle {
                 horizontal-stretch: 1;
                 Text { text: root.title; font-size: 14px; font-weight: 600; color: root.playing ? Theme.accent : Theme.text-1; overflow: elide; }
                 if root.artist != "": Text { text: root.artist; font-size: 12px; color: Theme.text-2; overflow: elide; }
+            }
+            // Remove from the queue: shown under the mouse, like the grip.
+            if root.draggable: Rectangle {
+                width: 28px;
+                visible: touch.has-hover || del.has-hover;
+                Icon { name: "close"; size: 16px; ink: del.has-hover ? Theme.text-1 : Theme.text-3; }
+                del := TouchArea { mouse-cursor: pointer; clicked => { root.removed(); } }
             }
             if root.draggable: Rectangle {
                 width: 28px;
@@ -1186,6 +1194,7 @@ export component AppWindow inherits Window {
     callback toggle-shuffle();
     callback cycle-repeat();
     callback queue-jump(int);
+    callback queue-remove(int);
     callback queue-clear();
     callback queue-move(int /* from */, int /* to */);
     // action: 0 queue, 1 go to artist, 2 go to album, 3 like, 4 radio
@@ -1297,7 +1306,8 @@ export component AppWindow inherits Window {
         y: root.menu-y;
         width: 240px;
         MenuPanel {
-            MenuItem { icon: "queue"; text: "В очередь"; clicked => { root.row-action(root.menu-source, root.menu-index, 0); } }
+            MenuItem { icon: "play"; text: "Играть следующим"; clicked => { root.row-action(root.menu-source, root.menu-index, 5); } }
+            MenuItem { icon: "queue"; text: "В конец очереди"; clicked => { root.row-action(root.menu-source, root.menu-index, 0); } }
             MenuItem { icon: "radio"; text: "Радио по треку"; clicked => { root.row-action(root.menu-source, root.menu-index, 4); } }
             MenuItem {
                 icon: "heart";
@@ -2825,6 +2835,7 @@ export component AppWindow inherits Window {
                                 dragging: root.drag-index == i;
                                 drag-dy: root.drag-dy;
                                 clicked => { root.queue-jump(i); }
+                                removed => { root.queue-remove(i); }
                                 drag-start => { root.drag-index = i; root.drag-dy = 0; }
                                 drag-move(dy) => { root.drag-dy = dy; }
                                 drag-end(dy) => {
