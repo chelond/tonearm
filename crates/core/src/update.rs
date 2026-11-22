@@ -158,25 +158,33 @@ fn sibling(exe: &Path, tag: &str) -> PathBuf {
     exe.with_file_name(name)
 }
 
-/// `"v1.2.3"` / `"1.2.3"` → `(1, 2, 3)`; anything with a pre-release suffix is not a version
-/// we offer.
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+/// `"v1.2.3"` / `"1.2.3"` → `(1, 2, 3)`; a pre-release (`1.2.3-beta.1`) gives the same numbers
+/// and `pre = true`.
+fn parse_version(s: &str) -> Option<((u64, u64, u64), bool)> {
     let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
+    // `+build` metadata does not count; `-beta.1` makes it a pre-release.
+    let s = s.split('+').next().unwrap_or(s);
+    let (core, pre) = match s.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (s, false),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().unwrap_or("0").parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch))
+    Some(((major, minor, patch), pre))
 }
 
-/// Whether `candidate` is newer than `current`.
+/// Whether `candidate` is newer than `current`. Pre-releases are never offered, but a copy that
+/// *is* a pre-release gets the final release of the same version (`0.3.0` > `0.3.0-beta.1`).
 #[must_use]
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
-        (Some(a), Some(b)) => a > b,
+        (Some((_, true)), _) => false,
+        (Some((a, false)), Some((b, b_pre))) => a > b || (a == b && b_pre),
         _ => false,
     }
 }
@@ -299,11 +307,45 @@ fn pick(
     }))
 }
 
-/// Checks the release file against the built-in key.
-fn verify(data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, PUBLIC_KEY)
-        .verify(data, signature)
+/// What CI signs: this header, then the file. The version and the file name are part of the
+/// signed message, so a signed file cannot be served as another version (no downgrade to an
+/// older signed build under a newer tag) or as another file (a tarball in place of the exe).
+fn signed_message(version: &str, name: &str, data: &[u8]) -> Vec<u8> {
+    let header = format!("{SIGNATURE_DOMAIN}\n{version}\n{name}\n");
+    let mut msg = Vec::with_capacity(header.len() + data.len());
+    msg.extend_from_slice(header.as_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
+/// First line of every signed message (also in `.github/workflows/ci.yml`).
+const SIGNATURE_DOMAIN: &str = "tonearm-update-v1";
+
+/// Checks the release file against the built-in key, for this version and file name.
+fn verify(version: &str, name: &str, data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
+    verify_with(&PUBLIC_KEY, version, name, data, signature)
+}
+
+fn verify_with(
+    key: &[u8],
+    version: &str,
+    name: &str,
+    data: &[u8],
+    signature: &[u8],
+) -> Result<(), UpdateError> {
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(&signed_message(version, name, data), signature)
         .map_err(|_| UpdateError::BadSignature)
+}
+
+/// The downloaded file is what it should be for this install: an ELF or PE binary, or a
+/// zstd-compressed pacman package. Checked before anything replaces the running program.
+fn looks_installable(kind: InstallKind, data: &[u8]) -> bool {
+    match kind {
+        InstallKind::Pacman => data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]),
+        InstallKind::Binary if cfg!(windows) => data.starts_with(b"MZ"),
+        InstallKind::Binary => data.starts_with(b"\x7fELF"),
+    }
 }
 
 /// Where the download goes: next to the binary (so the final rename stays on one file system)
@@ -451,7 +493,12 @@ async fn fetch_verified(
         }
         progress(data.len() as u64, total);
     }
-    verify(&data, &signature)?;
+    verify(&release.version, &release.asset_name, &data, &signature)?;
+    if !looks_installable(release.kind, &data) {
+        return Err(UpdateError::Install(
+            "файл обновления не похож на программу для этой системы".into(),
+        ));
+    }
     Ok(data)
 }
 
@@ -608,6 +655,52 @@ mod tests {
         assert!(!is_newer("v0.0.9", "0.1.0"));
         assert!(!is_newer("v0.2.0-rc1", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+        // A beta gets the final release of its version, and anything newer.
+        assert!(is_newer("v0.3.0", "0.3.0-beta.1"));
+        assert!(is_newer("v0.3.1", "0.3.0-beta.1"));
+        assert!(!is_newer("v0.2.9", "0.3.0-beta.1"));
+        assert!(
+            !is_newer("v0.3.0-beta.2", "0.3.0-beta.1"),
+            "pre-releases are not offered"
+        );
+        assert!(
+            !is_newer("v0.3.0+build.5", "0.3.0"),
+            "build metadata is not a new version"
+        );
+    }
+
+    #[test]
+    fn signature_covers_version_and_file_name() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key = pair.public_key().as_ref();
+        let data = b"\x7fELF old but signed";
+        let sig = pair.sign(&signed_message("0.2.0", "tonearm-linux-x86_64", data));
+        let ok = |v, n| verify_with(key, v, n, data, sig.as_ref()).is_ok();
+        assert!(ok("0.2.0", "tonearm-linux-x86_64"));
+        assert!(
+            !ok("99.0.0", "tonearm-linux-x86_64"),
+            "an old build under a new tag"
+        );
+        assert!(!ok("0.2.0", "tonearm-windows-x86_64.exe"), "another file");
+    }
+
+    #[test]
+    fn only_a_program_replaces_the_program() {
+        assert!(looks_installable(
+            InstallKind::Pacman,
+            &[0x28, 0xb5, 0x2f, 0xfd, 0]
+        ));
+        assert!(!looks_installable(InstallKind::Pacman, b"\x1f\x8b tarball"));
+        let exe: &[u8] = if cfg!(windows) {
+            b"MZ\x90"
+        } else {
+            b"\x7fELF\x02"
+        };
+        assert!(looks_installable(InstallKind::Binary, exe));
+        assert!(!looks_installable(InstallKind::Binary, b"PK\x03\x04 zip"));
     }
 
     #[test]
@@ -664,7 +757,7 @@ mod tests {
     #[test]
     fn rejects_unsigned_data() {
         assert!(matches!(
-            verify(b"hello", &[0u8; 64]),
+            verify("0.3.0", "tonearm-linux-x86_64", b"hello", &[0u8; 64]),
             Err(UpdateError::BadSignature)
         ));
     }

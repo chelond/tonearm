@@ -153,11 +153,18 @@ jobs:
           umask 077
           key="$RUNNER_TEMP/update-key.pem"
           printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          ver="${GITHUB_REF_NAME#v}"
+          msg="$RUNNER_TEMP/signed-message"
+          # The signed message is "tonearm-update-v1\n<version>\n<file name>\n" + the file
+          # (crates/core/src/update.rs, signed_message): a signature is only valid for this
+          # version and this file name, so old builds cannot be re-served as new ones.
           for f in dist/*; do
-            openssl pkeyutl -sign -inkey "$key" -rawin -in "$f" -out "$f.sig"
+            printf 'tonearm-update-v1\n%s\n%s\n' "$ver" "$(basename "$f")" > "$msg"
+            cat "$f" >> "$msg"
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$msg" -out "$f.sig"
             test "$(stat -c %s "$f.sig")" = 64
           done
-          rm -f "$key"
+          rm -f "$key" "$msg"
           ls -l dist
       # Release notes: the section of CHANGELOG.md for this version.
       - name: Release notes
