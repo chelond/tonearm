@@ -1582,6 +1582,21 @@ impl UiState {
         fx
     }
 
+    /// The player starts a track from the top. For the track already in the deck (repeat-one,
+    /// played again) that is a new listen: the previous one goes to the history and Last.fm, and
+    /// the count starts over. Another track is handled by [`UiState::on_track`].
+    pub fn on_started(&mut self, w: &AppWindow, uri: &str) -> Vec<Effect> {
+        if uri.is_empty() || uri != self.playing_uri {
+            return Vec::new();
+        }
+        let mut fx = self.finish_listen(w);
+        self.listened_ms = 0;
+        self.started_at = history::now();
+        self.np_sent.clear(); // Last.fm "now playing" again for the new listen
+        fx.extend(self.now_playing());
+        fx
+    }
+
     pub fn on_track(&mut self, w: &AppWindow, track: &TrackInfo) -> Vec<Effect> {
         // The same track again with more details (Soloist fills them in later): merge, keep
         // the listening time and the lyrics.

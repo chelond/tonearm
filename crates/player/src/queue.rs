@@ -386,4 +386,54 @@ mod tests {
         assert_eq!(q.snapshot(10).manual, 0);
         assert_eq!(uri(q.next(true)), "4");
     }
+
+    #[test]
+    fn empty_queue_never_panics() {
+        let mut q = Queue::default();
+        assert!(q.current().is_none());
+        assert!(q.peek_next(true).is_none());
+        assert!(q.next(true).is_none());
+        assert!(q.prev().is_none());
+        assert!(q.jump(3).is_none());
+        q.move_upcoming(0, 5);
+        q.move_upcoming(5, 0);
+        q.set_shuffle(true);
+        q.set_repeat(RepeatMode::All);
+        assert!(q.next(false).is_none());
+        q.set_context(Vec::new(), 7, "пусто".into());
+        assert!(q.current().is_none());
+        assert!(q.snapshot(10).upcoming.is_empty());
+    }
+
+    #[test]
+    fn only_hand_queued_tracks() {
+        let mut q = Queue::default();
+        for i in 0..3 {
+            q.add(QueueItem {
+                uri: format!("spotify:track:m{i}"),
+                ..QueueItem::default()
+            });
+        }
+        q.move_upcoming(2, 0);
+        q.move_upcoming(0, 99); // past the end of the hand-queued part: lands at its end
+        assert_eq!(uri(q.next(true)), "m0");
+        assert_eq!(uri(q.next(true)), "m1");
+        assert_eq!(uri(q.next(true)), "m2");
+        assert_eq!(uri(q.next(true)), "-");
+    }
+
+    #[test]
+    fn start_past_the_end_is_clamped() {
+        let mut q = Queue::default();
+        q.set_context(items(3), 99, "P".into());
+        assert_eq!(uri(q.current().cloned()), "2");
+        q.set_shuffle(true);
+        assert_eq!(
+            uri(q.current().cloned()),
+            "2",
+            "shuffle keeps the current track"
+        );
+        q.set_shuffle(false);
+        assert_eq!(uri(q.current().cloned()), "2");
+    }
 }

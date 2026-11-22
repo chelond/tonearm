@@ -72,13 +72,13 @@ pub fn init(
     let pos = Arc::clone(&position);
     let handler = move |event: MediaControlEvent| {
         let cmd = match event {
-            MediaControlEvent::Play | MediaControlEvent::Pause | MediaControlEvent::Toggle => {
-                // The player only knows "toggle"; Play while playing is rare and harmless to skip.
-                Some(PlayerCommand::TogglePlay)
-            }
+            // Lock screens, KDE Connect during a call and `playerctl pause` send Pause even when
+            // nothing plays: that must never start the music.
+            MediaControlEvent::Play => Some(PlayerCommand::Resume),
+            MediaControlEvent::Pause | MediaControlEvent::Stop => Some(PlayerCommand::Pause),
+            MediaControlEvent::Toggle => Some(PlayerCommand::TogglePlay),
             MediaControlEvent::Next => Some(PlayerCommand::Next),
             MediaControlEvent::Previous => Some(PlayerCommand::Prev),
-            MediaControlEvent::Stop => Some(PlayerCommand::TogglePlay),
             MediaControlEvent::Seek(dir) => Some(seek_by(&pos, dir, SEEK_STEP)),
             MediaControlEvent::SeekBy(dir, by) => Some(seek_by(&pos, dir, by)),
             MediaControlEvent::SetPosition(MediaPosition(p)) => Some(PlayerCommand::Seek {

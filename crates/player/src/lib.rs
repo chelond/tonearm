@@ -54,6 +54,8 @@ pub enum PlayerCommand {
         position_ms: u32,
     },
     TogglePlay,
+    /// Play if paused or stopped; nothing if already playing (MPRIS/SMTC "Play").
+    Resume,
     /// Seek to a position in the current track.
     Seek {
         position_ms: u32,
@@ -131,6 +133,9 @@ pub enum PlayerEvent {
         position_ms: u32,
     },
     Track(TrackInfo),
+    /// A track starts from its beginning (also the same track again: repeat-one, replay).
+    /// Not sent when playback continues mid-track (resume, hand-off back from a device).
+    Started(String),
     /// Volume in percent, 0..=100.
     Volume(u8),
     Queue(QueueSnapshot),

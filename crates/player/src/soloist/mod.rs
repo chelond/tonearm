@@ -116,13 +116,44 @@ impl Handle {
         let _ = self.tx.send(Ctl::Command(command));
     }
 
+    /// A handle without a Soloist behind it, for tests: the commands sent to it come out of the
+    /// returned receiver.
+    #[cfg(test)]
+    pub(crate) fn fake(config: SoloistConfig) -> (Self, mpsc::UnboundedReceiver<Value>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Ctl>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(ctl) = rx.recv().await {
+                match ctl {
+                    Ctl::Command(v) => {
+                        let _ = out_tx.send(v);
+                    }
+                    Ctl::Pair => {}
+                    Ctl::Stop => return,
+                }
+            }
+        });
+        (Self { tx, task, config }, out_rx)
+    }
+
     pub fn pair(&self) {
         let _ = self.tx.send(Ctl::Pair);
     }
 
+    /// Stops the supervisor and its Soloist. A supervisor that does not finish in time (stuck in
+    /// a download, say) is aborted, which kills the child (`kill_on_drop`): a second supervisor
+    /// started right after must never meet a living first one.
     pub async fn stop(self) {
         let _ = self.tx.send(Ctl::Stop);
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("soloist supervisor did not stop in time, aborting it");
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -138,9 +169,10 @@ async fn supervise(
     };
     let mut restarts = 0usize;
     loop {
-        let build = match ensure_build(&cfg, &events).await {
-            Ok(b) => b,
-            Err(e) => {
+        let build = match until_stopped(ensure_build(&cfg, &events), &mut ctl).await {
+            None => return,
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
                 status(SoloistStatus::Failed(e.to_string()));
                 if !wait_for_retry(&mut ctl).await {
                     return;
@@ -199,12 +231,17 @@ async fn supervise(
             version: build.version.clone(),
             days_left: build.days_left(install::now()),
         };
+        let started = std::time::Instant::now();
         match run(spawned, &cfg, ready, &sessions, &events, &mut ctl).await {
             Outcome::Stopped => return,
             Outcome::Expired => {
                 let _ = tokio::fs::remove_file(cfg.root.join("current.json")).await;
             }
             Outcome::Crashed(message) => {
+                // Crashes days apart are not a crash loop: only quick ones use up the retries.
+                if started.elapsed() >= STABLE_RUN {
+                    restarts = 0;
+                }
                 let Some(&delay) = RESTARTS.get(restarts) else {
                     status(SoloistStatus::Failed(message));
                     restarts = 0;
@@ -217,8 +254,35 @@ async fn supervise(
                 status(SoloistStatus::Failed(format!(
                     "{message}. Перезапускаю через {delay} с…"
                 )));
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                // Stopping must work during the wait too.
+                if until_stopped(tokio::time::sleep(Duration::from_secs(delay)), &mut ctl)
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
             }
+        }
+    }
+}
+
+/// A run of Soloist this long before a crash counts as healthy: the restart budget starts over.
+const STABLE_RUN: Duration = Duration::from_secs(10 * 60);
+
+/// Runs `work` unless a stop comes first (`None`). Other control messages meanwhile are dropped:
+/// there is no Soloist to send commands to yet, and pairing happens once it runs.
+async fn until_stopped<T>(
+    work: impl std::future::Future<Output = T>,
+    ctl: &mut mpsc::UnboundedReceiver<Ctl>,
+) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            out = &mut work => return Some(out),
+            msg = ctl.recv() => match msg {
+                Some(Ctl::Stop) | None => return None,
+                Some(_) => {}
+            },
         }
     }
 }
@@ -289,11 +353,14 @@ async fn run(
         return Outcome::Crashed("Soloist не отвечает по WebSocket".into());
     };
     // Err((true, _)): Soloist took the account but did not log in; the next way may work.
-    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<Result<(), (bool, String)>>();
+    // Results are tagged with the round they belong to: "Повторить" starts a new round, and a
+    // late answer or timer of the previous one must not start a second, parallel sign-in.
+    let (pair_tx, mut pair_rx) = mpsc::unbounded_channel::<(u64, Result<(), (bool, String)>)>();
+    let mut round = 0u64;
     // Sign-in attempts made: 1 = stored credentials, 2 = access token.
     let mut attempts = 0usize;
     let mut logged_in = false;
-    let start_pairing = |attempts: &mut usize| {
+    let start_pairing = |attempts: &mut usize, round: u64| {
         let way = *attempts;
         *attempts += 1;
         let session = sessions.borrow().clone();
@@ -306,7 +373,7 @@ async fn run(
                     .unwrap_or_else(|_| Err("нет ответа за 45 секунд".into())),
                 None => Err("сначала войдите в аккаунт".into()),
             };
-            let _ = tx.send(result.map_err(|e| (false, e)));
+            let _ = tx.send((round, result.map_err(|e| (false, e))));
         });
     };
     loop {
@@ -338,7 +405,7 @@ async fn run(
                             let _ = send(&mut socket, json!({"command": "get_state"})).await;
                         } else if attempts == 0 {
                             status(SoloistStatus::Pairing);
-                            start_pairing(&mut attempts);
+                            start_pairing(&mut attempts, round);
                         }
                     }
                     "error" => {
@@ -357,7 +424,10 @@ async fn run(
                     }
                 }
             }
-            Some(result) = pair_rx.recv() => {
+            Some((of_round, result)) = pair_rx.recv() => {
+                if of_round != round {
+                    continue; // left over from an earlier round
+                }
                 match result {
                     Ok(()) => {
                         tracing::info!("soloist accepted the account from tonearm");
@@ -365,14 +435,15 @@ async fn run(
                         // spinning forever.
                         let _ = send(&mut socket, json!({"command": "get_auth_state"})).await;
                         let tx = pair_tx.clone();
+                        let this_round = round;
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_secs(20)).await;
-                            let _ = tx.send(Err((true, "Soloist принял данные, но не вошёл".into())));
+                            let _ = tx.send((this_round, Err((true, "Soloist принял данные, но не вошёл".into()))));
                         });
                     }
                     Err((true, _)) if !logged_in && attempts < PAIR_WAYS => {
                         tracing::warn!(attempts, "soloist did not log in, trying the next way");
-                        start_pairing(&mut attempts);
+                        start_pairing(&mut attempts, round);
                     }
                     Err((_, reason)) if !logged_in => {
                         tracing::warn!(reason, "automatic soloist sign-in failed");
@@ -392,8 +463,9 @@ async fn run(
                 Some(Ctl::Pair) => {
                     if !logged_in {
                         status(SoloistStatus::Pairing);
+                        round += 1;
                         attempts = 0;
-                        start_pairing(&mut attempts);
+                        start_pairing(&mut attempts, round);
                     }
                 }
                 Some(Ctl::Stop) | None => {

@@ -121,6 +121,33 @@ fn install_panic_hook() {
     }));
 }
 
+/// Runs one of the background services. If it panics, the rest of the app keeps going, so the
+/// user is told instead of seeing buttons that silently do nothing (the panic itself is logged
+/// by the panic hook, with a backtrace).
+fn watched(
+    rt: &tokio::runtime::Runtime,
+    name: &'static str,
+    window: &slint::Weak<AppWindow>,
+    service: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let inner = rt.spawn(service);
+    let window = window.clone();
+    rt.spawn(async move {
+        if let Err(e) = inner.await
+            && e.is_panic()
+        {
+            tracing::error!(service = name, "background service crashed");
+            let _ = window.upgrade_in_event_loop(move |w| {
+                w.set_notice(
+                    format!("Сбой: {name} перестал работать. Перезапустите Tonearm, а в журнале tonearm.log есть подробности.")
+                        .into(),
+                );
+                w.set_notice_is_error(true);
+            });
+        }
+    })
+}
+
 /// Keyring entry of the user's own Soloist key (from developer.spotify.com).
 const SOLOIST_KEY: &str = "soloist-api-key";
 
@@ -360,6 +387,7 @@ impl Senders {
                         }
                     }
                     PlayerCommand::Pause => ConnectCommand::Control(RemoteAction::Pause),
+                    PlayerCommand::Resume => ConnectCommand::Control(RemoteAction::Play),
                     PlayerCommand::Next => ConnectCommand::Control(RemoteAction::Next),
                     PlayerCommand::Prev => ConnectCommand::Control(RemoteAction::Prev),
                     PlayerCommand::Seek { position_ms } => {
@@ -392,9 +420,22 @@ impl Senders {
         self.local(cmd);
     }
 
+    /// Sends to the local player. While it is busy, a newer volume or seek replaces an older
+    /// one anyway, so those may be dropped; anything else (pause, next, a track to play) is
+    /// delivered as soon as there is room.
     fn local(&self, cmd: PlayerCommand) {
-        if self.player.try_send(cmd).is_err() {
-            tracing::debug!("player busy, command dropped");
+        match self.player.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(
+                PlayerCommand::SetVolume(_) | PlayerCommand::Seek { .. },
+            )) => tracing::debug!("player busy, volume/seek dropped"),
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                let tx = self.player.clone();
+                self.rt.spawn(async move {
+                    let _ = tx.send(cmd).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -692,7 +733,12 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
 fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
     // While a Connect device plays, the deck shows that device, not the paused local player.
     let remote = s.remote.lock().ok().is_some_and(|r| r.is_some());
-    if remote && matches!(event, PlayerEvent::State { .. } | PlayerEvent::Track(_)) {
+    if remote
+        && matches!(
+            event,
+            PlayerEvent::State { .. } | PlayerEvent::Track(_) | PlayerEvent::Started(_)
+        )
+    {
         return;
     }
     match event {
@@ -704,6 +750,10 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             lyrics_kick(w);
         }
         PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
+        PlayerEvent::Started(uri) => {
+            let fx = ui_state::with(|st| st.on_started(w, &uri));
+            s.run(fx);
+        }
         PlayerEvent::Track(track) => {
             os_media::on_track(&track, window_focused(w), s.notifications());
             let fx = ui_state::with(|st| st.on_track(w, &track));
@@ -1669,20 +1719,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let backend = runtime.spawn(tonearm_core::run_backend(cmd_rx, ev_tx, session_tx));
-    let player = runtime.spawn(tonearm_player::run(pcmd_rx, pev_tx, session_rx.clone()));
-    let library = runtime.spawn(tonearm_core::library::run(
-        lcmd_rx,
-        lev_tx,
-        session_rx.clone(),
-    ));
-    let connect = runtime.spawn(tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx));
-    let lastfm = runtime.spawn(tonearm_core::lastfm::run(
-        settings.lastfm.clone(),
-        tonearm_core::system_store(),
-        fcmd_rx,
-        fev_tx,
-    ));
+    let ui = window.as_weak();
+    let backend = watched(
+        &runtime,
+        "вход",
+        &ui,
+        tonearm_core::run_backend(cmd_rx, ev_tx, session_tx),
+    );
+    let player = watched(
+        &runtime,
+        "плеер",
+        &ui,
+        tonearm_player::run(pcmd_rx, pev_tx, session_rx.clone()),
+    );
+    let library = watched(
+        &runtime,
+        "медиатека",
+        &ui,
+        tonearm_core::library::run(lcmd_rx, lev_tx, session_rx.clone()),
+    );
+    let connect = watched(
+        &runtime,
+        "Spotify Connect",
+        &ui,
+        tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx),
+    );
+    let lastfm = watched(
+        &runtime,
+        "Last.fm",
+        &ui,
+        tonearm_core::lastfm::run(
+            settings.lastfm.clone(),
+            tonearm_core::system_store(),
+            fcmd_rx,
+            fev_tx,
+        ),
+    );
     forward(
         &runtime,
         fev_rx,
@@ -1817,13 +1889,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(window);
     drop(senders);
     drop(tick);
+    // All services wind down at the same time; together they get two seconds, not two each.
     runtime.block_on(async {
-        let wait = Duration::from_secs(2);
-        let _ = tokio::time::timeout(wait, backend).await;
-        let _ = tokio::time::timeout(wait, player).await;
-        let _ = tokio::time::timeout(wait, library).await;
-        let _ = tokio::time::timeout(wait, connect).await;
-        let _ = tokio::time::timeout(wait, lastfm).await;
+        let all = async {
+            let _ = tokio::join!(backend, player, library, connect, lastfm);
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), all).await;
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     if updater.restart_requested() {

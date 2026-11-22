@@ -153,7 +153,7 @@ mod capture {
             node: &str,
             mut on_frame: impl FnMut(Frame) + Send + 'static,
         ) -> std::io::Result<Self> {
-            let mut child = Command::new("pw-record")
+            let child = Command::new("pw-record")
                 .args(["--target", node, "-P"])
                 .arg("{ stream.capture.sink = true node.name = tonearm_visualizer media.role = Music }")
                 .args(["--rate", &RATE.to_string(), "--channels", "1", "--format", "f32"])
@@ -162,7 +162,10 @@ mod capture {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()?;
-            let mut stdout = child
+            // From here on `Capture` owns the child, so every early return below kills it.
+            let mut capture = Self { child };
+            let mut stdout = capture
+                .child
                 .stdout
                 .take()
                 .ok_or_else(|| std::io::Error::other("no pw-record output"))?;
@@ -180,7 +183,7 @@ mod capture {
                         on_frame(analyzer.frame(&samples));
                     }
                 })?;
-            Ok(Self { child })
+            Ok(capture)
         }
     }
 

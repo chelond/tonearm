@@ -280,8 +280,12 @@ impl Service {
             self.ls_events = None;
         }
         if self.audio_failed {
-            // Retry the audio device: build a fresh player.
-            self.player = None;
+            // Retry the audio device: build a fresh player. Dropping the old one joins
+            // librespot's thread, which must not block this async worker.
+            if let Some(old) = self.player.take() {
+                old.stop();
+                std::thread::spawn(move || drop(old));
+            }
             self.ls_events = None;
             self.audio_failed = false;
         }
@@ -310,6 +314,12 @@ impl Service {
     }
 
     async fn handle_command(&mut self, cmd: PlayerCommand) {
+        // "Play" from the OS is a toggle that never pauses.
+        let cmd = match cmd {
+            PlayerCommand::Resume if self.state == PlaybackState::Playing => return,
+            PlayerCommand::Resume => PlayerCommand::TogglePlay,
+            cmd => cmd,
+        };
         match cmd {
             PlayerCommand::Load(input) => match uri::parse_playable(&input) {
                 Ok(u) => {
@@ -460,6 +470,7 @@ impl Service {
                 self.configure_soloist(config).await;
             }
             PlayerCommand::Effects(options) => self.set_effects(options).await,
+            PlayerCommand::Resume => unreachable!("mapped to TogglePlay above"),
             PlayerCommand::SoloistRetry => {
                 if let Some(h) = &self.solo.handle {
                     h.pair();
@@ -510,6 +521,9 @@ impl Service {
     }
 
     async fn play_item_at(&mut self, item: &QueueItem, position_ms: u32) {
+        if position_ms == 0 {
+            self.emit(PlayerEvent::Started(item.uri.clone())).await;
+        }
         if self.solo.handle.is_some() {
             return self.solo_play(item, position_ms).await;
         }
@@ -1107,8 +1121,11 @@ impl Service {
                 match crate::effects::spectrum::Capture::start(
                     crate::effects::pipewire::NODE,
                     move |frame| {
-                        // A busy UI drops frames instead of queueing them.
-                        let _ = events.try_send(PlayerEvent::Spectrum(frame));
+                        // A busy UI drops frames instead of queueing them, and frames never
+                        // take the last free slots: state and track events must get through.
+                        if events.capacity() > events.max_capacity() / 2 {
+                            let _ = events.try_send(PlayerEvent::Spectrum(frame));
+                        }
                     },
                 ) {
                     Ok(c) => self.fx.capture = Some(c),
@@ -1119,5 +1136,288 @@ impl Service {
                     .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The Soloist side of the service: it only sees Soloist's reports (there is no API to ask
+    //! "what is next"), so these heuristics decide when Tonearm's queue moves on.
+
+    use super::*;
+    use crate::soloist::{Event as SoloEvent, Snapshot};
+    use serde_json::Value;
+
+    struct Rig {
+        svc: Service,
+        events: mpsc::Receiver<PlayerEvent>,
+        sent: mpsc::UnboundedReceiver<Value>,
+    }
+
+    fn item(n: u32) -> QueueItem {
+        QueueItem {
+            uri: format!("spotify:track:{n}"),
+            title: format!("Трек {n}"),
+            artists: "Исполнитель".into(),
+            duration_ms: 200_000,
+            cover_url: None,
+        }
+    }
+
+    fn info(n: u32) -> TrackInfo {
+        TrackInfo {
+            uri: format!("spotify:track:{n}"),
+            title: format!("Трек {n}"),
+            artists: "Исполнитель".into(),
+            album: "Альбом".into(),
+            duration_ms: 200_000,
+            cover_url: None,
+        }
+    }
+
+    fn rig() -> Rig {
+        let (events_tx, events) = mpsc::channel(1024);
+        let (_sessions_tx, sessions) = watch::channel(None);
+        let (no_device_tx, _) = mpsc::unbounded_channel();
+        let mixer = mixer::find(None).expect("soft mixer")(MixerConfig::default()).expect("mixer");
+        let (handle, sent) = soloist::Handle::fake(soloist::SoloistConfig {
+            api_key: "k".into(),
+            root: std::env::temp_dir(),
+            cache_dir: std::env::temp_dir(),
+            device_name: "Tonearm".into(),
+            pipewire_device: None,
+        });
+        let svc = Service {
+            events: events_tx,
+            mixer,
+            session: None,
+            player: None,
+            ls_events: None,
+            no_device_tx,
+            audio_failed: false,
+            request_id: None,
+            state: PlaybackState::Stopped,
+            position_ms: 0,
+            current_uri: None,
+            queue: Queue::default(),
+            options: AudioOptions::default(),
+            rebuild: false,
+            skips: 0,
+            volume: DEFAULT_VOLUME_PERCENT,
+            sessions,
+            solo: Solo {
+                handle: Some(handle),
+                ready: true,
+                active: true,
+                ..Solo::default()
+            },
+            fx: Fx::default(),
+        };
+        Rig { svc, events, sent }
+    }
+
+    impl Rig {
+        async fn play_context(&mut self, n: u32, start: usize) {
+            self.svc
+                .handle_command(PlayerCommand::PlayContext {
+                    items: (0..n).map(item).collect(),
+                    start,
+                    name: "Плейлист".into(),
+                    shuffle: None,
+                    position_ms: 0,
+                })
+                .await;
+        }
+
+        /// Soloist confirms the track we asked for and plays it.
+        async fn soloist_plays(&mut self, n: u32, position_ms: u32) {
+            self.svc
+                .handle_solo_event(SoloEvent::Snapshot(Snapshot {
+                    status: "playing".into(),
+                    track: Some(info(n)),
+                    position_ms,
+                    volume: None,
+                    active: true,
+                }))
+                .await;
+        }
+
+        fn played_uris(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(v) = self.sent.try_recv() {
+                if v["command"] == "play"
+                    && let Some(u) = v["uri"].as_str()
+                {
+                    out.push(u.to_owned());
+                }
+            }
+            out
+        }
+
+        fn commands(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(v) = self.sent.try_recv() {
+                out.push(v["command"].as_str().unwrap_or("").to_owned());
+            }
+            out
+        }
+
+        fn drain_events(&mut self) -> Vec<PlayerEvent> {
+            let mut out = Vec::new();
+            while let Ok(e) = self.events.try_recv() {
+                out.push(e);
+            }
+            out
+        }
+    }
+
+    async fn settle() {
+        // The fake handle forwards commands on its own task.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn plays_the_picked_track_and_shows_it() {
+        let mut r = rig();
+        r.play_context(3, 1).await;
+        settle().await;
+        assert_eq!(r.played_uris(), vec!["spotify:track:1"]);
+        r.soloist_plays(1, 0).await;
+        assert_eq!(r.svc.state, PlaybackState::Playing);
+        assert_eq!(r.svc.solo.playing_uri.as_deref(), Some("spotify:track:1"));
+        let ev = r.drain_events();
+        assert!(ev.contains(&PlayerEvent::Started("spotify:track:1".into())));
+    }
+
+    #[tokio::test]
+    async fn stale_reports_of_the_old_track_do_not_skip_the_new_one() {
+        let mut r = rig();
+        r.play_context(3, 0).await;
+        r.soloist_plays(0, 1_000).await;
+        r.svc.handle_command(PlayerCommand::Next).await;
+        settle().await;
+        let _ = r.played_uris();
+        // Soloist still talks about track 0 for a moment after our "play 1".
+        r.soloist_plays(0, 2_000).await;
+        settle().await;
+        assert!(r.played_uris().is_empty(), "no extra skip");
+        assert_eq!(
+            r.svc.solo.awaiting.as_ref().map(|a| a.0.as_str()),
+            Some("spotify:track:1")
+        );
+        r.soloist_plays(1, 0).await;
+        assert!(r.svc.solo.awaiting.is_none());
+        assert_eq!(
+            r.svc.queue.current().map(|i| i.uri.as_str()),
+            Some("spotify:track:1")
+        );
+    }
+
+    #[tokio::test]
+    async fn soloist_moving_on_by_itself_continues_with_our_queue() {
+        let mut r = rig();
+        r.play_context(3, 0).await;
+        r.soloist_plays(0, 0).await;
+        settle().await;
+        let _ = r.played_uris();
+        // A track we did not ask for (Soloist's own autoplay).
+        r.soloist_plays(42, 0).await;
+        settle().await;
+        assert_eq!(r.played_uris(), vec!["spotify:track:1"]);
+    }
+
+    #[tokio::test]
+    async fn a_loop_back_to_the_start_counts_as_the_end() {
+        let mut r = rig();
+        r.play_context(2, 0).await;
+        r.soloist_plays(0, 0).await;
+        r.svc.position_ms = 198_000;
+        settle().await;
+        let _ = r.played_uris();
+        r.svc.handle_solo_event(SoloEvent::Position(500)).await;
+        settle().await;
+        assert_eq!(r.played_uris(), vec!["spotify:track:1"]);
+    }
+
+    #[tokio::test]
+    async fn idle_at_the_end_of_the_queue_stops() {
+        let mut r = rig();
+        r.play_context(1, 0).await;
+        r.soloist_plays(0, 0).await;
+        r.svc
+            .handle_solo_event(SoloEvent::Playing("idle".into()))
+            .await;
+        settle().await;
+        assert_eq!(r.svc.state, PlaybackState::Stopped);
+        assert!(r.svc.solo.playing_uri.is_none());
+        assert!(r.commands().contains(&"pause".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn repeat_one_starts_the_same_track_again_as_a_new_listen() {
+        let mut r = rig();
+        r.play_context(2, 0).await;
+        r.soloist_plays(0, 0).await;
+        r.svc.handle_command(PlayerCommand::CycleRepeat).await; // All
+        r.svc.handle_command(PlayerCommand::CycleRepeat).await; // One
+        let _ = r.drain_events();
+        r.svc
+            .handle_solo_event(SoloEvent::Playing("idle".into()))
+            .await;
+        let started: Vec<_> = r
+            .drain_events()
+            .into_iter()
+            .filter(|e| matches!(e, PlayerEvent::Started(_)))
+            .collect();
+        assert_eq!(
+            started,
+            vec![PlayerEvent::Started("spotify:track:0".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn os_play_and_pause_are_not_toggles() {
+        let mut r = rig();
+        r.play_context(1, 0).await;
+        r.soloist_plays(0, 0).await;
+        settle().await;
+        let _ = r.commands();
+        // "Play" while playing: nothing.
+        r.svc.handle_command(PlayerCommand::Resume).await;
+        settle().await;
+        assert!(r.commands().is_empty());
+        r.svc.handle_command(PlayerCommand::Pause).await;
+        settle().await;
+        assert_eq!(r.commands(), vec!["pause"]);
+        assert_eq!(r.svc.state, PlaybackState::Paused);
+        // "Pause" while paused: nothing (a lock screen must not start the music).
+        r.svc.handle_command(PlayerCommand::Pause).await;
+        settle().await;
+        assert!(r.commands().is_empty());
+        r.svc.handle_command(PlayerCommand::Resume).await;
+        settle().await;
+        assert_eq!(r.commands(), vec!["play"]);
+        assert_eq!(r.svc.state, PlaybackState::Playing);
+    }
+
+    #[tokio::test]
+    async fn a_resume_mid_track_is_not_a_new_listen() {
+        let mut r = rig();
+        r.svc
+            .handle_command(PlayerCommand::PlayContext {
+                items: vec![item(0)],
+                start: 0,
+                name: String::new(),
+                shuffle: None,
+                position_ms: 90_000,
+            })
+            .await;
+        let started = r
+            .drain_events()
+            .into_iter()
+            .any(|e| matches!(e, PlayerEvent::Started(_)));
+        assert!(!started);
     }
 }
