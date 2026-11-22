@@ -1342,12 +1342,15 @@ impl UiState {
     }
 
     pub fn on_cover(&mut self, w: &AppWindow, target: &CoverTarget, cover: &Cover) {
+        // Converted at most once (a cover often fills many rows); `Image` clones share pixels.
+        let image = std::cell::OnceCell::new();
+        let img = || image.get_or_init(|| to_image(cover)).clone();
         let set_tiles = |model: &VecModel<TileData>, uri: &str| {
             for i in 0..model.row_count_() {
                 if let Some(mut row) = model.row(i)
                     && row.uri.as_str() == uri
                 {
-                    row.image = to_image(cover);
+                    row.image = img();
                     row.has_image = true;
                     model.set_row(i, row);
                 }
@@ -1358,7 +1361,7 @@ impl UiState {
                 if *u == uri
                     && let Some(mut row) = model.row(i)
                 {
-                    row.image = to_image(cover);
+                    row.image = img();
                     row.has_image = true;
                     model.set_row(i, row);
                 }
@@ -1372,14 +1375,14 @@ impl UiState {
                     if let Some(mut row) = self.playlist_rows.row(i)
                         && row.uri.as_str() == uri
                     {
-                        row.image = to_image(cover);
+                        row.image = img();
                         row.has_image = true;
                         self.playlist_rows.set_row(i, row);
                     }
                 }
             }
             CoverTarget::Page(id) if *id == self.page_id => {
-                w.set_page_image(to_image(cover));
+                w.set_page_image(img());
                 w.set_page_has_image(true);
                 self.page_rgb = Some(cover.accent);
                 Theme::get(w).set_page_accent(self.tint(cover.accent));
@@ -1395,7 +1398,7 @@ impl UiState {
                 }
                 let mut best = w.get_search_best();
                 if best.uri.as_str() == uri {
-                    best.image = to_image(cover);
+                    best.image = img();
                     best.has_image = true;
                     w.set_search_best(best);
                 }
@@ -1421,15 +1424,15 @@ impl UiState {
                     if self.top_items.get(i).and_then(|e| e.image_url.as_deref()) == Some(url)
                         && let Some(mut row) = self.stat_track_rows.row(i)
                     {
-                        row.image = to_image(cover);
+                        row.image = img();
                         row.has_image = true;
                         self.stat_track_rows.set_row(i, row);
                     }
                 }
             }
-            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &to_image(cover)),
+            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &img()),
             CoverTarget::Deck(uri) if *uri == self.playing_uri => {
-                w.set_track_image(to_image(cover));
+                w.set_track_image(img());
                 w.set_track_backdrop(backdrop(cover));
                 w.set_track_has_image(true);
                 self.cover_rgb = Some(cover.accent);
