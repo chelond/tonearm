@@ -378,6 +378,11 @@ impl Service {
                 self.queue.set_shuffle(on);
                 self.emit_queue().await;
             }
+            PlayerCommand::SetModes { shuffle, repeat } => {
+                self.queue.set_shuffle(shuffle);
+                self.queue.set_repeat(repeat);
+                self.emit_queue().await;
+            }
             PlayerCommand::CycleRepeat => {
                 self.queue.set_repeat(self.queue.repeat().next());
                 self.emit_queue().await;

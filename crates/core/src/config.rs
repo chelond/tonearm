@@ -41,12 +41,27 @@ impl Default for LastFmSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlayerSettings {
     /// Play through Spotify Soloist instead of the built-in librespot player. The Soloist key
     /// itself lives in the keyring (`soloist-api-key`), never here.
     pub soloist: bool,
+    /// Kept from the last session: volume in percent, shuffle, repeat (0 off, 1 all, 2 one).
+    pub volume: u8,
+    pub shuffle: bool,
+    pub repeat: u8,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self {
+            soloist: false,
+            volume: 70,
+            shuffle: false,
+            repeat: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

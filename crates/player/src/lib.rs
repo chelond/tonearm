@@ -30,6 +30,11 @@ pub enum PlayerCommand {
     /// Restarts the track if it has played for more than 3 s, otherwise goes back.
     Prev,
     ToggleShuffle,
+    /// Shuffle and repeat as they were in the last session.
+    SetModes {
+        shuffle: bool,
+        repeat: RepeatMode,
+    },
     /// Off → All → One → Off.
     CycleRepeat,
     /// "Добавить в очередь": plays after the current track, before the context continues.

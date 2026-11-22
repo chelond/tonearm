@@ -26,7 +26,9 @@ use tonearm_core::lastfm::{LastFmCommand, LastFmEvent};
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
 use tonearm_player::effects::{self, EffectsOptions};
-use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
+use tonearm_player::{
+    AudioOptions, PlayerCommand, PlayerEvent, RepeatMode, SoloistConfig, SoloistStatus,
+};
 use ui_state::{CoverTarget, Effect, UiState};
 
 slint::include_modules!();
@@ -282,6 +284,24 @@ impl Senders {
             return; // sample data: never touch the real config
         }
         new.save_later();
+    }
+
+    /// Keeps volume/shuffle/repeat for the next start; saved only when they change.
+    fn remember_player(&self, change: impl FnOnce(&mut tonearm_core::config::PlayerSettings)) {
+        let Ok(mut current) = self.settings.lock() else {
+            return;
+        };
+        let mut player = current.player.clone();
+        change(&mut player);
+        if player == current.player {
+            return;
+        }
+        current.player = player;
+        let snapshot = current.clone();
+        drop(current);
+        if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+            snapshot.save_later();
+        }
     }
 
     /// Starts Soloist with the saved key, or asks for one.
@@ -751,7 +771,18 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             ui_state::with(|st| st.position_changed(w));
             lyrics_kick(w);
         }
-        PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
+        PlayerEvent::Queue(q) => {
+            ui_state::with(|st| st.on_queue(w, &q));
+            let repeat = match q.repeat {
+                RepeatMode::Off => 0,
+                RepeatMode::All => 1,
+                RepeatMode::One => 2,
+            };
+            s.remember_player(|p| {
+                p.shuffle = q.shuffle;
+                p.repeat = repeat;
+            });
+        }
         PlayerEvent::Started(uri) => {
             let fx = ui_state::with(|st| st.on_started(w, &uri));
             s.run(fx);
@@ -764,6 +795,7 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
         PlayerEvent::Volume(percent) => {
             os_media::on_volume(percent);
             w.set_volume_level(i32::from(percent));
+            s.remember_player(|p| p.volume = percent);
         }
         PlayerEvent::Error(text) => {
             w.set_notice(text.into());
@@ -1215,6 +1247,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
     senders.local(PlayerCommand::Effects(effects_options(&settings)));
+    // Volume, shuffle and repeat as the last session left them.
+    senders.local(PlayerCommand::SetVolume(settings.player.volume.min(100)));
+    senders.local(PlayerCommand::SetModes {
+        shuffle: settings.player.shuffle,
+        repeat: match settings.player.repeat {
+            1 => RepeatMode::All,
+            2 => RepeatMode::One,
+            _ => RepeatMode::Off,
+        },
+    });
     window.set_spectrum(slint::ModelRc::new(slint::VecModel::from(vec![
         0.0f32;
         effects::spectrum::BARS
