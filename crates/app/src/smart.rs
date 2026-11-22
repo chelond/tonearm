@@ -204,18 +204,12 @@ pub fn load() -> Vec<Rule> {
         .unwrap_or_else(presets)
 }
 
-pub fn save(rules: &[Rule]) {
+/// Queues an atomic save on the shared writer thread (call order kept, newest rules win).
+pub fn save_later(rules: Vec<Rule>) {
     let Some(p) = file() else { return };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Ok(data) = serde_json::to_vec_pretty(rules) else {
-        return;
-    };
-    let tmp = p.with_extension("tmp");
-    if std::fs::write(&tmp, data).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
-    }
+    tonearm_core::fsutil::write_later(p, tonearm_core::fsutil::Access::Normal, move || {
+        serde_json::to_vec_pretty(&rules).ok()
+    });
 }
 
 /// A short id that is not taken yet.

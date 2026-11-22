@@ -302,6 +302,14 @@ impl<H: Http> WebApi<H> {
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ApiError> {
+        // `next` links come from the response: the bearer token only ever goes to the Web API.
+        if !url
+            .strip_prefix(API)
+            .is_some_and(|rest| rest.starts_with(['/', '?']))
+        {
+            tracing::warn!(%url, "refusing a Web API link to another host");
+            return Err(ApiError::Parse);
+        }
         let mut attempt = 0;
         loop {
             let resp = self.http.get(url).await?;
@@ -751,5 +759,20 @@ mod tests {
         let tiles = api.recent_albums(6).await.unwrap();
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].uri, "spotify:album:x");
+    }
+
+    #[tokio::test]
+    async fn next_links_to_other_hosts_are_not_followed() {
+        let api = WebApi::new(Fake::default());
+        for url in [
+            "https://evil.example/v1/me/tracks",
+            "https://api.spotify.com.evil.example/v1/me/tracks",
+            "http://api.spotify.com/v1/me/tracks",
+        ] {
+            assert!(
+                matches!(api.liked(Some(url)).await, Err(ApiError::Parse)),
+                "{url}"
+            );
+        }
     }
 }

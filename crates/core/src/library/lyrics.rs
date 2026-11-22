@@ -7,7 +7,7 @@
 //! times spread at the song's own pace.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use librespot_core::{Session, SpotifyId, SpotifyUri};
@@ -169,7 +169,7 @@ fn parse_spotify(json: &serde_json::Value) -> Option<Lyrics> {
             "spotify lyrics: unknown sync type, reading lines only"
         );
     }
-    let lines: Vec<LyricLine> = inner["lines"]
+    let mut lines: Vec<LyricLine> = inner["lines"]
         .as_array()?
         .iter()
         .map(|l| LyricLine {
@@ -185,6 +185,12 @@ fn parse_spotify(json: &serde_json::Value) -> Option<Lyrics> {
             words: Vec::new(),
         })
         .collect();
+    if synced {
+        // `current_line` looks lines up by time: a line without one (or out of order) would
+        // light up the wrong line from there on.
+        lines.retain(|l| l.start_ms.is_some());
+        lines.sort_by_key(|l| l.start_ms);
+    }
     (!lines.is_empty()).then(|| Lyrics {
         lines,
         synced,
@@ -205,16 +211,22 @@ enum Fetch {
 }
 
 async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
-        .user_agent(concat!(
-            "Tonearm/",
-            env!("CARGO_PKG_VERSION"),
-            " (https://github.com/chelond/tonearm)"
-        ))
-        .build()
-        .ok()?;
+    // One pool for the whole run: no new TLS handshake with LRCLIB for every track.
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(4))
+                .user_agent(concat!(
+                    "Tonearm/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (https://github.com/chelond/tonearm)"
+                ))
+                .build()
+                .ok()
+        })
+        .as_ref()?;
     let artist = artist.split(", ").next().unwrap_or(artist).trim();
     let mut titles = vec![title.trim().to_owned()];
     let clean = clean_title(title);
@@ -232,7 +244,7 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
                 ("artist_name", artist),
                 ("duration", duration.as_str()),
             ];
-            match lrclib_get(&client, "get", &q, duration_ms).await {
+            match lrclib_get(client, "get", &q, duration_ms).await {
                 Fetch::Hit(l) => {
                     if keep(l, &mut best) {
                         return best;
@@ -257,7 +269,7 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
     searches.push(vec![("q", format!("{last} {artist}").trim().to_owned())]);
     for q in searches {
         let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        match lrclib_get(&client, "search", &q, duration_ms).await {
+        match lrclib_get(client, "search", &q, duration_ms).await {
             Fetch::Hit(l) => {
                 if keep(l, &mut best) {
                     return best;
@@ -273,34 +285,37 @@ async fn lrclib(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
 /// NetEase Cloud Music: no key, word timings (YRC) for many tracks. An unofficial API: any
 /// failure just means no lyrics from it.
 async fn netease(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        reqwest::header::REFERER,
-        HeaderValue::from_static("https://music.163.com/"),
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
-        .default_headers(headers)
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) Tonearm")
-        .build()
-        .ok()?;
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::REFERER,
+                HeaderValue::from_static("https://music.163.com/"),
+            );
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(4))
+                .default_headers(headers)
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) Tonearm")
+                .build()
+                .ok()
+        })
+        .as_ref()?;
     let artist = artist.split(", ").next().unwrap_or(artist).trim();
     let clean = clean_title(title);
     let query = format!("{clean} {artist}");
-    let found: serde_json::Value = client
+    let found = client
         .get("https://music.163.com/api/search/get")
         .query(&[("s", query.trim()), ("type", "1"), ("limit", "10")])
         .send()
         .await
         .map_err(|e| tracing::info!(error = %e, "NetEase unreachable"))
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let found = crate::net::json_limited(found, crate::net::MAX_JSON).await?;
     let id = netease_match(&found, &clean, artist, duration_ms)?;
     let id = id.to_string();
-    let json: serde_json::Value = client
+    let json = client
         .get("https://music.163.com/api/song/lyric/v1")
         .query(&[
             ("id", id.as_str()),
@@ -315,10 +330,8 @@ async fn netease(title: &str, artist: &str, duration_ms: u32) -> Option<Lyrics> 
         ])
         .send()
         .await
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    let json = crate::net::json_limited(json, crate::net::MAX_JSON).await?;
     parse_netease(&json)
 }
 
@@ -439,7 +452,7 @@ fn parse_yrc(yrc: &str) -> Vec<LyricLine> {
             if !piece.is_empty() {
                 words.push(LyricWord {
                     start_ms: ws,
-                    end_ms: ws + wl.max(1),
+                    end_ms: ws.saturating_add(wl.max(1)),
                     text: piece.to_owned(),
                 });
             }
@@ -496,7 +509,7 @@ async fn lrclib_get(
             Fetch::Miss
         };
     }
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
+    let Some(json) = crate::net::json_limited(resp, crate::net::MAX_JSON).await else {
         return Fetch::Miss;
     };
     let found = if json.is_array() {
@@ -672,7 +685,8 @@ fn lrc_time(s: &str) -> Option<u32> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let ms = (sec * 1000.0).round() as u32;
-    Some(m * 60_000 + ms)
+    // `[99999:00]` from a broken file: dropped instead of wrapping around.
+    m.checked_mul(60_000)?.checked_add(ms)
 }
 
 /// Closes open-ended word stamps (the last word of a line) and turns breaks between verses
@@ -687,7 +701,7 @@ pub fn fill_timings(lines: &mut [LyricLine], duration_ms: u32, estimate: bool) {
             .copied()
             .find(|&s| s > start)
             .or((duration_ms > start).then_some(duration_ms))
-            .unwrap_or(start + 6000)
+            .unwrap_or(start.saturating_add(6000))
     };
     let pace = estimate.then(|| song_pace(lines, &next_of));
     for (i, line) in lines.iter_mut().enumerate() {
@@ -700,14 +714,16 @@ pub fn fill_timings(lines: &mut [LyricLine], duration_ms: u32, estimate: bool) {
                 if line.words[k].end_ms <= line.words[k].start_ms {
                     let following = line.words.get(k + 1).map_or(next, |w| w.start_ms);
                     let w = &mut line.words[k];
-                    w.end_ms = following.min(w.start_ms + 1500).max(w.start_ms + 1);
+                    w.end_ms = following
+                        .min(w.start_ms.saturating_add(1500))
+                        .max(w.start_ms.saturating_add(1));
                 }
             }
             continue;
         }
         if line.text.is_empty() {
             if gap >= 3000 {
-                let end = next.saturating_sub(300).max(start + 3);
+                let end = next.saturating_sub(300).max(start.saturating_add(3));
                 let step = (end - start) / 3;
                 for k in 0..3 {
                     line.words.push(LyricWord {
@@ -748,25 +764,33 @@ fn song_pace(lines: &[LyricLine], next_of: &impl Fn(usize, u32) -> u32) -> u32 {
 
 fn weight(text: &str) -> u32 {
     text.split_whitespace()
-        .map(|p| u32::try_from(p.chars().count()).unwrap_or(1) + 1)
-        .sum()
+        .map(|p| {
+            u32::try_from(p.chars().count())
+                .unwrap_or(1)
+                .saturating_add(1)
+        })
+        .fold(0u32, u32::saturating_add)
 }
 
 /// Times for the words of a line nobody timed by word: by length, at the song's pace, always
 /// done before the next line starts.
 fn spread_words(line: &mut LyricLine, start: u32, gap: u32, pace: u32) {
+    // u64 inside: a long line times a long gap does not fit in u32.
     let pieces: Vec<&str> = line.text.split_whitespace().collect();
-    let total = weight(&line.text).max(1);
-    let sung = (total * pace).min(gap * 9 / 10).max(1);
-    let mut at = 0u32;
+    let total = u64::from(weight(&line.text).max(1));
+    let sung = (total * u64::from(pace))
+        .min(u64::from(gap) * 9 / 10)
+        .max(1);
+    let at_ms = |at: u64| u32::try_from(u64::from(start) + sung * at / total).unwrap_or(u32::MAX);
+    let mut at = 0u64;
     for p in pieces {
-        let w = u32::try_from(p.chars().count()).unwrap_or(1) + 1;
-        let s = start + sung * at / total;
+        let w = u64::try_from(p.chars().count()).unwrap_or(1) + 1;
+        let s = at_ms(at);
         at += w;
-        let e = start + sung * at / total;
+        let e = at_ms(at);
         line.words.push(LyricWord {
             start_ms: s,
-            end_ms: e.max(s + 1),
+            end_ms: e.max(s.saturating_add(1)),
             text: p.to_owned(),
         });
     }
@@ -965,5 +989,95 @@ mod tests {
         assert_eq!(hit["duration"], 205.0);
         let any = best_search_hit(&j, 0).unwrap();
         assert!(any["syncedLyrics"].is_string());
+    }
+
+    #[test]
+    fn absurd_stamps_are_dropped_not_wrapped() {
+        assert_eq!(lrc_time("99999999:00.00"), None);
+        assert_eq!(
+            lrc_time("71582:47.295"),
+            Some(u32::MAX),
+            "the largest that fits"
+        );
+        assert_eq!(lrc_time("71582:47.296"), None, "one past u32::MAX ms");
+        assert_eq!(lrc_time("01:02.50"), Some(62_500));
+        let l = parse_yrc("[4294967000,5000](4294967000,4000,0)Слово");
+        assert_eq!(l[0].words[0].end_ms, u32::MAX);
+    }
+
+    #[test]
+    fn spotify_lines_without_time_do_not_break_the_lookup() {
+        let json = serde_json::json!({"lyrics": {
+            "syncType": "LINE_SYNCED",
+            "lines": [
+                {"startTimeMs": "1000", "words": "Первая"},
+                {"words": "без времени"},
+                {"startTimeMs": "9000", "words": "Третья"},
+                {"startTimeMs": "5000", "words": "Вторая"}
+            ]
+        }});
+        let l = parse_spotify(&json).unwrap();
+        assert_eq!(
+            lines(&l.lines),
+            [
+                (Some(1000), "Первая"),
+                (Some(5000), "Вторая"),
+                (Some(9000), "Третья")
+            ]
+        );
+        assert_eq!(current_line(&l.lines, 6000), Some(1));
+    }
+
+    #[test]
+    fn garbage_never_panics() {
+        // A small deterministic fuzz over the parsers and the timing pass, with the kind of
+        // input broken LRC/YRC files contain: huge numbers, missing brackets, Cyrillic, emoji.
+        let pieces = [
+            "[",
+            "]",
+            "<",
+            ">",
+            "(",
+            ")",
+            ",",
+            ":",
+            ".",
+            "-",
+            "00",
+            "59",
+            "60.4",
+            "99999",
+            "4294967295",
+            "18446744073709551616",
+            "Привет",
+            "мир",
+            "♪",
+            "🎵",
+            " ",
+            "\n",
+            "[00:01.00]",
+            "<00:02.00>",
+            "(1000,500,0)",
+            "[1000,2000]",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..3000 {
+            let len = (next() % 24) as usize;
+            let text: String = (0..len)
+                .map(|_| pieces[(next() % pieces.len() as u64) as usize])
+                .collect();
+            let duration = u32::try_from(next() % 5_000_000_000).unwrap_or(u32::MAX);
+            for mut parsed in [parse_lrc(&text), parse_yrc(&text)] {
+                fill_timings(&mut parsed, duration, next() % 2 == 0);
+                let _ = current_line(&parsed, duration);
+            }
+            let _ = parse_words(&text);
+        }
     }
 }

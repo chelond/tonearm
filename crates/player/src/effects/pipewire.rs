@@ -128,15 +128,22 @@ async fn control(mut rx: mpsc::UnboundedReceiver<Ctl>, mut eq: Option<Gains>) {
 }
 
 async fn set(props: &str) {
-    let out = Command::new("pw-cli")
-        .args(["set-param", NODE, "Props", props])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if let Err(e) = out {
-        tracing::warn!(error = %e, "pw-cli set-param failed");
+    // A hung pw-cli must not stall the fade/equalizer loop; it is killed when dropped.
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        Command::new("pw-cli")
+            .args(["set-param", NODE, "Props", props])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    match out {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "pw-cli set-param failed"),
+        Err(_) => tracing::warn!("pw-cli set-param timed out"),
     }
 }
 

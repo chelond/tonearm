@@ -115,14 +115,6 @@ fn date_label(at: u64) -> String {
         .unwrap_or_default()
 }
 
-fn days_word(n: usize) -> &'static str {
-    match (n % 10, n % 100) {
-        (1, x) if x != 11 => "день",
-        (2..=4, x) if !(12..=14).contains(&x) => "дня",
-        _ => "дней",
-    }
-}
-
 impl UiState {
     pub(super) fn init_insights(&mut self, w: &AppWindow) {
         self.smart_rules = if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
@@ -276,12 +268,9 @@ impl UiState {
         if empty {
             let rule = self.smart_rules.iter().find(|r| r.id == id);
             let hint = match rule.map(|r| (r.source, r.played)) {
-                Some((Source::Liked, Played::Never)) => {
-                    "Все любимые треки вы уже слушали в Tonearm. Отлично!"
-                }
+                Some((Source::Liked, Played::Never)) => "Вы уже слушали все любимые треки.",
                 Some((Source::Liked, Played::NotFor)) => {
-                    "Пока таких нет: история слушания копится с первого запуска Tonearm, \
-                     забытые треки появятся со временем."
+                    "История Tonearm ведётся с первого запуска. Плейлист заполнится, когда накопятся прослушивания."
                 }
                 _ => {
                     "Под эти правила пока ничего не подходит. Послушайте музыку или измените \
@@ -455,11 +444,11 @@ impl UiState {
             empty: s.plays == 0,
             hours: (s.minutes / 60).to_string().into(),
             minutes: s.minutes.to_string().into(),
-            plays: s.plays.to_string().into(),
-            tracks: s.tracks.to_string().into(),
-            artists: s.artists.to_string().into(),
-            days: format!("{} {}", s.days, days_word(s.days)).into(),
-            streak: format!("{} {}", s.streak, days_word(s.streak)).into(),
+            plays: crate::ru::count_of(s.plays, crate::ru::PLAYS).into(),
+            tracks: crate::ru::count_of(s.tracks, crate::ru::TRACKS).into(),
+            artists: crate::ru::count_of(s.artists, crate::ru::ARTISTS).into(),
+            days: crate::ru::count_of(s.days, crate::ru::DAYS).into(),
+            streak: crate::ru::count_of(s.streak, crate::ru::DAYS).into(),
             top_month: top_month
                 .map(|m| wrapped::MONTHS[m].to_owned())
                 .unwrap_or_default()

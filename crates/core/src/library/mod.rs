@@ -128,13 +128,19 @@ pub struct SessionHttp {
 }
 
 impl SessionHttp {
+    /// Cheap: all instances share one connection pool (reqwest clients are reference-counted),
+    /// so TLS sessions to api.spotify.com are reused between pages instead of renegotiated.
     #[must_use]
     pub fn new(session: Session) -> Self {
-        Self {
-            client: reqwest::Client::builder()
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        });
+        Self {
+            client: client.clone(),
             session,
         }
     }
@@ -155,11 +161,9 @@ impl SessionHttp {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = resp
-            .bytes()
+        let body = crate::net::body_limited(resp, crate::net::MAX_API, Duration::from_secs(20))
             .await
-            .map_err(|e| ApiError::Network(e.without_url().to_string()))?
-            .to_vec();
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         Ok(HttpResponse {
             status,
             body,

@@ -124,13 +124,30 @@ enum Error {
     Format,
 }
 
+/// What a failed `track.scrobble` means for the queued plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Try the same plays again later.
+    Later,
+    /// Our API key, signature or session is wrong: no play can get through until that is fixed,
+    /// so nothing is dropped.
+    Setup,
+    /// Last.fm refuses these plays themselves (bad data): drop them, keep the rest.
+    Data,
+}
+
 impl Error {
-    /// Worth sending again later.
-    fn temporary(&self) -> bool {
+    fn refusal(&self) -> Refusal {
         match self {
-            Self::Network | Self::Format => true,
-            // 8 operation failed, 11 offline, 16 temporary, 29 rate limit
-            Self::Api { code, .. } => matches!(code, 8 | 11 | 16 | 29),
+            Self::Network | Self::Format => Refusal::Later,
+            Self::Api { code, .. } => match code {
+                // 8 operation failed, 11 offline, 16 temporary, 29 rate limit
+                8 | 11 | 16 | 29 => Refusal::Later,
+                // 4 authentication failed, 9 invalid session, 10 invalid API key,
+                // 13 invalid signature (wrong api_secret), 26 suspended API key
+                4 | 9 | 10 | 13 | 26 => Refusal::Setup,
+                _ => Refusal::Data,
+            },
         }
     }
 }
@@ -276,7 +293,9 @@ impl Client {
             .send()
             .await
             .map_err(|_| Error::Network)?;
-        let bytes = resp.bytes().await.map_err(|_| Error::Network)?;
+        let bytes = crate::net::body_limited(resp, crate::net::MAX_JSON, Duration::from_secs(20))
+            .await
+            .map_err(|_| Error::Network)?;
         let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| Error::Format)?;
         if let Ok(e) = serde_json::from_value::<ApiError>(json.clone()) {
             return Err(Error::Api {
@@ -354,14 +373,10 @@ impl Queue {
 
     fn save(&self) {
         let Some(p) = &self.path else { return };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(data) = serde_json::to_vec(&self.items) {
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, data).is_ok() {
-                let _ = std::fs::rename(&tmp, p);
-            }
+        if let Ok(data) = serde_json::to_vec(&self.items)
+            && let Err(e) = crate::fsutil::write_atomic(p, &data, crate::fsutil::Access::Private)
+        {
+            tracing::warn!(error = %e, "cannot save the scrobble queue");
         }
     }
 
@@ -374,15 +389,15 @@ impl Queue {
         self.save();
     }
 
-    /// Drops what Last.fm would refuse as too old; returns the next batch.
-    pub fn batch(&mut self, now: u64) -> Vec<Scrobble> {
+    /// Drops what Last.fm would refuse as too old; returns the next (at most `limit`) plays.
+    pub fn batch(&mut self, now: u64, limit: usize) -> Vec<Scrobble> {
         let before = self.items.len();
         self.items
-            .retain(|s| s.timestamp + MAX_AGE_SECS > now && !s.artist.is_empty());
+            .retain(|s| s.timestamp.saturating_add(MAX_AGE_SECS) > now && !s.artist.is_empty());
         if self.items.len() != before {
             self.save();
         }
-        self.items.iter().take(BATCH).cloned().collect()
+        self.items.iter().take(limit).cloned().collect()
     }
 
     pub fn done(&mut self, n: usize) {
@@ -422,6 +437,10 @@ struct Service {
     session: Option<(String, Secret)>,
     queue: Queue,
     login: Option<JoinHandle<()>>,
+    /// Number of the current login attempt: a result of an aborted or older one is ignored.
+    login_attempt: u64,
+    /// The key/signature problem was shown already (once is enough; retries keep failing).
+    setup_warned: bool,
 }
 
 impl Service {
@@ -468,17 +487,27 @@ impl Service {
         let (Some(client), true) = (self.client.clone(), self.enabled) else {
             return;
         };
+        // After a data error, plays go one at a time, so only the bad one is dropped.
+        let mut limit = BATCH;
         loop {
             let Some((_, sk)) = self.session.clone() else {
                 return;
             };
-            let batch = self.queue.batch(now_secs());
+            let batch = self.queue.batch(now_secs(), limit);
             if batch.is_empty() {
                 break;
             }
-            match client.scrobble(sk.expose(), &batch).await {
-                Ok(()) => self.queue.done(batch.len()),
-                Err(Error::Api { code: 9, .. }) => {
+            let Err(e) = client.scrobble(sk.expose(), &batch).await else {
+                self.queue.done(batch.len());
+                self.setup_warned = false;
+                continue;
+            };
+            match (e.refusal(), &e) {
+                (Refusal::Later, _) => {
+                    tracing::info!(error = %e, "scrobbles stay queued");
+                    break;
+                }
+                (Refusal::Setup, Error::Api { code: 9, .. }) => {
                     self.forget_session().await;
                     self.emit(LastFmEvent::Error(
                         "Last.fm отозвал вход, войдите снова в настройках".into(),
@@ -486,14 +515,22 @@ impl Service {
                     .await;
                     break;
                 }
-                Err(e) if e.temporary() => {
-                    tracing::info!(error = %e, "scrobbles stay queued");
+                (Refusal::Setup, _) => {
+                    tracing::warn!(error = %e, "last.fm refuses our key or signature; plays kept");
+                    if std::mem::replace(&mut self.setup_warned, true) {
+                        break;
+                    }
+                    self.emit(LastFmEvent::Error(format!(
+                        "{e}. Прослушивания сохранены и уйдут, когда ключ Last.fm заработает \
+                         (проверьте [lastfm] в config.toml)."
+                    )))
+                    .await;
                     break;
                 }
-                Err(e) => {
-                    // Refused for good (bad data): do not block the rest.
-                    tracing::warn!(error = %e, n = batch.len(), "scrobbles refused");
-                    self.queue.done(batch.len());
+                (Refusal::Data, _) if batch.len() > 1 => limit = 1,
+                (Refusal::Data, _) => {
+                    tracing::warn!(error = %e, artist = %batch[0].artist, title = %batch[0].title, "scrobble refused, dropped");
+                    self.queue.done(1);
                 }
             }
         }
@@ -531,8 +568,10 @@ pub async fn run(
         session,
         queue,
         login: None,
+        login_attempt: 0,
+        setup_warned: false,
     };
-    let (login_tx, mut login_rx) = mpsc::channel::<Result<(String, String), String>>(1);
+    let (login_tx, mut login_rx) = mpsc::channel::<(u64, Result<(String, String), String>)>(4);
     svc.publish().await;
     svc.flush().await;
     let mut retry = tokio::time::interval(RETRY);
@@ -550,11 +589,13 @@ pub async fn run(
                         if let Some(t) = svc.login.take() {
                             t.abort();
                         }
+                        svc.login_attempt += 1;
+                        let attempt = svc.login_attempt;
                         let events = svc.events.clone();
                         let tx = login_tx.clone();
                         svc.login = Some(tokio::spawn(async move {
                             let result = login(&client, &events).await;
-                            let _ = tx.send(result).await;
+                            let _ = tx.send((attempt, result)).await;
                         }));
                         svc.publish().await;
                     }
@@ -562,12 +603,15 @@ pub async fn run(
                         if let Some(t) = svc.login.take() {
                             t.abort();
                         }
+                        // A result that was already on its way belongs to the cancelled attempt.
+                        svc.login_attempt += 1;
                         svc.publish().await;
                     }
                     LastFmCommand::Logout => {
                         if let Some(t) = svc.login.take() {
                             t.abort();
                         }
+                        svc.login_attempt += 1;
                         svc.forget_session().await;
                         svc.publish().await;
                     }
@@ -598,19 +642,21 @@ pub async fn run(
                     }
                 }
             }
-            result = login_rx.recv() => {
+            Some((attempt, result)) = login_rx.recv() => {
+                if attempt != svc.login_attempt {
+                    continue; // cancelled or replaced by a newer login
+                }
                 svc.login = None;
                 match result {
-                    Some(Ok((user, key))) => {
+                    Ok((user, key)) => {
                         svc.store_session(user, key).await;
                         svc.publish().await;
                         svc.flush().await;
                     }
-                    Some(Err(message)) => {
+                    Err(message) => {
                         svc.publish().await;
                         svc.emit(LastFmEvent::Error(message)).await;
                     }
-                    None => {}
                 }
             }
             _ = retry.tick() => {
@@ -714,12 +760,29 @@ mod tests {
         }
         let mut q = Queue::load(Some(path));
         assert_eq!(q.len(), 61);
-        let b = q.batch(now);
+        let b = q.batch(now, BATCH);
         assert_eq!(q.len(), 60);
         assert_eq!(b.len(), BATCH);
         assert_eq!(b[0].timestamp, now - 100);
         q.done(b.len());
-        assert_eq!(q.batch(now).len(), 10);
+        assert_eq!(q.batch(now, BATCH).len(), 10);
+        assert_eq!(q.batch(now, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_wrong_key_never_costs_the_queued_plays() {
+        let api = |code| Error::Api {
+            code,
+            message: String::new(),
+        };
+        for code in [4, 9, 10, 13, 26] {
+            assert_eq!(api(code).refusal(), Refusal::Setup, "{code}");
+        }
+        for code in [8, 11, 16, 29] {
+            assert_eq!(api(code).refusal(), Refusal::Later, "{code}");
+        }
+        assert_eq!(Error::Network.refusal(), Refusal::Later);
+        assert_eq!(api(6).refusal(), Refusal::Data);
     }
 
     #[test]

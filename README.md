@@ -12,6 +12,8 @@
 ![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-555)
 ![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)
 
+<a href="https://slint.dev"><img src="https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png" alt="Made with Slint" height="48"></a>
+
 [Скачать](https://github.com/chelond/tonearm/releases/latest) ·
 [Возможности](#возможности) ·
 [Установка](#установка) ·

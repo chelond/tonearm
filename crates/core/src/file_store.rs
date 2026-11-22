@@ -8,7 +8,6 @@
 //! File layout: `MAGIC | salt (16) | nonce (12) | ciphertext + tag`. The AAD binds magic and key name.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
@@ -170,23 +169,11 @@ fn create_private_dir(dir: &Path) -> Result<(), SecretStoreError> {
     Ok(())
 }
 
-/// Writes via a temp file created with 0600 from the start, then renames over the target.
+/// Writes via a unique temp file created with 0600 from the start, fsynced, then renamed over
+/// the target.
 fn write_private_atomic(path: &Path, data: &[u8]) -> Result<(), SecretStoreError> {
-    let tmp = path.with_extension("tmp");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&tmp)
-        .map_err(|e| io_err("запись файла секрета", &e))?;
-    file.write_all(data)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| io_err("запись файла секрета", &e))?;
-    fs::rename(&tmp, path).map_err(|e| io_err("запись файла секрета", &e))
+    crate::fsutil::write_atomic(path, data, crate::fsutil::Access::Private)
+        .map_err(|e| io_err("запись файла секрета", &e))
 }
 
 #[cfg(unix)]

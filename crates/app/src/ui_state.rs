@@ -151,6 +151,10 @@ pub struct UiState {
     /// Last session's track, shown paused until play is pressed.
     resume: Option<Resume>,
     lyrics_uri: String,
+    /// Per-track timing fixes (`None` until the lyrics are first shown).
+    lyrics_offsets: Option<std::collections::HashMap<String, i32>>,
+    /// The fix for the track on screen: positive shows the words later.
+    lyrics_offset: i32,
     /// Timed lines of the shown lyrics (empty when not synced).
     lyrics: Vec<LyricLine>,
     /// Last reported position and when it came: the song clock between reports.
@@ -283,65 +287,23 @@ pub fn to_image(cover: &Cover) -> Image {
     Image::from_rgba8(buf)
 }
 
-/// Blurred backdrop: a 12×12 average of the cover, smoothly enlarged to 96×96 here (the software
-/// renderer scales up without filtering, so the smoothing has to be in the pixels). Costs 36 KB
-/// instead of a real blur pass.
+/// A small, genuinely blurred copy of the cover. Blur it before handing it to Slint because the
+/// software renderer scales images with nearest-neighbour filtering; a low-res colour grid looks
+/// like square tiles once enlarged.
 pub fn backdrop(cover: &Cover) -> Image {
-    const N: usize = 12;
-    const OUT: usize = 96;
-    let (w, h) = (cover.width.max(1) as usize, cover.height.max(1) as usize);
-    let mut cells = [[0f32; 3]; N * N];
-    for (by, row) in cells.chunks_mut(N).enumerate() {
-        for (bx, cell) in row.iter_mut().enumerate() {
-            let (x0, x1) = (bx * w / N, ((bx + 1) * w / N).max(bx * w / N + 1).min(w));
-            let (y0, y1) = (by * h / N, ((by + 1) * h / N).max(by * h / N + 1).min(h));
-            let mut n = 0f32;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = (y * w + x) * 4;
-                    if let Some(p) = cover.color.get(i..i + 3) {
-                        for c in 0..3 {
-                            cell[c] += f32::from(p[c]);
-                        }
-                        n += 1.0;
-                    }
-                }
-            }
-            for v in cell.iter_mut() {
-                *v /= n.max(1.0);
-            }
-        }
+    const OUT: u32 = 192;
+    let Some(mut source) =
+        image::RgbaImage::from_raw(cover.width, cover.height, cover.color.clone())
+    else {
+        return Image::default();
+    };
+    for pixel in source.pixels_mut() {
+        pixel.0[3] = 255;
     }
-    let mut out = SharedPixelBuffer::<Rgba8Pixel>::new(OUT as u32, OUT as u32);
-    let px = out.make_mut_slice();
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    for y in 0..OUT {
-        let fy = ((y as f32 + 0.5) * N as f32 / OUT as f32 - 0.5).clamp(0.0, (N - 1) as f32);
-        let (y0, ty) = (fy.floor() as usize, fy.fract());
-        let y1 = (y0 + 1).min(N - 1);
-        for x in 0..OUT {
-            let fx = ((x as f32 + 0.5) * N as f32 / OUT as f32 - 0.5).clamp(0.0, (N - 1) as f32);
-            let (x0, tx) = (fx.floor() as usize, fx.fract());
-            let x1 = (x0 + 1).min(N - 1);
-            let mut rgb = [0u8; 3];
-            for (c, out_c) in rgb.iter_mut().enumerate() {
-                let top = cells[y0 * N + x0][c] * (1.0 - tx) + cells[y0 * N + x1][c] * tx;
-                let bot = cells[y1 * N + x0][c] * (1.0 - tx) + cells[y1 * N + x1][c] * tx;
-                *out_c = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
-            }
-            px[y * OUT + x] = Rgba8Pixel {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-                a: 255,
-            };
-        }
-    }
-    Image::from_rgba8(out)
+    let small = image::imageops::resize(&source, OUT, OUT, image::imageops::FilterType::Triangle);
+    let blurred = image::imageops::blur(&small, 18.0);
+    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(blurred.as_raw(), OUT, OUT);
+    Image::from_rgba8(buf)
 }
 
 fn rgba(c: themes::Rgba) -> Color {
@@ -607,7 +569,7 @@ impl UiState {
     fn finish_tracks(&self, w: &AppWindow) {
         let total: u64 = self.tracks.iter().map(|t| u64::from(t.duration_ms)).sum();
         w.set_page_length_label(format_duration(total).into());
-        w.set_page_tracks_label(self.tracks.len().to_string().into());
+        w.set_page_tracks_label(crate::ru::count_of(self.tracks.len(), crate::ru::TRACKS).into());
     }
 
     pub fn open(&mut self, w: &AppWindow, req: PageRequest, push_history: bool) -> Vec<Effect> {
@@ -746,7 +708,8 @@ impl UiState {
         }
     }
 
-    /// Right-click menu: 0 add to queue, 1 go to artist, 2 go to album, 3 like, 4 radio.
+    /// Right-click menu: 0 add to queue, 1 go to artist, 2 go to album, 3 like, 4 radio,
+    /// 5 play next.
     pub fn row_action(
         &mut self,
         w: &AppWindow,
@@ -759,6 +722,7 @@ impl UiState {
         };
         match action {
             0 if t.playable => vec![Effect::Player(PlayerCommand::Enqueue(queue_item(&t)))],
+            5 if t.playable => vec![Effect::Player(PlayerCommand::PlayNext(queue_item(&t)))],
             1 => t
                 .artist_uri
                 .map(|u| self.open(w, PageRequest::Artist(u), true))
@@ -1086,10 +1050,29 @@ impl UiState {
                     ..Context::default()
                 };
                 let name = ctx.title.clone();
-                fx.extend(self.start_context(&tracks, Some(0), &name, Some(false), ctx));
+                // The seed comes first; if it is the track playing now, it goes on from where
+                // it is instead of starting over. Shuffle stays as the user set it.
+                let seed_playing = tracks.first().is_some_and(|t| t.uri == self.playing_uri);
+                let at = u32::try_from(w.get_position_ms()).unwrap_or(0);
+                let mut start = self.start_context(&tracks, Some(0), &name, None, ctx);
+                if seed_playing {
+                    for e in &mut start {
+                        if let Effect::Player(PlayerCommand::PlayContext { position_ms, .. }) = e {
+                            *position_ms = at;
+                        }
+                    }
+                }
+                fx.extend(start);
                 self.mark_context(w);
             }
             LibraryEvent::Lyrics { uri, lyrics } if uri == self.playing_uri => {
+                self.lyrics_offset = self
+                    .lyrics_offsets
+                    .get_or_insert_with(crate::lyrics_offsets::load)
+                    .get(&uri)
+                    .copied()
+                    .unwrap_or(0);
+                w.set_lyrics_offset_label(crate::lyrics_offsets::label(self.lyrics_offset).into());
                 self.lyrics_uri = uri;
                 match lyrics {
                     Some(l) if l.instrumental => {
@@ -1108,8 +1091,8 @@ impl UiState {
                         };
                         w.set_lyrics_synced(l.synced);
                         w.set_lyrics_word_synced(l.word_synced);
-                        let timed_words = l
-                            .lines
+                        let timed_words = self
+                            .lyrics
                             .iter()
                             .any(|x| x.words.iter().any(|wd| wd.text != "•"));
                         let how = if !l.synced {
@@ -1151,7 +1134,7 @@ impl UiState {
                 uri: p.uri.clone(),
                 kind: CollectionKind::Playlist,
                 title: p.name.clone(),
-                subtitle: format!("{} треков", p.track_count),
+                subtitle: crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS),
                 image_url: p.image_url.clone(),
             })
             .collect()
@@ -1165,7 +1148,7 @@ impl UiState {
                 if t.kind == CollectionKind::Playlist
                     && let Some(p) = self.playlists.iter().find(|p| p.uri == t.uri)
                 {
-                    t.subtitle = format!("{} треков", p.track_count);
+                    t.subtitle = crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS);
                 }
                 t
             })
@@ -1261,7 +1244,7 @@ impl UiState {
         w.set_page_byline(byline.into());
         w.set_page_year_label(h.year.map(|y| y.to_string()).unwrap_or_default().into());
         if let Some(n) = h.total_tracks {
-            w.set_page_tracks_label(n.to_string().into());
+            w.set_page_tracks_label(crate::ru::count(u64::from(n), crate::ru::TRACKS).into());
         }
         h.image_url
             .as_ref()
@@ -1384,12 +1367,15 @@ impl UiState {
     }
 
     pub fn on_cover(&mut self, w: &AppWindow, target: &CoverTarget, cover: &Cover) {
+        // Converted at most once (a cover often fills many rows); `Image` clones share pixels.
+        let image = std::cell::OnceCell::new();
+        let img = || image.get_or_init(|| to_image(cover)).clone();
         let set_tiles = |model: &VecModel<TileData>, uri: &str| {
             for i in 0..model.row_count_() {
                 if let Some(mut row) = model.row(i)
                     && row.uri.as_str() == uri
                 {
-                    row.image = to_image(cover);
+                    row.image = img();
                     row.has_image = true;
                     model.set_row(i, row);
                 }
@@ -1400,7 +1386,7 @@ impl UiState {
                 if *u == uri
                     && let Some(mut row) = model.row(i)
                 {
-                    row.image = to_image(cover);
+                    row.image = img();
                     row.has_image = true;
                     model.set_row(i, row);
                 }
@@ -1414,14 +1400,14 @@ impl UiState {
                     if let Some(mut row) = self.playlist_rows.row(i)
                         && row.uri.as_str() == uri
                     {
-                        row.image = to_image(cover);
+                        row.image = img();
                         row.has_image = true;
                         self.playlist_rows.set_row(i, row);
                     }
                 }
             }
             CoverTarget::Page(id) if *id == self.page_id => {
-                w.set_page_image(to_image(cover));
+                w.set_page_image(img());
                 w.set_page_has_image(true);
                 self.page_rgb = Some(cover.accent);
                 Theme::get(w).set_page_accent(self.tint(cover.accent));
@@ -1437,7 +1423,7 @@ impl UiState {
                 }
                 let mut best = w.get_search_best();
                 if best.uri.as_str() == uri {
-                    best.image = to_image(cover);
+                    best.image = img();
                     best.has_image = true;
                     w.set_search_best(best);
                 }
@@ -1463,15 +1449,15 @@ impl UiState {
                     if self.top_items.get(i).and_then(|e| e.image_url.as_deref()) == Some(url)
                         && let Some(mut row) = self.stat_track_rows.row(i)
                     {
-                        row.image = to_image(cover);
+                        row.image = img();
                         row.has_image = true;
                         self.stat_track_rows.set_row(i, row);
                     }
                 }
             }
-            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &to_image(cover)),
+            CoverTarget::Wrapped(url) => self.wrapped_cover(url, &img()),
             CoverTarget::Deck(uri) if *uri == self.playing_uri => {
-                w.set_track_image(to_image(cover));
+                w.set_track_image(img());
                 w.set_track_backdrop(backdrop(cover));
                 w.set_track_has_image(true);
                 self.cover_rgb = Some(cover.accent);
@@ -1620,6 +1606,21 @@ impl UiState {
         self.meta_pending = still_pending && !complete;
         // Fetched ahead, so the lyrics are there the moment they are opened.
         fx.extend(self.lyrics_opened(w));
+        fx.extend(self.now_playing());
+        fx
+    }
+
+    /// The player starts a track from the top. For the track already in the deck (repeat-one,
+    /// played again) that is a new listen: the previous one goes to the history and Last.fm, and
+    /// the count starts over. Another track is handled by [`UiState::on_track`].
+    pub fn on_started(&mut self, w: &AppWindow, uri: &str) -> Vec<Effect> {
+        if uri.is_empty() || uri != self.playing_uri {
+            return Vec::new();
+        }
+        let mut fx = self.finish_listen(w);
+        self.listened_ms = 0;
+        self.started_at = history::now();
+        self.np_sent.clear(); // Last.fm "now playing" again for the new listen
         fx.extend(self.now_playing());
         fx
     }
@@ -1787,8 +1788,9 @@ impl UiState {
         let elapsed = at.filter(|_| playing).map_or(0, |t| {
             u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX)
         });
-        // A little early: reading lags behind hearing.
+        // A little early: reading lags behind hearing. Then the user's fix for this track.
         let pos = base.saturating_add(elapsed).saturating_add(LYRICS_LEAD_MS);
+        let pos = pos.saturating_add_signed(-self.lyrics_offset);
         let (line, word, next) = lyrics_at(&self.lyrics, pos);
         let to_i32 = |v: Option<usize>| v.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1);
         if w.get_lyrics_line() != to_i32(line) {
@@ -1829,6 +1831,33 @@ impl UiState {
     }
 
     /// "Строки" / "Слова" switched: the lyrics are fetched again for the new mode.
+    /// "−0,5 с / +0,5 с" in the lyrics header (`delta = 0`: back to the source's timing).
+    pub fn lyrics_shift(&mut self, w: &AppWindow, delta: i32) {
+        if self.lyrics_uri.is_empty() {
+            return;
+        }
+        let target = if delta == 0 {
+            0
+        } else {
+            self.lyrics_offset.saturating_add(delta)
+        };
+        let map = self
+            .lyrics_offsets
+            .get_or_insert_with(crate::lyrics_offsets::load);
+        self.lyrics_offset = crate::lyrics_offsets::set(map, &self.lyrics_uri, target);
+        w.set_lyrics_offset_label(crate::lyrics_offsets::label(self.lyrics_offset).into());
+    }
+
+    /// A click on a line seeks to where it is sung, with this track's fix applied.
+    #[must_use]
+    pub fn lyrics_seek_ms(&self, line_start: i32) -> Option<u32> {
+        if line_start < 0 {
+            return None; // a line without a time
+        }
+        let at = i64::from(line_start) + i64::from(self.lyrics_offset);
+        Some(u32::try_from(at.max(0)).unwrap_or(0))
+    }
+
     pub fn lyrics_mode_changed(&mut self, w: &AppWindow) -> Vec<Effect> {
         self.lyrics_uri.clear();
         self.lyrics_asked.clear();
@@ -2182,7 +2211,10 @@ impl UiState {
                             1,
                             "library",
                             &p.name,
-                            &format!("Плейлист · {} треков", p.track_count),
+                            &format!(
+                                "Плейлист · {}",
+                                crate::ru::count(u64::from(p.track_count), crate::ru::TRACKS)
+                            ),
                         ),
                         PaletteAction::Open(PageRequest::Playlist(p.uri.clone())),
                     );
@@ -2258,12 +2290,7 @@ impl UiState {
 }
 
 fn plays_label(n: usize) -> String {
-    let word = match (n % 10, n % 100) {
-        (1, x) if x != 11 => "раз",
-        (2..=4, x) if !(12..=14).contains(&x) => "раза",
-        _ => "раз",
-    };
-    format!("{n} {word}")
+    crate::ru::count_of(n, crate::ru::TIMES)
 }
 
 fn queue_item(t: &TrackItem) -> QueueItem {

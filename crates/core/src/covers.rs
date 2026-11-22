@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use image::imageops::FilterType;
 
@@ -39,7 +39,20 @@ pub struct CoverCache {
     /// Changeable at runtime from the settings page.
     max_bytes: std::sync::atomic::AtomicU64,
     http: reqwest::Client,
+    /// Bytes in the cache directory as far as we know (`u64::MAX` = not counted yet). Keeps a
+    /// full directory scan off every new cover: pruning runs only when the limit is passed.
+    used: std::sync::atomic::AtomicU64,
+    /// One download per cache key at a time: the same cover asked for by several rows at once
+    /// is fetched once, the others wait and read it from disk.
+    inflight:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// Lets the cache go this far over its limit before pruning (then prunes down to the limit),
+/// so pruning is a rare batch instead of a scan per cover.
+const PRUNE_SLACK: u64 = 10;
+/// Not counted yet.
+const UNKNOWN: u64 = u64::MAX;
 
 /// Only Spotify's image CDNs are fetched. Spotify serves its own playlists (blends, "This Is",
 /// mixes, daylist, Wrapped…) from many hosts under these two domains, so match the domain.
@@ -100,7 +113,7 @@ impl CoverCache {
         self.max_bytes
             .store(max_bytes, std::sync::atomic::Ordering::Relaxed);
         if let Some(dir) = &self.dir {
-            prune(dir, max_bytes);
+            self.used.store(prune(dir, max_bytes), Ordering::Relaxed);
         }
     }
 
@@ -112,7 +125,7 @@ impl CoverCache {
 
     pub fn clear(&self) {
         if let Some(dir) = &self.dir {
-            prune(dir, 0);
+            self.used.store(prune(dir, 0), Ordering::Relaxed);
         }
     }
 
@@ -127,6 +140,8 @@ impl CoverCache {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            used: std::sync::atomic::AtomicU64::new(UNKNOWN),
+            inflight: std::sync::Mutex::default(),
         }
     }
 
@@ -145,13 +160,35 @@ impl CoverCache {
                 .await
                 .map_err(|_| CoverError::Decode)?;
         }
-        let bytes = match image_id(&url) {
-            Some(id) => self.image(&sized_id(&id, size)).await?,
-            None => self.fetch_cached(&url, std::slice::from_ref(&url)).await?,
-        };
-        tokio::task::spawn_blocking(move || decode(&url, &bytes, size))
-            .await
-            .map_err(|_| CoverError::Decode)?
+        let id = image_id(&url).map(|id| sized_id(&id, size));
+        for attempt in 0..2 {
+            let bytes = match &id {
+                Some(id) => self.image(id).await?,
+                None => self.fetch_cached(&url, std::slice::from_ref(&url)).await?,
+            };
+            let u = url.clone();
+            let decoded = tokio::task::spawn_blocking(move || decode(&u, &bytes, size))
+                .await
+                .map_err(|_| CoverError::Decode)?;
+            match decoded {
+                // A file cut short by a crash (or a bad answer cached earlier) would fail
+                // forever: drop it and download once more.
+                Err(CoverError::Decode) if attempt == 0 => {
+                    let key = id.as_ref().map_or_else(|| url.clone(), |id| image_key(id));
+                    self.forget(&key).await;
+                }
+                other => return other,
+            }
+        }
+        Err(CoverError::Decode)
+    }
+
+    /// Removes one cached file.
+    async fn forget(&self, key: &str) {
+        if let Some(dir) = &self.dir {
+            let _ = tokio::fs::remove_file(dir.join(file_name(key))).await;
+            self.used.store(UNKNOWN, Ordering::Relaxed);
+        }
     }
 
     /// An image by its id, from whichever of Spotify's image hosts answers (some networks
@@ -167,20 +204,44 @@ impl CoverCache {
             })
             .collect();
         // Cached under one name whatever host served it.
-        let key = format!("https://i.scdn.co/image/{id}");
-        self.fetch_cached(&key, &urls).await
+        self.fetch_cached(&image_key(id), &urls).await
     }
 
     /// From the disk cache under `key`, else the first of `urls` that answers.
     async fn fetch_cached(&self, key: &str, urls: &[String]) -> Result<Vec<u8>, CoverError> {
         let path = self.dir.as_ref().map(|d| d.join(file_name(key)));
-        if let Some(p) = &path
-            && let Ok(data) = tokio::fs::read(p).await
-        {
-            // Touch so pruning keeps recently used covers.
-            let _ = filetime_touch(p);
+        if let Some(data) = read_cached(path.as_deref()).await {
             return Ok(data);
         }
+        // Someone may be downloading this very cover: wait for them, then it is on disk.
+        let lock = {
+            let mut map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(map.entry(key.to_owned()).or_default())
+        };
+        let result = {
+            let _guard = lock.lock().await;
+            match read_cached(path.as_deref()).await {
+                Some(data) => Ok(data),
+                None => self.download(path.as_deref(), urls).await,
+            }
+        };
+        {
+            let mut map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Ours plus the map's: nobody else waits for this key any more.
+            if std::sync::Arc::strong_count(&lock) <= 2 {
+                map.remove(key);
+            }
+        }
+        result
+    }
+
+    async fn download(&self, path: Option<&Path>, urls: &[String]) -> Result<Vec<u8>, CoverError> {
         let mut last = String::new();
         let mut data = None;
         // Every host once, then once more: a blocked host costs one short timeout, and the
@@ -215,14 +276,35 @@ impl CoverCache {
             }
         }
         let data = data.ok_or(CoverError::Network(last))?;
-        if let Some(p) = path
-            && tokio::fs::write(&p, &data).await.is_ok()
-            && let Some(dir) = self.dir.clone()
-        {
-            let max = self.limit();
-            tokio::task::spawn_blocking(move || prune(&dir, max));
+        if let (Some(p), Some(dir)) = (path, self.dir.clone()) {
+            // Atomic: a reader (or a crash) never sees half a picture under the final name.
+            let (p, bytes) = (p.to_path_buf(), data.clone());
+            let written = tokio::task::spawn_blocking(move || {
+                crate::fsutil::write_atomic(&p, &bytes, crate::fsutil::Access::Normal)
+            })
+            .await
+            .is_ok_and(|r| r.is_ok());
+            if written {
+                self.account(&dir, data.len() as u64);
+            }
         }
         Ok(data)
+    }
+
+    /// Counts a new file; prunes (off this task) once the cache is well over its limit.
+    fn account(&self, dir: &Path, added: u64) {
+        let max = self.limit();
+        let used = match self.used.load(Ordering::Relaxed) {
+            UNKNOWN => dir_size(dir),
+            n => n.saturating_add(added),
+        };
+        self.used.store(used, Ordering::Relaxed);
+        if used > max.saturating_add(max / PRUNE_SLACK) {
+            // Marked as unknown until the prune reports what is left.
+            self.used.store(UNKNOWN, Ordering::Relaxed);
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || prune(&dir, max));
+        }
     }
 
     async fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -233,7 +315,9 @@ impl CoverCache {
             .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|e| e.to_string())?;
-        Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+        crate::net::body_limited(resp, crate::net::MAX_IMAGE, Duration::from_secs(20))
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -330,6 +414,20 @@ fn compose(url: &str, parts: &[Vec<u8>], size: u32) -> Result<Cover, CoverError>
     })
 }
 
+/// Cache key of an image id (the same whatever host served it).
+fn image_key(id: &str) -> String {
+    format!("https://i.scdn.co/image/{id}")
+}
+
+/// The cached bytes, if there; touched (off the async worker) so pruning keeps covers in use.
+async fn read_cached(path: Option<&Path>) -> Option<Vec<u8>> {
+    let path = path?;
+    let data = tokio::fs::read(path).await.ok()?;
+    let p = path.to_path_buf();
+    drop(tokio::task::spawn_blocking(move || filetime_touch(&p)));
+    Some(data)
+}
+
 fn filetime_touch(path: &Path) -> std::io::Result<()> {
     std::fs::File::options()
         .append(true)
@@ -350,10 +448,11 @@ fn dir_size(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Deletes the least recently used files until the directory fits into `max_bytes`.
-pub fn prune(dir: &Path, max_bytes: u64) {
+/// Deletes the least recently used files until the directory fits into `max_bytes`; returns
+/// the bytes left.
+pub fn prune(dir: &Path, max_bytes: u64) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return 0;
     };
     let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
         .filter_map(Result::ok)
@@ -370,7 +469,7 @@ pub fn prune(dir: &Path, max_bytes: u64) {
         .collect();
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     if total <= max_bytes {
-        return;
+        return total;
     }
     files.sort_by_key(|f| f.0);
     for (_, len, path) in files {
@@ -381,6 +480,7 @@ pub fn prune(dir: &Path, max_bytes: u64) {
             total -= len;
         }
     }
+    total
 }
 
 fn decode(url: &str, bytes: &[u8], size: u32) -> Result<Cover, CoverError> {
@@ -581,6 +681,40 @@ mod tests {
     #[test]
     fn garbage_is_an_error_not_a_panic() {
         assert!(decode("u", b"not an image", 64).is_err());
+    }
+
+    #[tokio::test]
+    async fn prunes_only_once_well_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CoverCache::with_dir(Some(dir.path().to_path_buf()), 1000);
+        for i in 0..4 {
+            std::fs::write(dir.path().join(format!("f{i}")), vec![0u8; 260]).unwrap();
+        }
+        // 1040 bytes: over the limit, but within the slack: nothing is deleted.
+        cache.account(dir.path(), 0);
+        assert_eq!(dir_size(dir.path()), 1040);
+        assert_eq!(cache.used.load(Ordering::Relaxed), 1040);
+        // Known size: a new file is added to the count, no directory scan needed.
+        std::fs::write(dir.path().join("f4"), vec![0u8; 260]).unwrap();
+        cache.account(dir.path(), 260);
+        // 1300 > 1100: pruned back under the limit in the background.
+        for _ in 0..100 {
+            if dir_size(dir.path()) <= 1000 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dir_size(dir.path()) <= 1000);
+    }
+
+    #[test]
+    fn prune_reports_what_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("b"), vec![0u8; 100]).unwrap();
+        assert_eq!(prune(dir.path(), 500), 200);
+        assert_eq!(prune(dir.path(), 150), 100);
+        assert_eq!(prune(dir.path(), 0), 0);
     }
 
     #[test]

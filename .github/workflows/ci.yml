@@ -12,48 +12,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+# Least privilege by default; only the release job may write (create the GitHub release).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+  checks:
+    name: checks
+    uses: ./.github/workflows/checks.yml
 
-  # Checks: clippy + tests (tests also cover the debug build).
-  build:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      # RUSTFLAGS overrides .cargo/config.toml, so the static CRT flag is repeated here for Windows.
-      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libasound2-dev
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+  test:
+    name: tests
+    uses: ./.github/workflows/tests.yml
 
-  # Release binaries, in parallel with the checks so the exe is ready sooner.
+  # Build and package in parallel with tests; release waits for both.
   package:
     name: package (${{ matrix.os }})
     strategy:
@@ -67,9 +43,11 @@ jobs:
       TONEARM_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
       TONEARM_LASTFM_SECRET: ${{ secrets.LASTFM_API_SECRET }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-on-failure: true
       - name: Install Linux system dependencies
@@ -97,20 +75,20 @@ jobs:
           Compress-Archive -Path target/release/tonearm.exe, README.md, LICENSE -DestinationPath dist/tonearm-windows-x86_64.zip
           # The bare exe is what the in-app updater downloads.
           Copy-Item target/release/tonearm.exe dist/tonearm-windows-x86_64.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tonearm-${{ runner.os }}
           path: dist/*
 
+  # Compile in the target distribution environment on every CI run.
   arch:
     name: build (archlinux container)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: pacman -Syu --noconfirm --needed rust fontconfig libxkbcommon libxkbcommon-x11 wayland alsa-lib
       - run: cargo build --workspace --locked
-      - run: cargo test --workspace --locked
 
   # pacman package for the in-app updater on Arch (pkexec pacman -U). Tags only.
   arch-package:
@@ -119,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
           pacman -Syu --noconfirm --needed rust gcc-libs glibc fontconfig freetype2 libxkbcommon \
             libxkbcommon-x11 wayland libx11 libxcursor libxi libxrandr alsa-lib
@@ -134,19 +112,22 @@ jobs:
           su builder -c "makepkg --nocheck --noconfirm"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp tonearm-*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tonearm-arch
           path: dist/*
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, build, package, arch, arch-package]
+    needs: [checks, test, package, arch, arch-package]
     runs-on: ubuntu-latest
+    # Keep UPDATE_SIGNING_KEY as an environment secret of "release" (with required reviewers),
+    # so no other job or branch can read the key that every installed copy trusts.
+    environment: release
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Tag matches the version in Cargo.toml
         run: |
           want="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -154,7 +135,7 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} but Cargo.toml says ${want}; the app would offer itself as an update forever"
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -172,11 +153,18 @@ jobs:
           umask 077
           key="$RUNNER_TEMP/update-key.pem"
           printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          ver="${GITHUB_REF_NAME#v}"
+          msg="$RUNNER_TEMP/signed-message"
+          # The signed message is "tonearm-update-v1\n<version>\n<file name>\n" + the file
+          # (crates/core/src/update.rs, signed_message): a signature is only valid for this
+          # version and this file name, so old builds cannot be re-served as new ones.
           for f in dist/*; do
-            openssl pkeyutl -sign -inkey "$key" -rawin -in "$f" -out "$f.sig"
+            printf 'tonearm-update-v1\n%s\n%s\n' "$ver" "$(basename "$f")" > "$msg"
+            cat "$f" >> "$msg"
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$msg" -out "$f.sig"
             test "$(stat -c %s "$f.sig")" = 64
           done
-          rm -f "$key"
+          rm -f "$key" "$msg"
           ls -l dist
       # Release notes: the section of CHANGELOG.md for this version.
       - name: Release notes
@@ -202,7 +190,7 @@ jobs:
           Файлы `.sig` — подписи для встроенного обновления, скачивать их не нужно.
           NOTES
           cat "$RUNNER_TEMP/notes.md"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: Tonearm ${{ github.ref_name }}
           body_path: ${{ runner.temp }}/notes.md

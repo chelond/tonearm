@@ -134,7 +134,7 @@ export component WrappedPage inherits Rectangle {
                 background: Theme.surface;
                 Text {
                     width: parent.width - 48px;
-                    text: "За " + root.info.year + " год пока нет прослушиваний. Слушайте музыку, и здесь появятся ваши главные треки, исполнители и альбомы.";
+                    text: "За " + root.info.year + " год пока нет прослушиваний. Послушайте музыку, чтобы здесь появились итоги.";
                     font-size: 15px;
                     color: Theme.text-2;
                     wrap: word-wrap;
@@ -169,7 +169,7 @@ export component WrappedPage inherits Rectangle {
                             color: Theme.on-accent;
                         }
                         Text {
-                            text: root.info.plays + " прослушиваний · " + root.info.tracks + " треков · " + root.info.artists + " исполнителей";
+                            text: root.info.plays + " · " + root.info.tracks + " · " + root.info.artists;
                             font-size: 14px;
                             color: Theme.on-accent.with-alpha(0.85);
                             overflow: elide;
@@ -366,7 +366,6 @@ export component SmartEditor inherits Rectangle {
                     horizontal-stretch: 1;
                     alignment: center;
                     Text { text: root.is-new ? "Новый умный плейлист" : "Правила плейлиста"; font-family: Fonts.display; font-weight: 700; font-size: 20px; color: Theme.text-1; }
-                    Caption { text: "Собирается заново при каждом открытии"; }
                 }
                 IconButton { icon: "close"; clicked => { root.close(); } }
             }

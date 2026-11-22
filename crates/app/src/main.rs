@@ -2,8 +2,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod history;
+mod lyrics_offsets;
 mod mini;
 mod os_media;
+mod ru;
 mod smart;
 mod themes;
 mod ui_state;
@@ -24,7 +26,9 @@ use tonearm_core::lastfm::{LastFmCommand, LastFmEvent};
 use tonearm_core::library::{LibraryCommand, LibraryEvent, PageRequest};
 use tonearm_core::{AuthState, Command, Event, Notice};
 use tonearm_player::effects::{self, EffectsOptions};
-use tonearm_player::{AudioOptions, PlayerCommand, PlayerEvent, SoloistConfig, SoloistStatus};
+use tonearm_player::{
+    AudioOptions, PlayerCommand, PlayerEvent, RepeatMode, SoloistConfig, SoloistStatus,
+};
 use ui_state::{CoverTarget, Effect, UiState};
 
 slint::include_modules!();
@@ -44,12 +48,7 @@ fn init_logging() {
         }
     }
     // Also log to a file: a Windows release build has no console, so this is the only trace.
-    let file = log_path().and_then(|p| {
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir).ok()?;
-        }
-        std::fs::File::create(p).ok()
-    });
+    let file = log_path().and_then(|p| open_log(&p));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     match file {
         Some(f) => {
@@ -61,6 +60,21 @@ fn init_logging() {
         }
         None => builder.init(),
     }
+}
+
+/// Starts a fresh log, keeping the previous run's as `tonearm.log.1` (after a crash that one is
+/// what tells what happened). Owner-only: track names and account ids are in it.
+fn open_log(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let _ = std::fs::rename(path, path.with_extension("log.1"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).ok()
 }
 
 /// `tonearm.log` in the local data dir (`%LOCALAPPDATA%\tonearm\data` on Windows).
@@ -111,6 +125,33 @@ fn install_panic_hook() {
     }));
 }
 
+/// Runs one of the background services. If it panics, the rest of the app keeps going, so the
+/// user is told instead of seeing buttons that silently do nothing (the panic itself is logged
+/// by the panic hook, with a backtrace).
+fn watched(
+    rt: &tokio::runtime::Runtime,
+    name: &'static str,
+    window: &slint::Weak<AppWindow>,
+    service: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let inner = rt.spawn(service);
+    let window = window.clone();
+    rt.spawn(async move {
+        if let Err(e) = inner.await
+            && e.is_panic()
+        {
+            tracing::error!(service = name, "background service crashed");
+            let _ = window.upgrade_in_event_loop(move |w| {
+                w.set_notice(
+                    format!("Сбой: {name} перестал работать. Перезапустите Tonearm, а в журнале tonearm.log есть подробности.")
+                        .into(),
+                );
+                w.set_notice_is_error(true);
+            });
+        }
+    })
+}
+
 /// Keyring entry of the user's own Soloist key (from developer.spotify.com).
 const SOLOIST_KEY: &str = "soloist-api-key";
 
@@ -132,6 +173,9 @@ fn soloist_config(api_key: String) -> Option<SoloistConfig> {
         pipewire_device: None,
     })
 }
+
+/// How long "ПОЛУЧИТЬ КЛЮЧ" waits for the key to be copied.
+const KEY_WATCH_SECS: u32 = 180;
 
 /// What Spotify's "Copy" button puts on the clipboard: one token of printable characters.
 /// The format is not documented, so stay loose but never take ordinary text or a link.
@@ -239,11 +283,25 @@ impl Senders {
         if std::env::var_os("TONEARM_UI_PREVIEW").is_some() {
             return; // sample data: never touch the real config
         }
-        self.rt.spawn_blocking(move || {
-            if let Err(e) = new.save() {
-                tracing::warn!(error = %e, "cannot save config.toml");
-            }
-        });
+        new.save_later();
+    }
+
+    /// Keeps volume/shuffle/repeat for the next start; saved only when they change.
+    fn remember_player(&self, change: impl FnOnce(&mut tonearm_core::config::PlayerSettings)) {
+        let Ok(mut current) = self.settings.lock() else {
+            return;
+        };
+        let mut player = current.player.clone();
+        change(&mut player);
+        if player == current.player {
+            return;
+        }
+        current.player = player;
+        let snapshot = current.clone();
+        drop(current);
+        if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
+            snapshot.save_later();
+        }
     }
 
     /// Starts Soloist with the saved key, or asks for one.
@@ -290,31 +348,42 @@ impl Senders {
         });
     }
 
-    /// After "ПОЛУЧИТЬ КЛЮЧ": watch the clipboard for ten minutes for the key the user copies.
+    /// After "ПОЛУЧИТЬ КЛЮЧ": wait (up to three minutes) for the next clipboard change, which is
+    /// the user pressing "Copy" on the key page. Only that one change is looked at: whatever is
+    /// copied later (a password from a password manager, say) is never read as the key.
     fn watch_clipboard_for_key(&self) {
         if self.key_watch.swap(true, Ordering::SeqCst) {
             return;
         }
         let s = self.clone();
         std::thread::spawn(move || {
-            let found = (|| {
+            let changed = (|| {
                 let mut clipboard = arboard::Clipboard::new().ok()?;
                 let before = clipboard.get_text().ok();
-                for _ in 0..600 {
+                for _ in 0..KEY_WATCH_SECS {
                     std::thread::sleep(Duration::from_secs(1));
-                    let Ok(text) = clipboard.get_text() else {
-                        continue;
-                    };
-                    if Some(&text) != before.as_ref() && looks_like_key(&text) {
-                        return Some(text.trim().to_owned());
+                    match clipboard.get_text() {
+                        Ok(text) if Some(&text) != before.as_ref() => return Some(text),
+                        _ => {}
                     }
                 }
                 None
             })();
             s.key_watch.store(false, Ordering::SeqCst);
-            if let Some(key) = found {
-                tracing::info!("soloist key taken from the clipboard");
-                s.use_soloist_key(key);
+            match changed {
+                Some(text) if looks_like_key(&text) => {
+                    tracing::info!("soloist key taken from the clipboard");
+                    s.use_soloist_key(text.trim().to_owned());
+                }
+                Some(_) => {
+                    tracing::info!("clipboard changed, but not to a key");
+                    let _ = s.window.upgrade_in_event_loop(|w| {
+                        w.set_soloist_detail(
+                            "В буфере обмена не ключ. Скопируйте ключ ещё раз и вставьте его в поле.".into(),
+                        );
+                    });
+                }
+                None => {}
             }
         });
     }
@@ -340,6 +409,7 @@ impl Senders {
                         }
                     }
                     PlayerCommand::Pause => ConnectCommand::Control(RemoteAction::Pause),
+                    PlayerCommand::Resume => ConnectCommand::Control(RemoteAction::Play),
                     PlayerCommand::Next => ConnectCommand::Control(RemoteAction::Next),
                     PlayerCommand::Prev => ConnectCommand::Control(RemoteAction::Prev),
                     PlayerCommand::Seek { position_ms } => {
@@ -372,9 +442,22 @@ impl Senders {
         self.local(cmd);
     }
 
+    /// Sends to the local player. While it is busy, a newer volume or seek replaces an older
+    /// one anyway, so those may be dropped; anything else (pause, next, a track to play) is
+    /// delivered as soon as there is room.
     fn local(&self, cmd: PlayerCommand) {
-        if self.player.try_send(cmd).is_err() {
-            tracing::debug!("player busy, command dropped");
+        match self.player.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(
+                PlayerCommand::SetVolume(_) | PlayerCommand::Seek { .. },
+            )) => tracing::debug!("player busy, volume/seek dropped"),
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                let tx = self.player.clone();
+                self.rt.spawn(async move {
+                    let _ = tx.send(cmd).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -436,13 +519,12 @@ impl Senders {
                 }
                 Effect::Save(store) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt.spawn_blocking(move || store.save());
+                        store.save_later();
                     }
                 }
                 Effect::SaveResume(r) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt
-                            .spawn_blocking(move || history::save_resume(Some(&r)));
+                        history::save_resume(Some(*r));
                     }
                 }
                 Effect::LogPlay(e) => {
@@ -458,7 +540,7 @@ impl Senders {
                 }
                 Effect::SaveRules(rules) => {
                     if std::env::var_os("TONEARM_UI_PREVIEW").is_none() {
-                        self.rt.spawn_blocking(move || smart::save(&rules));
+                        smart::save_later(rules);
                     }
                 }
                 Effect::LastFm(cmd) => self.lastfm_cmd(cmd),
@@ -505,7 +587,7 @@ impl Senders {
                                     Some(year)
                                 };
                                 let entries = match (&log, pick) {
-                                    (Some(l), Some(y)) => l.read_year(y),
+                                    (Some(l), Some(y)) => l.plays_in(y),
                                     _ => Vec::new(),
                                 };
                                 (years, entries)
@@ -673,7 +755,12 @@ fn apply_player(w: &AppWindow, s: &Senders, event: PlayerEvent) {
 fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
     // While a Connect device plays, the deck shows that device, not the paused local player.
     let remote = s.remote.lock().ok().is_some_and(|r| r.is_some());
-    if remote && matches!(event, PlayerEvent::State { .. } | PlayerEvent::Track(_)) {
+    if remote
+        && matches!(
+            event,
+            PlayerEvent::State { .. } | PlayerEvent::Track(_) | PlayerEvent::Started(_)
+        )
+    {
         return;
     }
     match event {
@@ -684,7 +771,22 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
             ui_state::with(|st| st.position_changed(w));
             lyrics_kick(w);
         }
-        PlayerEvent::Queue(q) => ui_state::with(|st| st.on_queue(w, &q)),
+        PlayerEvent::Queue(q) => {
+            ui_state::with(|st| st.on_queue(w, &q));
+            let repeat = match q.repeat {
+                RepeatMode::Off => 0,
+                RepeatMode::All => 1,
+                RepeatMode::One => 2,
+            };
+            s.remember_player(|p| {
+                p.shuffle = q.shuffle;
+                p.repeat = repeat;
+            });
+        }
+        PlayerEvent::Started(uri) => {
+            let fx = ui_state::with(|st| st.on_started(w, &uri));
+            s.run(fx);
+        }
         PlayerEvent::Track(track) => {
             os_media::on_track(&track, window_focused(w), s.notifications());
             let fx = ui_state::with(|st| st.on_track(w, &track));
@@ -693,6 +795,7 @@ fn apply_player_event(w: &AppWindow, s: &Senders, event: PlayerEvent) {
         PlayerEvent::Volume(percent) => {
             os_media::on_volume(percent);
             w.set_volume_level(i32::from(percent));
+            s.remember_player(|p| p.volume = percent);
         }
         PlayerEvent::Error(text) => {
             w.set_notice(text.into());
@@ -793,6 +896,15 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
             if let Some(uri) = uri {
                 s.local(PlayerCommand::PlayAt { uri, position_ms });
             }
+        }
+        ConnectEvent::HandoffFailed(text) => {
+            // The app switched to "remote" before asking; go back to this computer.
+            s.set_remote(None);
+            s.remote_playing.store(false, Ordering::Relaxed);
+            w.set_remote_name("".into());
+            s.local(PlayerCommand::Resume);
+            w.set_notice(text.into());
+            w.set_notice_is_error(true);
         }
         ConnectEvent::Error(text) => {
             w.set_devices_loading(false);
@@ -988,6 +1100,8 @@ fn show_settings(w: &AppWindow, s: &Settings) {
     w.set_set_gapless(i32::from(s.audio.gapless));
     w.set_set_notifications(i32::from(s.ui.notifications));
     w.set_lyrics_mode(i32::from(s.ui.lyrics_words));
+    w.set_set_lyrics_backdrop(i32::from(s.ui.lyrics_backdrop.min(2)));
+    w.set_set_lyrics_layout(i32::from(s.ui.lyrics_layout.min(1)));
     w.set_set_device(s.audio.device.as_str().into());
     // A hand-edited size that is not one of the steps shows as the nearest larger step.
     let cache = CACHE_SIZES_MB
@@ -1026,6 +1140,10 @@ fn read_settings(w: &AppWindow, mut s: Settings) -> Settings {
     s.audio.device = w.get_set_device().to_string();
     s.ui.notifications = w.get_set_notifications() != 0;
     s.ui.lyrics_words = w.get_lyrics_mode() == 1;
+    s.ui.lyrics_backdrop = u8::try_from(w.get_set_lyrics_backdrop())
+        .unwrap_or(1)
+        .min(2);
+    s.ui.lyrics_layout = u8::try_from(w.get_set_lyrics_layout()).unwrap_or(0).min(1);
     s.ui.theme = w.get_theme_id().to_string();
     s.cache.max_size_mb = CACHE_SIZES_MB[pick(w.get_set_cache(), CACHE_SIZES_MB.len())];
     s.player.soloist = w.get_set_engine() == 1;
@@ -1129,6 +1247,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     senders.local(PlayerCommand::Configure(audio_options(&settings)));
     senders.local(PlayerCommand::Effects(effects_options(&settings)));
+    // Volume, shuffle and repeat as the last session left them.
+    senders.local(PlayerCommand::SetVolume(settings.player.volume.min(100)));
+    senders.local(PlayerCommand::SetModes {
+        shuffle: settings.player.shuffle,
+        repeat: match settings.player.repeat {
+            1 => RepeatMode::All,
+            2 => RepeatMode::One,
+            _ => RepeatMode::Off,
+        },
+    });
     window.set_spectrum(slint::ModelRc::new(slint::VecModel::from(vec![
         0.0f32;
         effects::spectrum::BARS
@@ -1381,6 +1509,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             lyrics_kick(&w);
         }
     });
+    let weak = window.as_weak();
+    window.on_lyrics_shift(move |delta| {
+        if let Some(w) = weak.upgrade() {
+            ui_state::with(|st| st.lyrics_shift(&w, delta));
+            lyrics_kick(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_lyrics_seek(move |line_start| {
+        if let Some(w) = weak.upgrade()
+            && let Some(ms) = ui_state::with(|st| st.lyrics_seek_ms(line_start))
+            && w.get_duration_ms() > 0
+        {
+            #[allow(clippy::cast_precision_loss)]
+            w.invoke_seek(ms as f32 / w.get_duration_ms() as f32);
+        }
+    });
     let s = senders.clone();
     window.on_lyrics_opened(move || {
         if let Some(w) = s.window.upgrade() {
@@ -1558,6 +1703,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ));
     });
     let s = senders.clone();
+    window.on_queue_remove(move |i| {
+        if let Ok(i) = usize::try_from(i) {
+            s.player(PlayerCommand::RemoveFromQueue(i));
+        }
+    });
+    let s = senders.clone();
     window.on_row_action(move |source, index, action| {
         if let Some(w) = s.window.upgrade() {
             let index = usize::try_from(index).unwrap_or(usize::MAX);
@@ -1644,20 +1795,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let backend = runtime.spawn(tonearm_core::run_backend(cmd_rx, ev_tx, session_tx));
-    let player = runtime.spawn(tonearm_player::run(pcmd_rx, pev_tx, session_rx.clone()));
-    let library = runtime.spawn(tonearm_core::library::run(
-        lcmd_rx,
-        lev_tx,
-        session_rx.clone(),
-    ));
-    let connect = runtime.spawn(tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx));
-    let lastfm = runtime.spawn(tonearm_core::lastfm::run(
-        settings.lastfm.clone(),
-        tonearm_core::system_store(),
-        fcmd_rx,
-        fev_tx,
-    ));
+    let ui = window.as_weak();
+    let backend = watched(
+        &runtime,
+        "вход",
+        &ui,
+        tonearm_core::run_backend(cmd_rx, ev_tx, session_tx),
+    );
+    let player = watched(
+        &runtime,
+        "плеер",
+        &ui,
+        tonearm_player::run(pcmd_rx, pev_tx, session_rx.clone()),
+    );
+    let library = watched(
+        &runtime,
+        "медиатека",
+        &ui,
+        tonearm_core::library::run(lcmd_rx, lev_tx, session_rx.clone()),
+    );
+    let connect = watched(
+        &runtime,
+        "Spotify Connect",
+        &ui,
+        tonearm_core::connect::run(ccmd_rx, cev_tx, session_rx),
+    );
+    let lastfm = watched(
+        &runtime,
+        "Last.fm",
+        &ui,
+        tonearm_core::lastfm::run(
+            settings.lastfm.clone(),
+            tonearm_core::system_store(),
+            fcmd_rx,
+            fev_tx,
+        ),
+    );
     forward(
         &runtime,
         fev_rx,
@@ -1778,6 +1951,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     window.run()?;
 
+    // Queued saves first, so none of them can land after (and over) the final one below.
+    tonearm_core::fsutil::flush();
     // Continue where we left off next time: write the history and position now.
     if std::env::var_os("TONEARM_UI_PREVIEW").is_none()
         && let Some(store) = ui_state::with(|st| st.save_now(&window))
@@ -1790,13 +1965,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(window);
     drop(senders);
     drop(tick);
+    // All services wind down at the same time; together they get two seconds, not two each.
     runtime.block_on(async {
-        let wait = Duration::from_secs(2);
-        let _ = tokio::time::timeout(wait, backend).await;
-        let _ = tokio::time::timeout(wait, player).await;
-        let _ = tokio::time::timeout(wait, library).await;
-        let _ = tokio::time::timeout(wait, connect).await;
-        let _ = tokio::time::timeout(wait, lastfm).await;
+        let all = async {
+            let _ = tokio::join!(backend, player, library, connect, lastfm);
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), all).await;
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     if updater.restart_requested() {

@@ -24,8 +24,8 @@ pub const RELEASES_PAGE: &str = "https://github.com/chelond/tonearm/releases/lat
 
 /// ed25519 public key that release files are signed with (the private key is a CI secret).
 const PUBLIC_KEY: [u8; 32] = [
-    0x35, 0xf5, 0xee, 0xab, 0x16, 0x99, 0x63, 0x27, 0xce, 0x32, 0x0d, 0x14, 0x77, 0x1d, 0x0b, 0x48,
-    0x30, 0x8f, 0xee, 0xf9, 0xb3, 0xc4, 0x00, 0xdf, 0x2a, 0x8f, 0xf4, 0x8a, 0xf4, 0xa8, 0x45, 0x4c,
+    0x92, 0x25, 0x9d, 0xf2, 0xa1, 0x8f, 0xa6, 0x3a, 0x98, 0xe5, 0xaa, 0xf6, 0x3d, 0xa9, 0x44, 0x22,
+    0xcf, 0x46, 0x64, 0x7d, 0x5f, 0xf6, 0x0f, 0x45, 0xbb, 0x29, 0x79, 0x3c, 0xb8, 0x9a, 0xf6, 0xba,
 ];
 
 /// Release files are a few dozen MB; refuse anything absurd.
@@ -158,25 +158,33 @@ fn sibling(exe: &Path, tag: &str) -> PathBuf {
     exe.with_file_name(name)
 }
 
-/// `"v1.2.3"` / `"1.2.3"` → `(1, 2, 3)`; anything with a pre-release suffix is not a version
-/// we offer.
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+/// `"v1.2.3"` / `"1.2.3"` → `(1, 2, 3)`; a pre-release (`1.2.3-beta.1`) gives the same numbers
+/// and `pre = true`.
+fn parse_version(s: &str) -> Option<((u64, u64, u64), bool)> {
     let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
+    // `+build` metadata does not count; `-beta.1` makes it a pre-release.
+    let s = s.split('+').next().unwrap_or(s);
+    let (core, pre) = match s.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (s, false),
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().unwrap_or("0").parse().ok()?;
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor, patch))
+    Some(((major, minor, patch), pre))
 }
 
-/// Whether `candidate` is newer than `current`.
+/// Whether `candidate` is newer than `current`. Pre-releases are never offered, but a copy that
+/// *is* a pre-release gets the final release of the same version (`0.3.0` > `0.3.0-beta.1`).
 #[must_use]
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
-        (Some(a), Some(b)) => a > b,
+        (Some((_, true)), _) => false,
+        (Some((a, false)), Some((b, b_pre))) => a > b || (a == b && b_pre),
         _ => false,
     }
 }
@@ -218,9 +226,15 @@ fn feed_or_default(feed: &str) -> &str {
 /// Asks the feed for the latest release; `Ok(None)` = this is the newest version.
 pub async fn check(feed: &str, current: &str) -> Result<Option<Release>, UpdateError> {
     let kind = install_kind();
+    let feed = feed_or_default(feed);
+    if !https(feed) {
+        return Err(UpdateError::Network(
+            "адрес обновлений в config.toml должен начинаться с https://".into(),
+        ));
+    }
     let http = client(Some(Duration::from_secs(20)))?;
     let resp = http
-        .get(feed_or_default(feed))
+        .get(feed)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -238,6 +252,26 @@ pub async fn check(feed: &str, current: &str) -> Result<Option<Release>, UpdateE
     pick(release, current, kind)
 }
 
+/// A file name with no directory part (`a/../b`, `..`, `C:\x` are refused): the name from the
+/// feed becomes a path on disk.
+fn plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', ':'])
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+}
+
+/// Downloads come over TLS only, whatever a custom feed says.
+fn https(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
+/// The page handed to the OS opener: only GitHub release pages, never `file://` or app schemes.
+fn safe_page(url: Option<String>) -> String {
+    url.filter(|u| u.starts_with("https://github.com/"))
+        .unwrap_or_else(|| RELEASES_PAGE.to_owned())
+}
+
 fn pick(
     release: FeedRelease,
     current: &str,
@@ -249,7 +283,7 @@ fn pick(
     let asset = release
         .assets
         .iter()
-        .find(|a| wanted_asset(&a.name, kind))
+        .find(|a| plain_file_name(&a.name) && wanted_asset(&a.name, kind))
         .ok_or(UpdateError::NoAsset)?;
     let sig_name = format!("{}.sig", asset.name);
     let sig = release
@@ -257,10 +291,15 @@ fn pick(
         .iter()
         .find(|a| a.name == sig_name)
         .ok_or(UpdateError::NoAsset)?;
+    if !https(&asset.browser_download_url) || !https(&sig.browser_download_url) {
+        return Err(UpdateError::Network(
+            "сервер обновлений дал ссылку не по https".into(),
+        ));
+    }
     Ok(Some(Release {
         version: release.tag_name.trim_start_matches('v').to_owned(),
         notes: release.body.unwrap_or_default(),
-        page: release.html_url.unwrap_or_else(|| RELEASES_PAGE.to_owned()),
+        page: safe_page(release.html_url),
         asset_name: asset.name.clone(),
         asset_url: asset.browser_download_url.clone(),
         sig_url: sig.browser_download_url.clone(),
@@ -268,11 +307,45 @@ fn pick(
     }))
 }
 
-/// Checks the release file against the built-in key.
-fn verify(data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, PUBLIC_KEY)
-        .verify(data, signature)
+/// What CI signs: this header, then the file. The version and the file name are part of the
+/// signed message, so a signed file cannot be served as another version (no downgrade to an
+/// older signed build under a newer tag) or as another file (a tarball in place of the exe).
+fn signed_message(version: &str, name: &str, data: &[u8]) -> Vec<u8> {
+    let header = format!("{SIGNATURE_DOMAIN}\n{version}\n{name}\n");
+    let mut msg = Vec::with_capacity(header.len() + data.len());
+    msg.extend_from_slice(header.as_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
+/// First line of every signed message (also in `.github/workflows/ci.yml`).
+const SIGNATURE_DOMAIN: &str = "tonearm-update-v1";
+
+/// Checks the release file against the built-in key, for this version and file name.
+fn verify(version: &str, name: &str, data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
+    verify_with(&PUBLIC_KEY, version, name, data, signature)
+}
+
+fn verify_with(
+    key: &[u8],
+    version: &str,
+    name: &str,
+    data: &[u8],
+    signature: &[u8],
+) -> Result<(), UpdateError> {
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(&signed_message(version, name, data), signature)
         .map_err(|_| UpdateError::BadSignature)
+}
+
+/// The downloaded file is what it should be for this install: an ELF or PE binary, or a
+/// zstd-compressed pacman package. Checked before anything replaces the running program.
+fn looks_installable(kind: InstallKind, data: &[u8]) -> bool {
+    match kind {
+        InstallKind::Pacman => data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]),
+        InstallKind::Binary if cfg!(windows) => data.starts_with(b"MZ"),
+        InstallKind::Binary => data.starts_with(b"\x7fELF"),
+    }
 }
 
 /// Where the download goes: next to the binary (so the final rename stays on one file system)
@@ -280,8 +353,10 @@ fn verify(data: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
 fn target_path(release: &Release) -> Result<PathBuf, UpdateError> {
     match release.kind {
         InstallKind::Pacman => {
-            let dir = std::env::temp_dir().join("tonearm-update");
-            std::fs::create_dir_all(&dir).map_err(|e| UpdateError::Install(e.to_string()))?;
+            // Not the shared /tmp: another local user could pre-create the directory there and
+            // swap the package while pkexec waits for the password, and pacman (as root) would
+            // install theirs. A 0700 directory in our own cache dir cannot be touched by others.
+            let dir = private_update_dir().map_err(|e| UpdateError::Install(e.to_string()))?;
             Ok(dir.join(&release.asset_name))
         }
         InstallKind::Binary => {
@@ -292,6 +367,37 @@ fn target_path(release: &Release) -> Result<PathBuf, UpdateError> {
     }
 }
 
+/// `~/.cache/tonearm/update`, owner-only. It lives in the user's home, where other users cannot
+/// create or replace anything, and it is refused if something other than a directory is there.
+fn private_update_dir() -> std::io::Result<PathBuf> {
+    let dir = directories::ProjectDirs::from("", "", "tonearm")
+        .map(|d| d.cache_dir().join("update"))
+        .ok_or_else(|| std::io::Error::other("нет каталога кэша"))?;
+    std::fs::create_dir_all(&dir)?;
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(std::io::Error::other("каталог обновления подменён"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Creates `path` fresh (an old file or a planted link there is removed first, never followed).
+fn create_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// Downloads the release file and its signature, verifies it and writes it to disk.
 /// `progress(done, total)` is called as bytes arrive (`total` is 0 when unknown).
 pub async fn download(
@@ -300,23 +406,34 @@ pub async fn download(
 ) -> Result<Downloaded, UpdateError> {
     let path = target_path(release)?;
     // Fail before the download if the file cannot be written anyway.
-    if let Err(e) = std::fs::write(&path, b"") {
-        let dir = path.parent().unwrap_or(&path).display().to_string();
-        return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
-            UpdateError::NotWritable(dir)
-        } else {
-            UpdateError::Install(e.to_string())
-        });
-    }
+    let file = match create_fresh(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            let dir = path.parent().unwrap_or(&path).display().to_string();
+            return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
+                UpdateError::NotWritable(dir)
+            } else {
+                UpdateError::Install(e.to_string())
+            });
+        }
+    };
     let result = fetch_verified(release, &mut progress).await;
     let data = match result {
         Ok(d) => d,
         Err(e) => {
+            drop(file);
             let _ = std::fs::remove_file(&path);
             return Err(e);
         }
     };
-    let write = tokio::fs::write(&path, &data).await;
+    // Write into the file we created (not by path again: nothing can be swapped in between).
+    let write = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = file;
+        file.write_all(&data).and_then(|()| file.sync_all())
+    })
+    .await
+    .map_err(|e| UpdateError::Install(e.to_string()))?;
     if let Err(e) = write {
         let _ = std::fs::remove_file(&path);
         return Err(UpdateError::Install(e.to_string()));
@@ -334,16 +451,21 @@ async fn fetch_verified(
 ) -> Result<Vec<u8>, UpdateError> {
     let http = client(None)?;
     let net = |e: reqwest::Error| UpdateError::Network(e.to_string());
-    let signature = http
+    let sig_resp = http
         .get(&release.sig_url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(net)?
-        .bytes()
-        .await
         .map_err(net)?;
+    // A signature is 64 bytes: do not read an endless body into memory.
+    if sig_resp.content_length().is_some_and(|n| n > 1024) {
+        return Err(UpdateError::BadSignature);
+    }
+    let signature = sig_resp.bytes().await.map_err(net)?;
+    if signature.len() != 64 {
+        return Err(UpdateError::BadSignature);
+    }
     let mut resp = http
         .get(&release.asset_url)
         .send()
@@ -371,7 +493,12 @@ async fn fetch_verified(
         }
         progress(data.len() as u64, total);
     }
-    verify(&data, &signature)?;
+    verify(&release.version, &release.asset_name, &data, &signature)?;
+    if !looks_installable(release.kind, &data) {
+        return Err(UpdateError::Install(
+            "файл обновления не похож на программу для этой системы".into(),
+        ));
+    }
     Ok(data)
 }
 
@@ -466,6 +593,60 @@ mod tests {
     }
 
     #[test]
+    fn feed_file_names_cannot_leave_the_directory() {
+        assert!(plain_file_name("tonearm-0.3.0-1-x86_64.pkg.tar.zst"));
+        assert!(!plain_file_name("tonearm-../../.bashrc-x86_64.pkg.tar.zst"));
+        assert!(!plain_file_name("../tonearm-linux-x86_64"));
+        assert!(!plain_file_name("..\\tonearm-windows-x86_64.exe"));
+        assert!(!plain_file_name("C:tonearm-windows-x86_64.exe"));
+        assert!(!plain_file_name(".hidden"));
+        assert!(!plain_file_name(""));
+    }
+
+    #[test]
+    fn only_https_and_github_pages() {
+        assert!(https("https://github.com/x"));
+        assert!(!https("http://mirror.local/x"));
+        assert_eq!(
+            safe_page(Some(
+                "https://github.com/chelond/tonearm/releases/tag/v1".into()
+            )),
+            "https://github.com/chelond/tonearm/releases/tag/v1"
+        );
+        assert_eq!(safe_page(Some("file:///etc/passwd".into())), RELEASES_PAGE);
+        assert_eq!(safe_page(Some("ms-settings:".into())), RELEASES_PAGE);
+        assert_eq!(safe_page(None), RELEASES_PAGE);
+    }
+
+    #[test]
+    fn http_download_links_are_refused() {
+        let mut f = feed(
+            "v99.0.0",
+            &["tonearm-linux-x86_64", "tonearm-linux-x86_64.sig"],
+        );
+        for a in &mut f.assets {
+            a.browser_download_url = a.browser_download_url.replace("https://", "http://");
+        }
+        if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
+            assert!(pick(f, "0.1.0", InstallKind::Binary).is_err());
+        }
+    }
+
+    #[test]
+    fn create_fresh_does_not_follow_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let path = dir.path().join("pkg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let mut f = create_fresh(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
     fn versions() {
         assert!(is_newer("v0.2.0", "0.1.0"));
         assert!(is_newer("0.1.10", "0.1.9"));
@@ -474,6 +655,52 @@ mod tests {
         assert!(!is_newer("v0.0.9", "0.1.0"));
         assert!(!is_newer("v0.2.0-rc1", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+        // A beta gets the final release of its version, and anything newer.
+        assert!(is_newer("v0.3.0", "0.3.0-beta.1"));
+        assert!(is_newer("v0.3.1", "0.3.0-beta.1"));
+        assert!(!is_newer("v0.2.9", "0.3.0-beta.1"));
+        assert!(
+            !is_newer("v0.3.0-beta.2", "0.3.0-beta.1"),
+            "pre-releases are not offered"
+        );
+        assert!(
+            !is_newer("v0.3.0+build.5", "0.3.0"),
+            "build metadata is not a new version"
+        );
+    }
+
+    #[test]
+    fn signature_covers_version_and_file_name() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key = pair.public_key().as_ref();
+        let data = b"\x7fELF old but signed";
+        let sig = pair.sign(&signed_message("0.2.0", "tonearm-linux-x86_64", data));
+        let ok = |v, n| verify_with(key, v, n, data, sig.as_ref()).is_ok();
+        assert!(ok("0.2.0", "tonearm-linux-x86_64"));
+        assert!(
+            !ok("99.0.0", "tonearm-linux-x86_64"),
+            "an old build under a new tag"
+        );
+        assert!(!ok("0.2.0", "tonearm-windows-x86_64.exe"), "another file");
+    }
+
+    #[test]
+    fn only_a_program_replaces_the_program() {
+        assert!(looks_installable(
+            InstallKind::Pacman,
+            &[0x28, 0xb5, 0x2f, 0xfd, 0]
+        ));
+        assert!(!looks_installable(InstallKind::Pacman, b"\x1f\x8b tarball"));
+        let exe: &[u8] = if cfg!(windows) {
+            b"MZ\x90"
+        } else {
+            b"\x7fELF\x02"
+        };
+        assert!(looks_installable(InstallKind::Binary, exe));
+        assert!(!looks_installable(InstallKind::Binary, b"PK\x03\x04 zip"));
     }
 
     #[test]
@@ -530,7 +757,7 @@ mod tests {
     #[test]
     fn rejects_unsigned_data() {
         assert!(matches!(
-            verify(b"hello", &[0u8; 64]),
+            verify("0.3.0", "tonearm-linux-x86_64", b"hello", &[0u8; 64]),
             Err(UpdateError::BadSignature)
         ));
     }

@@ -30,12 +30,21 @@ pub enum PlayerCommand {
     /// Restarts the track if it has played for more than 3 s, otherwise goes back.
     Prev,
     ToggleShuffle,
+    /// Shuffle and repeat as they were in the last session.
+    SetModes {
+        shuffle: bool,
+        repeat: RepeatMode,
+    },
     /// Off → All → One → Off.
     CycleRepeat,
     /// "Добавить в очередь": plays after the current track, before the context continues.
     Enqueue(QueueItem),
+    /// "Играть следующим": right after the current track, ahead of the queued ones.
+    PlayNext(QueueItem),
     /// Play the n-th entry of the upcoming list.
     JumpTo(usize),
+    /// Remove the n-th entry of the upcoming list.
+    RemoveFromQueue(usize),
     /// Drop the hand-queued tracks.
     ClearQueue,
     /// Drag and drop in the queue panel: entry `from` of the upcoming list goes to `to`.
@@ -54,6 +63,8 @@ pub enum PlayerCommand {
         position_ms: u32,
     },
     TogglePlay,
+    /// Play if paused or stopped; nothing if already playing (MPRIS/SMTC "Play").
+    Resume,
     /// Seek to a position in the current track.
     Seek {
         position_ms: u32,
@@ -131,6 +142,9 @@ pub enum PlayerEvent {
         position_ms: u32,
     },
     Track(TrackInfo),
+    /// A track starts from its beginning (also the same track again: repeat-one, replay).
+    /// Not sent when playback continues mid-track (resume, hand-off back from a device).
+    Started(String),
     /// Volume in percent, 0..=100.
     Volume(u8),
     Queue(QueueSnapshot),

@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 tracing.workspace = true
@@ -23,6 +24,8 @@ ring.workspace = true
 futures-util.workspace = true
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect"] }
 mdns-sd = "0.22"
+# Same version mdns-sd already uses; to tell this computer's addresses from the rest of the LAN.
+if-addrs = "0.15"
 aes = "0.8"
 ctr = "0.9"
 hmac = "0.12"

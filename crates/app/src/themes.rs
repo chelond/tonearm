@@ -343,6 +343,46 @@ mod tests {
         assert_eq!(format_color([255, 255, 255, 13]), "#FFFFFF0D");
     }
 
+    /// WCAG relative luminance of an opaque colour.
+    fn luminance(c: Rgba) -> f64 {
+        let ch = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn builtin_themes_are_readable() {
+        // WCAG AA: 4.5:1 for text (hints included: they carry durations, counts, empty states),
+        // 3:1 for the accent as a control colour, 4.5:1 for text on accent buttons.
+        let c = Catalog::load(None);
+        for t in &c.themes {
+            let col = |k| t.colors.get(k);
+            for surface in ["bg", "sidebar", "surface", "surface-2"] {
+                for (text, min) in [("text-1", 4.5), ("text-2", 4.5), ("text-3", 4.5)] {
+                    let r = contrast(col(text), col(surface));
+                    assert!(r >= min, "{}: {text} on {surface} is {r:.2}:1", t.id);
+                }
+            }
+            let r = contrast(col("accent"), col("bg"));
+            assert!(r >= 3.0, "{}: accent on bg is {r:.2}:1", t.id);
+            let r = contrast(col("on-accent"), col("accent"));
+            assert!(r >= 4.5, "{}: on-accent on accent is {r:.2}:1", t.id);
+            let r = contrast(col("danger"), col("bg"));
+            assert!(r >= 3.0, "{}: danger on bg is {r:.2}:1", t.id);
+        }
+    }
+
     #[test]
     fn builtins_load_and_default_comes_first() {
         let c = Catalog::load(None);
