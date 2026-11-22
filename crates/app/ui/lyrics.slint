@@ -1,5 +1,4 @@
-// Synced lyrics: the song's lines follow the playback, the current one in the upper third, its
-// words lighting up as they are sung.
+// Synced lyrics: the current line stays centered, with two nearby lines on either side.
 import { Fonts } from "theme.slint";
 
 // start/end in ms of the song.
@@ -24,89 +23,175 @@ component Word inherits Rectangle {
         font-weight: 700;
         font-size: root.size;
         color: !root.active || root.lit ? #FFFFFF : #FFFFFF59;
-        animate color { duration: 150ms; easing: ease-out; }
+        animate font-size { duration: 480ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+        animate color { duration: 420ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     }
 }
 
 component Line inherits Rectangle {
     in property <LyricRow> line;
     in property <bool> active;
-    in property <bool> past;
+    in property <int> distance;
+    in property <bool> centered;
+    in property <bool> reveal-rest;
     // Index of the word being sung in this line, -1 before the first.
     in property <int> word;
     in property <length> size;
     callback clicked();
-    // Lines further from the current one fade out.
-    opacity: root.active ? 1 : root.past ? 0.38 : 0.5;
-    animate opacity { duration: 400ms; easing: ease-out; }
+    property <bool> hovered: row-touch.has-hover;
+    background: root.hovered ? #FFFFFF18 : #00000000;
+    animate background { duration: 160ms; easing: ease-out; }
+    // Keep a clear five-line focus window; more distant lines recede into the background.
+    property <length> display-size: root.distance == 0 ? root.size
+        : root.distance == 1 ? root.size * 0.78
+        : root.distance == 2 ? root.size * 0.66
+        : root.size * 0.58;
+    opacity: root.centered && !root.reveal-rest && root.distance > 2 ? 0
+        : root.distance == 0 ? 1 : root.distance == 1 ? 0.68 : root.distance == 2 ? 0.38 : 0.10;
+    animate opacity { duration: 520ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     min-height: root.line.words.length == 0 && root.line.text == "" ? 8px : 0px;
     VerticalLayout {
+        width: root.width;
         padding-top: 6px;
         padding-bottom: 6px;
-        // The current line steps in a little (no animation: it would lay the line out each frame).
-        padding-left: root.active ? 10px : 0px;
+        // Keep text geometry stable while focus moves; only colour and opacity ease between lines.
+        padding-left: 0px;
         if root.line.words.length > 0: FlexboxLayout {
-            spacing-horizontal: root.size * 0.28;
+            width: root.width;
+            alignment: root.centered ? center : start;
+            spacing-horizontal: root.display-size * 0.22;
             spacing-vertical: 2px;
             for w[k] in root.line.words: Word {
                 text: w.text;
                 active: root.active;
                 lit: k <= root.word;
-                size: root.size;
+                size: root.display-size;
             }
         }
         if root.line.words.length == 0 && root.line.text != "": Text {
+            width: root.width;
             text: root.line.text;
             font-family: Fonts.display;
             font-weight: 700;
-            font-size: root.size;
+            font-size: root.display-size;
             color: #FFFFFF;
+            horizontal-alignment: root.centered ? center : left;
             wrap: word-wrap;
+            animate font-size { duration: 480ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         }
     }
-    TouchArea {
+    row-touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
 }
 
-export component LyricsView inherits Rectangle {
+export component PlainLyricLine inherits Rectangle {
+    in property <string> text;
+    preferred-width: 0px;
+    horizontal-stretch: 1;
+    height: label.preferred-height + 16px;
+    background: row-touch.has-hover ? #FFFFFF18 : #00000000;
+    animate background { duration: 160ms; easing: ease-out; }
+    label := Text {
+        x: 12px;
+        y: 8px;
+        width: root.width - 24px;
+        text: root.text != "" ? root.text : " ";
+        font-family: Fonts.display;
+        font-weight: 700;
+        font-size: 24px;
+        color: #FFFFFFE0;
+        wrap: word-wrap;
+    }
+    row-touch := TouchArea { }
+}
+
+component ScrollingLyrics inherits Rectangle {
     in property <[LyricRow]> lines;
-    // The current line and word, moved on by the app exactly when they change: nothing here
-    // runs on a frame clock, so the screen stays still between words.
     in property <int> current-line: -1;
     in property <int> current-word: -1;
-    in property <length> size: 30px;
+    in property <bool> centered: false;
     callback seek-to(int);
-
     property <length> focus-y: 0;
+    property <bool> reveal-rest: false;
+    in-out property <length> scroll-y: 0px;
+    property <length> auto-scroll-y: min(0px, -(root.focus-y - root.height * 0.50));
+    animate scroll-y { duration: root.reveal-rest ? 0ms : 900ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+    hide-rest := Timer {
+        interval: 4s;
+        running: false;
+        triggered => {
+            root.reveal-rest = false;
+            root.scroll-y = root.auto-scroll-y;
+            self.running = false;
+        }
+    }
+    changed centered => {
+        if !root.centered {
+            root.reveal-rest = false;
+            hide-rest.stop();
+            root.scroll-y = root.auto-scroll-y;
+        }
+    }
+    changed focus-y => {
+        if !root.reveal-rest { root.scroll-y = root.auto-scroll-y; }
+    }
+    changed height => {
+        if !root.reveal-rest { root.scroll-y = root.auto-scroll-y; }
+    }
     lyr := Flickable {
+        width: root.width;
+        height: root.height;
         interactive: false;
         content-height: col.preferred-height + root.height;
-        content-y: min(0px, -(root.focus-y - root.height * 0.36));
-        animate content-y { duration: 550ms; easing: cubic-bezier(0.2, 0.8, 0.2, 1); }
+        content-y <=> root.scroll-y;
+        flicked => {
+            if root.centered {
+                root.reveal-rest = true;
+                if hide-rest.running { hide-rest.restart(); } else { hide-rest.start(); }
+            }
+        }
         col := VerticalLayout {
             width: lyr.width;
-            padding-top: 24px;
             alignment: start;
+            padding-top: 24px;
             for l[i] in root.lines: Line {
                 property <bool> current: i == root.current-line;
                 line: l;
                 active: self.current;
-                past: i < root.current-line;
+                distance: abs(i - root.current-line);
                 word: self.current ? root.current-word : -1;
-                size: root.size;
+                size: root.centered ? 56px : 48px;
+                centered: root.centered;
+                reveal-rest: root.reveal-rest;
                 init => {
                     if self.current { root.focus-y = self.y + self.height / 2; }
                 }
                 changed current => {
                     if self.current { root.focus-y = self.y + self.height / 2; }
                 }
-                changed y => {
-                    if self.current { root.focus-y = self.y + self.height / 2; }
-                }
                 clicked => { root.seek-to(l.start); }
             }
         }
+    }
+}
+
+export component LyricsView inherits Rectangle {
+    in property <[LyricRow]> lines;
+    // Updated only when a timed line or word changes; no frame clock runs between updates.
+    in property <int> current-line: -1;
+    in property <int> current-word: -1;
+    in property <int> layout-mode: 0; // scrolling list | centered five-line focus
+    callback seek-to(int);
+
+    ScrollingLyrics {
+        width: root.width;
+        height: root.height;
+        lines: root.lines;
+        current-line: root.current-line;
+        current-word: root.current-word;
+        centered: root.layout-mode == 1;
+        seek-to(ms) => { root.seek-to(ms); }
     }
 }

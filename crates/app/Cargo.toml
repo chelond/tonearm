@@ -18,6 +18,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 slint.workspace = true
+image.workspace = true
 souvlaki.workspace = true
 directories.workspace = true
 serde.workspace = true

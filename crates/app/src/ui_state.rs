@@ -283,65 +283,23 @@ pub fn to_image(cover: &Cover) -> Image {
     Image::from_rgba8(buf)
 }
 
-/// Blurred backdrop: a 12×12 average of the cover, smoothly enlarged to 96×96 here (the software
-/// renderer scales up without filtering, so the smoothing has to be in the pixels). Costs 36 KB
-/// instead of a real blur pass.
+/// A small, genuinely blurred copy of the cover. Blur it before handing it to Slint because the
+/// software renderer scales images with nearest-neighbour filtering; a low-res colour grid looks
+/// like square tiles once enlarged.
 pub fn backdrop(cover: &Cover) -> Image {
-    const N: usize = 12;
-    const OUT: usize = 96;
-    let (w, h) = (cover.width.max(1) as usize, cover.height.max(1) as usize);
-    let mut cells = [[0f32; 3]; N * N];
-    for (by, row) in cells.chunks_mut(N).enumerate() {
-        for (bx, cell) in row.iter_mut().enumerate() {
-            let (x0, x1) = (bx * w / N, ((bx + 1) * w / N).max(bx * w / N + 1).min(w));
-            let (y0, y1) = (by * h / N, ((by + 1) * h / N).max(by * h / N + 1).min(h));
-            let mut n = 0f32;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = (y * w + x) * 4;
-                    if let Some(p) = cover.color.get(i..i + 3) {
-                        for c in 0..3 {
-                            cell[c] += f32::from(p[c]);
-                        }
-                        n += 1.0;
-                    }
-                }
-            }
-            for v in cell.iter_mut() {
-                *v /= n.max(1.0);
-            }
-        }
+    const OUT: u32 = 192;
+    let Some(mut source) =
+        image::RgbaImage::from_raw(cover.width, cover.height, cover.color.clone())
+    else {
+        return Image::default();
+    };
+    for pixel in source.pixels_mut() {
+        pixel.0[3] = 255;
     }
-    let mut out = SharedPixelBuffer::<Rgba8Pixel>::new(OUT as u32, OUT as u32);
-    let px = out.make_mut_slice();
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    for y in 0..OUT {
-        let fy = ((y as f32 + 0.5) * N as f32 / OUT as f32 - 0.5).clamp(0.0, (N - 1) as f32);
-        let (y0, ty) = (fy.floor() as usize, fy.fract());
-        let y1 = (y0 + 1).min(N - 1);
-        for x in 0..OUT {
-            let fx = ((x as f32 + 0.5) * N as f32 / OUT as f32 - 0.5).clamp(0.0, (N - 1) as f32);
-            let (x0, tx) = (fx.floor() as usize, fx.fract());
-            let x1 = (x0 + 1).min(N - 1);
-            let mut rgb = [0u8; 3];
-            for (c, out_c) in rgb.iter_mut().enumerate() {
-                let top = cells[y0 * N + x0][c] * (1.0 - tx) + cells[y0 * N + x1][c] * tx;
-                let bot = cells[y1 * N + x0][c] * (1.0 - tx) + cells[y1 * N + x1][c] * tx;
-                *out_c = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
-            }
-            px[y * OUT + x] = Rgba8Pixel {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-                a: 255,
-            };
-        }
-    }
-    Image::from_rgba8(out)
+    let small = image::imageops::resize(&source, OUT, OUT, image::imageops::FilterType::Triangle);
+    let blurred = image::imageops::blur(&small, 18.0);
+    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(blurred.as_raw(), OUT, OUT);
+    Image::from_rgba8(buf)
 }
 
 fn rgba(c: themes::Rgba) -> Color {
@@ -1108,8 +1066,8 @@ impl UiState {
                         };
                         w.set_lyrics_synced(l.synced);
                         w.set_lyrics_word_synced(l.word_synced);
-                        let timed_words = l
-                            .lines
+                        let timed_words = self
+                            .lyrics
                             .iter()
                             .any(|x| x.words.iter().any(|wd| wd.text != "•"));
                         let how = if !l.synced {
