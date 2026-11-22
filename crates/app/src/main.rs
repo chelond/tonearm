@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod history;
+mod lyrics_offsets;
 mod mini;
 mod os_media;
 mod ru;
@@ -1464,6 +1465,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let fx = ui_state::with(|st| st.lyrics_mode_changed(&w));
             s.run(fx);
             lyrics_kick(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_lyrics_shift(move |delta| {
+        if let Some(w) = weak.upgrade() {
+            ui_state::with(|st| st.lyrics_shift(&w, delta));
+            lyrics_kick(&w);
+        }
+    });
+    let weak = window.as_weak();
+    window.on_lyrics_seek(move |line_start| {
+        if let Some(w) = weak.upgrade()
+            && let Some(ms) = ui_state::with(|st| st.lyrics_seek_ms(line_start))
+            && w.get_duration_ms() > 0
+        {
+            #[allow(clippy::cast_precision_loss)]
+            w.invoke_seek(ms as f32 / w.get_duration_ms() as f32);
         }
     });
     let s = senders.clone();

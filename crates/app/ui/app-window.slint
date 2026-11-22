@@ -1202,6 +1202,11 @@ export component AppWindow inherits Window {
     callback radio-current();
     callback lyrics-opened();
     callback lyrics-mode-changed();
+    // Lyrics timing fix for the playing track: −500 / +500 ms, 0 resets.
+    callback lyrics-shift(int);
+    // A line was clicked: its start in ms (−1 for a line without a time).
+    callback lyrics-seek(int);
+    in property <string> lyrics-offset-label: "0,0 с";
     callback palette-opened();
     callback palette-edited(string);
     callback palette-activate(int);
@@ -2700,6 +2705,25 @@ export component AppWindow inherits Window {
                                     Text { text: root.track-title; font-size: 16px; font-weight: 600; color: #FFFFFF; overflow: elide; }
                                     Text { text: root.track-artists; font-size: 13px; color: #FFFFFFB0; overflow: elide; }
                                 }
+                                // Timing fix: shown for synced lyrics only.
+                                if root.lyrics-synced && root.lyrics-status == "": HorizontalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    IconButton { icon: "back"; tooltip: "Текст раньше на 0,5 с"; clicked => { root.lyrics-shift(-500); } }
+                                    shift-t := TouchArea {
+                                        width: 64px;
+                                        mouse-cursor: pointer;
+                                        clicked => { root.lyrics-shift(0); }
+                                        Text {
+                                            text: root.lyrics-offset-label;
+                                            font-size: 13px;
+                                            color: shift-t.has-hover ? #FFFFFF : #FFFFFFB0;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    IconButton { icon: "forward"; tooltip: "Текст позже на 0,5 с"; clicked => { root.lyrics-shift(500); } }
+                                }
                                 Segmented {
                                     y: (parent.height - self.height) / 2;
                                     items: ["Строки", "Слова"];
@@ -2725,9 +2749,7 @@ export component AppWindow inherits Window {
                                 current-line: root.lyrics-line;
                                 current-word: root.lyrics-word;
                                 layout-mode: root.set-lyrics-layout;
-                                seek-to(ms) => {
-                                    if root.duration-ms > 0 { root.seek(ms / root.duration-ms); }
-                                }
+                                seek-to(ms) => { root.lyrics-seek(ms); }
                             }
                             // plain text: scrolled by hand; each line takes the height its wrapping needs
                             if root.lyrics-status == "" && !root.lyrics-synced: plain := Flickable {

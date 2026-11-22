@@ -151,6 +151,10 @@ pub struct UiState {
     /// Last session's track, shown paused until play is pressed.
     resume: Option<Resume>,
     lyrics_uri: String,
+    /// Per-track timing fixes (`None` until the lyrics are first shown).
+    lyrics_offsets: Option<std::collections::HashMap<String, i32>>,
+    /// The fix for the track on screen: positive shows the words later.
+    lyrics_offset: i32,
     /// Timed lines of the shown lyrics (empty when not synced).
     lyrics: Vec<LyricLine>,
     /// Last reported position and when it came: the song clock between reports.
@@ -1062,6 +1066,13 @@ impl UiState {
                 self.mark_context(w);
             }
             LibraryEvent::Lyrics { uri, lyrics } if uri == self.playing_uri => {
+                self.lyrics_offset = self
+                    .lyrics_offsets
+                    .get_or_insert_with(crate::lyrics_offsets::load)
+                    .get(&uri)
+                    .copied()
+                    .unwrap_or(0);
+                w.set_lyrics_offset_label(crate::lyrics_offsets::label(self.lyrics_offset).into());
                 self.lyrics_uri = uri;
                 match lyrics {
                     Some(l) if l.instrumental => {
@@ -1777,8 +1788,9 @@ impl UiState {
         let elapsed = at.filter(|_| playing).map_or(0, |t| {
             u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX)
         });
-        // A little early: reading lags behind hearing.
+        // A little early: reading lags behind hearing. Then the user's fix for this track.
         let pos = base.saturating_add(elapsed).saturating_add(LYRICS_LEAD_MS);
+        let pos = pos.saturating_add_signed(-self.lyrics_offset);
         let (line, word, next) = lyrics_at(&self.lyrics, pos);
         let to_i32 = |v: Option<usize>| v.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1);
         if w.get_lyrics_line() != to_i32(line) {
@@ -1819,6 +1831,33 @@ impl UiState {
     }
 
     /// "Строки" / "Слова" switched: the lyrics are fetched again for the new mode.
+    /// "−0,5 с / +0,5 с" in the lyrics header (`delta = 0`: back to the source's timing).
+    pub fn lyrics_shift(&mut self, w: &AppWindow, delta: i32) {
+        if self.lyrics_uri.is_empty() {
+            return;
+        }
+        let target = if delta == 0 {
+            0
+        } else {
+            self.lyrics_offset.saturating_add(delta)
+        };
+        let map = self
+            .lyrics_offsets
+            .get_or_insert_with(crate::lyrics_offsets::load);
+        self.lyrics_offset = crate::lyrics_offsets::set(map, &self.lyrics_uri, target);
+        w.set_lyrics_offset_label(crate::lyrics_offsets::label(self.lyrics_offset).into());
+    }
+
+    /// A click on a line seeks to where it is sung, with this track's fix applied.
+    #[must_use]
+    pub fn lyrics_seek_ms(&self, line_start: i32) -> Option<u32> {
+        if line_start < 0 {
+            return None; // a line without a time
+        }
+        let at = i64::from(line_start) + i64::from(self.lyrics_offset);
+        Some(u32::try_from(at.max(0)).unwrap_or(0))
+    }
+
     pub fn lyrics_mode_changed(&mut self, w: &AppWindow) -> Vec<Effect> {
         self.lyrics_uri.clear();
         self.lyrics_asked.clear();
