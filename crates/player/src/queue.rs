@@ -74,13 +74,13 @@ impl Queue {
 
     /// Shuffled order keeps the current track first, so turning shuffle on never skips it.
     fn reshuffle(&mut self, rng: &mut impl Rng) {
-        let current = self.pos.map(|p| self.order[p]);
-        let mut rest: Vec<usize> = (0..self.context.len())
-            .filter(|i| Some(*i) != current)
-            .collect();
-        rest.shuffle(rng);
-        self.order = current.into_iter().chain(rest).collect();
-        self.pos = current.map(|_| 0);
+        if let Some(p) = self.pos {
+            self.order.swap(0, p);
+            self.order[1..].shuffle(rng);
+            self.pos = Some(0);
+        } else {
+            self.order.shuffle(rng);
+        }
     }
 
     #[must_use]
@@ -238,8 +238,8 @@ impl Queue {
             self.reshuffle(rng);
         } else {
             let current = self.pos.map(|p| self.order[p]);
-            self.order = (0..self.context.len()).collect();
-            self.pos = current;
+            self.order.sort_unstable();
+            self.pos = current.and_then(|id| self.order.binary_search(&id).ok());
         }
     }
 
@@ -390,6 +390,22 @@ mod tests {
         q.set_shuffle_with(false, &mut rng);
         let cur: usize = uri(q.current().cloned()).parse().unwrap();
         assert_eq!(q.snapshot(50).upcoming.len(), 19 - cur);
+    }
+
+    #[test]
+    fn removed_entry_stays_removed_across_shuffle_toggles() {
+        let mut q = Queue::default();
+        q.set_context(items(4), 0, String::new());
+        q.remove_upcoming(0); // Remove 1, then advance to 2 (now at position 1).
+        assert_eq!(uri(q.next(true)), "2");
+        q.set_shuffle(true);
+        let mut remaining = q.snapshot(10).upcoming;
+        remaining.sort_by(|a, b| a.uri.cmp(&b.uri));
+        assert_eq!(remaining, vec![items(4)[0].clone(), items(4)[3].clone()]);
+        q.set_shuffle(false);
+        assert_eq!(uri(q.current().cloned()), "2");
+        assert_eq!(uri(q.next(true)), "3");
+        assert!(!q.select("spotify:track:1"));
     }
 
     #[test]
