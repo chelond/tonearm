@@ -128,6 +128,8 @@ struct Solo {
     /// We asked Soloist to play this URI and wait for it to report it.
     awaiting: Option<(String, Instant)>,
     seek_after_load: Option<u32>,
+    /// Soloist cannot load silently: keep the queue selection local until resume.
+    deferred_load: bool,
     /// The URI Soloist plays now, as we last saw it.
     playing_uri: Option<String>,
     /// What the player bar got for it; a fuller report of the same track replaces it.
@@ -348,7 +350,7 @@ impl Service {
                     self.queue.set_context(items, start, name);
                 }
                 if let Some(item) = self.queue.current().cloned() {
-                    self.play_item_at(&item, position_ms).await;
+                    self.play_item_at(&item, position_ms, true).await;
                 }
                 self.emit_queue().await;
             }
@@ -406,7 +408,11 @@ impl Service {
                     p.pause();
                 }
             }
-            PlayerCommand::PlayAt { uri, position_ms } => {
+            PlayerCommand::PlayAt {
+                uri,
+                position_ms,
+                start_playing,
+            } => {
                 if !self.queue.select(&uri) {
                     let item = QueueItem {
                         uri,
@@ -415,7 +421,7 @@ impl Service {
                     self.queue.set_context(vec![item], 0, String::new());
                 }
                 if let Some(item) = self.queue.current().cloned() {
-                    self.play_item_at(&item, position_ms).await;
+                    self.play_item_at(&item, position_ms, start_playing).await;
                 }
                 self.emit_queue().await;
             }
@@ -444,6 +450,11 @@ impl Service {
                     self.play_item(&item).await;
                 }
                 self.emit_queue().await;
+            }
+            PlayerCommand::TogglePlay if self.solo.deferred_load => {
+                if let Some(item) = self.queue.current().cloned() {
+                    self.play_item_at(&item, self.position_ms, true).await;
+                }
             }
             PlayerCommand::TogglePlay if self.solo.handle.is_some() => match self.state {
                 PlaybackState::Playing => self.solo_pause().await,
@@ -498,6 +509,7 @@ impl Service {
     }
 
     async fn stop(&mut self) {
+        self.solo.deferred_load = false;
         if self.solo.handle.is_some() {
             self.solo_send(json!({"command": "pause"}));
             self.solo.anchor = None;
@@ -510,7 +522,7 @@ impl Service {
     }
 
     async fn play_item(&mut self, item: &QueueItem) {
-        self.play_item_at(item, 0).await;
+        self.play_item_at(item, 0, true).await;
     }
 
     /// Puts the picked track into the player bar right away, from what the list already knows;
@@ -533,8 +545,18 @@ impl Service {
         self.emit(PlayerEvent::Track(track)).await;
     }
 
-    async fn play_item_at(&mut self, item: &QueueItem, position_ms: u32) {
-        if position_ms == 0 {
+    async fn play_item_at(&mut self, item: &QueueItem, position_ms: u32, start_playing: bool) {
+        self.solo.deferred_load = self.solo.handle.is_some() && !start_playing;
+        if self.solo.deferred_load {
+            self.solo.awaiting = None;
+            self.solo.playing_uri = None;
+            self.solo.anchor = None;
+            self.current_uri = Some(item.uri.clone());
+            self.show_picked(item).await;
+            self.set_state(PlaybackState::Paused, position_ms).await;
+            return;
+        }
+        if start_playing && position_ms == 0 {
             self.emit(PlayerEvent::Started(item.uri.clone())).await;
         }
         if self.solo.handle.is_some() {
@@ -551,7 +573,7 @@ impl Service {
                 .await;
         };
         self.current_uri = Some(item.uri.clone());
-        player.load(uri, true, position_ms);
+        player.load(uri, start_playing, position_ms);
         self.show_picked(item).await;
         self.set_state(PlaybackState::Loading, position_ms).await;
     }
@@ -732,6 +754,10 @@ impl Service {
     }
 
     async fn solo_seek(&mut self, position_ms: u32) {
+        if self.solo.deferred_load {
+            self.set_state(PlaybackState::Paused, position_ms).await;
+            return;
+        }
         self.solo_send(json!({"command": "seek", "position_ms": position_ms}));
         self.solo.seek_sent = Some((position_ms, Instant::now()));
         if self.state == PlaybackState::Playing {
@@ -822,6 +848,9 @@ impl Service {
 
     /// `true` while an answer to our `play` is still due: older reports are about the old track.
     fn solo_waiting(&mut self) -> bool {
+        if self.solo.deferred_load {
+            return true;
+        }
         match &self.solo.awaiting {
             Some((_, at)) if at.elapsed() > AWAIT_LIMIT => {
                 self.solo.awaiting = None;
@@ -835,6 +864,9 @@ impl Service {
     /// Soloist reports a track. Ours: show it. Another one while nothing is pending: Soloist
     /// went on by itself (the track ended), so continue with Tonearm's queue instead.
     async fn solo_track(&mut self, track: Option<TrackInfo>) {
+        if self.solo.deferred_load {
+            return;
+        }
         let Some(track) = track else { return };
         if let Some((want, _)) = &self.solo.awaiting {
             if *want == track.uri {
@@ -1294,6 +1326,36 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn paused_connect_release_stays_silent_until_resume() {
+        let mut r = rig();
+        r.play_context(3, 0).await;
+        r.soloist_plays(0, 100).await;
+        settle().await;
+        r.commands();
+        r.svc
+            .handle_command(PlayerCommand::PlayAt {
+                uri: item(1).uri,
+                position_ms: 4567,
+                start_playing: false,
+            })
+            .await;
+        r.soloist_plays(0, 200).await; // A stale snapshot must not restart or reposition it.
+        assert_eq!(r.svc.state, PlaybackState::Paused);
+        assert_eq!(r.svc.position_ms, 4567);
+        settle().await;
+        assert!(!r.commands().iter().any(|c| c == "play"));
+        r.svc.handle_command(PlayerCommand::Resume).await;
+        settle().await;
+        assert_eq!(r.played_uris(), vec![item(1).uri]);
+        r.soloist_plays(1, 0).await;
+        settle().await;
+        assert_eq!(
+            r.sent.try_recv().unwrap(),
+            json!({"command": "seek", "position_ms": 4567})
+        );
     }
 
     #[tokio::test]

@@ -38,6 +38,34 @@ const NOTICE_SECS: u32 = 5;
 /// The library is fetched again on coming back to the window, at most this often.
 const LIBRARY_REFRESH: Duration = Duration::from_secs(300);
 
+enum QueueClick {
+    Local(PlayerCommand),
+    Remote(ConnectCommand),
+}
+
+fn queue_click(
+    device: Option<String>,
+    upcoming: &[tonearm_player::QueueItem],
+    row: i32,
+) -> Option<QueueClick> {
+    let index = usize::try_from(row).ok()?;
+    upcoming.get(index)?;
+    Some(match device {
+        None => QueueClick::Local(PlayerCommand::JumpTo(index)),
+        // The panel shows our upcoming tracks, not the device's queue. Start
+        // a known sequence at the clicked URI rather than skipping remotely.
+        Some(device_id) => QueueClick::Remote(ConnectCommand::PlayOn {
+            device_id,
+            uris: upcoming[index..]
+                .iter()
+                .map(|item| item.uri.clone())
+                .collect(),
+            offset: 0,
+            position_ms: 0,
+        }),
+    })
+}
+
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -889,12 +917,20 @@ fn apply_connect(w: &AppWindow, s: &Senders, event: ConnectEvent) {
             });
             s.run(fx);
         }
-        ConnectEvent::Released { uri, position_ms } => {
+        ConnectEvent::Released {
+            uri,
+            position_ms,
+            was_playing,
+        } => {
             s.set_remote(None);
             s.remote_playing.store(false, Ordering::Relaxed);
             w.set_remote_name("".into());
             if let Some(uri) = uri {
-                s.local(PlayerCommand::PlayAt { uri, position_ms });
+                s.local(PlayerCommand::PlayAt {
+                    uri,
+                    position_ms,
+                    start_playing: was_playing,
+                });
             }
         }
         ConnectEvent::HandoffFailed(text) => {
@@ -1698,9 +1734,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     let s = senders.clone();
     window.on_queue_jump(move |i| {
-        s.player(PlayerCommand::JumpTo(
-            usize::try_from(i).unwrap_or(usize::MAX),
-        ));
+        let Ok(device) = s.remote.lock().map(|r| r.clone()) else {
+            return;
+        };
+        match ui_state::with(|st| queue_click(device, &st.queue.upcoming, i)) {
+            Some(QueueClick::Remote(cmd)) => s.connect(cmd),
+            Some(QueueClick::Local(cmd)) => s.local(cmd),
+            None => {}
+        }
     });
     let s = senders.clone();
     window.on_queue_remove(move |i| {
@@ -2414,4 +2455,46 @@ fn preview_search(w: &AppWindow, senders: &Senders, screen: &str) {
         )
     });
     senders.run(fx);
+}
+
+#[cfg(test)]
+mod queue_click_tests {
+    use super::*;
+
+    #[test]
+    fn remote_queue_click_plays_displayed_uri_on_device_not_locally() {
+        let upcoming: Vec<_> = [
+            "spotify:track:first",
+            "spotify:episode:picked",
+            "spotify:track:next",
+        ]
+        .into_iter()
+        .map(|uri| tonearm_player::QueueItem {
+            uri: uri.into(),
+            ..Default::default()
+        })
+        .collect();
+        match queue_click(Some("speaker".into()), &upcoming, 1) {
+            Some(QueueClick::Remote(ConnectCommand::PlayOn {
+                device_id,
+                uris,
+                offset,
+                position_ms,
+            })) => {
+                assert_eq!(device_id, "speaker");
+                assert_eq!(
+                    &uris[offset..],
+                    &["spotify:episode:picked", "spotify:track:next"]
+                );
+                assert_eq!(position_ms, 0);
+            }
+            _ => panic!("remote row click must only send PlayOn"),
+        }
+        assert!(matches!(
+            queue_click(None, &upcoming, 1),
+            Some(QueueClick::Local(PlayerCommand::JumpTo(1)))
+        ));
+        assert!(queue_click(Some("speaker".into()), &upcoming, 3).is_none());
+        assert!(queue_click(Some("speaker".into()), &upcoming, -1).is_none());
+    }
 }

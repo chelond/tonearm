@@ -78,8 +78,9 @@ pub enum ConnectEvent {
     Devices(Vec<Device>),
     /// State of the remote device; `None` when it stopped or disappeared.
     Remote(Option<RemoteState>),
-    /// Playback came back: resume `uri` at `position_ms` locally.
+    /// Restore the remote position and pre-release play/pause state locally.
     Released {
+        was_playing: bool,
         uri: Option<String>,
         position_ms: u32,
     },
@@ -260,6 +261,19 @@ impl<H: Http> WebApi<H> {
         .await
     }
 
+    async fn release(&self) -> ConnectEvent {
+        let state = self.playback().await.ok().flatten();
+        let was_playing = state.as_ref().is_some_and(|s| s.is_playing);
+        if was_playing {
+            let _ = self.control(&RemoteAction::Pause).await;
+        }
+        ConnectEvent::Released {
+            was_playing,
+            position_ms: state.as_ref().map_or(0, |s| s.progress_ms),
+            uri: state.map(|s| s.uri).filter(|u| !u.is_empty()),
+        }
+    }
+
     pub async fn transfer(&self, device_id: &str, play: bool) -> Result<(), ApiError> {
         let body = serde_json::json!({ "device_ids": [device_id], "play": play });
         self.command(Method::Put, "", Some(body.to_string())).await
@@ -399,14 +413,7 @@ impl Service {
             }
             ConnectCommand::Release => {
                 self.stop_polling();
-                let state = api.playback().await.ok().flatten();
-                if state.as_ref().is_some_and(|s| s.is_playing) {
-                    let _ = api.control(&RemoteAction::Pause).await;
-                }
-                Ok(Some(ConnectEvent::Released {
-                    position_ms: state.as_ref().map_or(0, |s| s.progress_ms),
-                    uri: state.map(|s| s.uri).filter(|u| !u.is_empty()),
-                }))
+                Ok(Some(api.release().await))
             }
         };
         match result {
@@ -523,6 +530,35 @@ mod tests {
 
         let idle = WebApi::new(Fake::default());
         assert_eq!(idle.playback().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn release_preserves_remote_play_state_and_position() {
+        for was_playing in [false, true] {
+            let body = serde_json::json!({"device": {"id": "d"}, "is_playing": was_playing,
+                "progress_ms": 4321, "item": {"uri": "spotify:track:1"}});
+            let api = WebApi::new(Fake {
+                get_body: Some((200, body.to_string())),
+                ..Fake::default()
+            });
+            assert_eq!(
+                api.release().await,
+                ConnectEvent::Released {
+                    uri: Some("spotify:track:1".into()),
+                    position_ms: 4321,
+                    was_playing,
+                }
+            );
+            let sent = api.http.sent.lock().unwrap();
+            if was_playing {
+                assert_eq!(
+                    &sent[..],
+                    &[(Method::Put, format!("{API}/me/player/pause"), None)]
+                );
+            } else {
+                assert!(sent.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

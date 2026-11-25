@@ -59,6 +59,7 @@ pub enum PlayerCommand {
     /// Continue `uri` from `position_ms` (playback came back from another device): inside the
     /// current queue if it is there, otherwise as a one-track queue.
     PlayAt {
+        start_playing: bool,
         uri: String,
         position_ms: u32,
     },
